@@ -1,0 +1,40 @@
+# --- Local config + secrets (never commit) -------------------------------
+# Operators copy config.example.yaml -> config.yaml and fill in their own
+# SSH hosts, hotkeys, R2 credentials. The example file is the only one
+# tracked in git.
+config.yaml
+config.local.yaml
+.env
+.env.local
+*.pem
+
+# --- Runtime caches (regenerated on each run) -----------------------------
+baseline.jsonl
+window_cache.json.gz
+state/
+data/
+*.log
+/tmp/
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv*/
+venv/
+.python-version
+*.egg-info/
+build/
+dist/
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# --- Editor / OS ----------------------------------------------------------
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

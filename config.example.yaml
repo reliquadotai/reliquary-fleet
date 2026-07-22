@@ -1,0 +1,160 @@
+# Reliquary fleet dashboard — operator config.
+#
+# `reliquary-fleet init` copies this template to a private per-user config.
+# Edit that file, run `reliquary-fleet doctor`, then start with
+# `reliquary-fleet serve`. Source checkouts may still copy it to config.yaml.
+
+# ---------------------------------------------------------------------------
+# Validator under test. The dashboard SSHes into this host to tail the
+# validator container's logs (events feed) and HTTP-polls /state, /health,
+# and full-hotkey /verdicts for live window/runtime/final-outcome KPIs.
+# ---------------------------------------------------------------------------
+validator:
+  # FastAPI URL exposed by the validator container (default port 8080).
+  url: "http://validator.example:8080"
+  ssh:
+    # Either user@host (passwordless key login) or an alias from
+    # ~/.ssh/config. The same identity must be able to run
+    # `docker logs <container>` non-interactively.
+    host: "ops@validator.example"
+    port: 22
+    # Absolute path or ~-expansion. The user running the dashboard needs
+    # read access to this file.
+    key: "~/.ssh/id_ed25519"
+  # Docker container name to tail logs from. Standard reliquary builds
+  # name it "reliquary-trainer".
+  container: "reliquary-trainer"
+
+# ---------------------------------------------------------------------------
+# Non-secret, host-local Code readiness paths. These defaults match the
+# source-pinned miner provisioner. Change them only when the grader was
+# deliberately installed under a different service/path/metrics port.
+# Code reference lanes fail readiness unless the miner and grader units are
+# persistently enabled, the root-owned socket has this exact mode, and the
+# bundle/canary/source identities match the live validator.
+# ---------------------------------------------------------------------------
+code_readiness:
+  grader_unit: "reliquary-code-grader.service"
+  grader_socket: "/tmp/reliquary-grader.sock"
+  grader_bundle_link: "/opt/reliquary-code-grader/current"
+  grader_metrics_port: 9876
+  grader_socket_mode: "0660"
+
+# ---------------------------------------------------------------------------
+# Your fleet of miner boxes. The dashboard SSHes into each box on a fast
+# loop to fetch GPU stats, journal events, OOM history. The "color" tints
+# events from that box in the live tail.
+#
+#   alias       — ssh alias or user@host
+#   hotkey      — SS58 hotkey running on this box (used for event filtering)
+#   label       — short tag shown in tables ("stg1", "h100", etc.)
+#   color       — cyan | magenta | yellow | green | red | orange | white
+#   unit        — systemd unit name (e.g. reliquary-miner-pro@h100a.service)
+#                 or null if the miner runs outside systemd
+#   env_file    — exact service EnvironmentFile path. Set this for the
+#                 reference miner because its non-templated service uses
+#                 /srv/reliquary-miner-pro/state/miner-pro.env.
+#   allowed_units — optional replacement-unit allowlist for one logical box.
+#                 Exactly one of `unit` plus these entries may be active. Each
+#                 mapping should provide the exact per-lane EnvironmentFile.
+#                 To run concurrent shards, configure one fleet row per unit;
+#                 rows sharing an SSH host form its exact host-wide allowlist.
+#                 Any other active reliquary-miner-pro unit fails closed.
+#   ssh_key     — optional per-box key override (falls back to validator.ssh.key)
+# ---------------------------------------------------------------------------
+fleet:
+  - alias: "ops@miner-1.example"
+    hotkey: "YOUR_SS58_HOTKEY"
+    label: "m1"
+    color: "cyan"
+    unit: "reliquary-miner-pro@m1.service"
+    env_file: "/srv/reliquary-miner-pro/state/miner-pro-m1.env"
+    # One logical H100 row can follow a legacy canary or one named lane:
+    # allowed_units:
+    #   - unit: "reliquary-miner-pro@math-m2.service"
+    #     env_file: "/srv/reliquary-miner-pro/state/miner-pro-math-m2.env"
+    #   - unit: "reliquary-miner-pro@code-m2.service"
+    #     env_file: "/srv/reliquary-miner-pro/state/miner-pro-code-m2.env"
+    # Optional exact set allowed to run concurrently. Every named service must
+    # already appear in unit + allowed_units; any other multi-service set is
+    # still reported as multiple_allowed_units_active.
+    # coordinated_units:
+    #   - "reliquary-miner-pro@code-m2.service"
+    #   - "reliquary-miner-pro@code-m2-peer.service"
+    ssh_key: null
+
+# ---------------------------------------------------------------------------
+# Submit-disabled accelerator laboratories. These rows are intentionally not
+# miners: they have no hotkey, never enter pool/selection/reward accounting,
+# and never count toward live fleet readiness. The dashboard verifies the
+# process + provisioner submit-disabled attestation and reads only aggregate
+# counters from a dedicated evidence database or a checksummed selector
+# artifact manifest. Artifact-only completed jobs need no service or database.
+# ---------------------------------------------------------------------------
+labs:
+  # Labs are optional. Uncomment and edit a row only for a deliberately
+  # submit-disabled host; never put a production miner under this key.
+  # - alias: "ops@offline-gpu.example"
+  #   label: "selector-lab"
+  #   color: "magenta"
+  #   selector_artifact_manifest: "/srv/reliquary-selector/report.json"
+  #   source_manifest: "/srv/reliquary-miner-pro/state/source-manifest.env"
+  #   ssh_key: null
+
+# ---------------------------------------------------------------------------
+# Extra hotkeys to mark as "yours" beyond the fleet above. The fleet
+# hotkeys are auto-starred. Use this for hotkeys you watch but don't own
+# the GPU box for (e.g. a friend's miner sharing a coldkey, or a renter).
+#
+# You can also star hotkeys live via the dashboard UI — click the star
+# icon in the EMA leaderboard. Star state is persisted to
+# the private application state directory.
+# ---------------------------------------------------------------------------
+starred_hotkeys: []
+# Example:
+# starred_hotkeys:
+#   - "5GEppz..."
+#   - "5DAAnrj..."
+
+# ---------------------------------------------------------------------------
+# Subnet. Default is netuid 81 (Reliquary mainnet on finney).
+# ---------------------------------------------------------------------------
+netuid: 81
+
+# ---------------------------------------------------------------------------
+# Cloudflare R2 — the dashboard reads validator-published window archives
+# to compute slot share / EMA leaderboard / reject summaries.
+#
+# All four fields can also be set via env vars; env wins over yaml so a
+# shared config.yaml + per-operator .env works. Bash export form:
+#
+#   export R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+#   export R2_BUCKET="reliquary"
+#   export AWS_ACCESS_KEY_ID="..."
+#   export AWS_SECRET_ACCESS_KEY="..."
+# ---------------------------------------------------------------------------
+r2:
+  endpoint: ""
+  bucket: "reliquary"
+  access_key_id: ""
+  secret_access_key: ""
+
+# ---------------------------------------------------------------------------
+# Dashboard runtime tuning. Defaults match the previously-shipped fleet.py.
+# ---------------------------------------------------------------------------
+dashboard:
+  # Listen address + port. 127.0.0.1 keeps it local-only (recommended);
+  # A non-loopback address additionally requires --allow-remote. Put an
+  # authenticated TLS reverse proxy in front; the dashboard has no login.
+  host: "127.0.0.1"
+  port: 9091
+  # Refresh cadence for the fast box-probe loop (SSH journalctl + GPU).
+  refresh_seconds: 5
+  # Readiness fails when no complete atomic box+validator probe generation has
+  # been published for this long. Keep this above the worst-case network probe
+  # duration plus refresh_seconds; 60s covers the current bounded ~40s cycle
+  # without hiding a genuinely stuck poller.
+  health_poll_stale_seconds: 60
+  # Number of recent R2 windows to keep cached for the slot-share /
+  # EMA / reject panels. 216 windows × ~5 min = ~18 h of history.
+  history_windows: 216

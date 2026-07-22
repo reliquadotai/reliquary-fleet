@@ -1,0 +1,3 @@
+# Source-checkout compatibility. Package dependencies and supported ranges
+# live in pyproject.toml so local and published installs cannot drift.
+-e .
