@@ -32,8 +32,8 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     return asyncio.run(run())
 
 
-def test_release_version_is_1_0_1() -> None:
-    assert __version__ == "1.0.1"
+def test_release_version_is_1_0_2() -> None:
+    assert __version__ == "1.0.2"
 
 
 def test_packaged_config_matches_repository_template() -> None:
@@ -114,8 +114,8 @@ def test_web_assets_and_security_headers_are_local() -> None:
     page = _request(app, "GET", "/")
     assert page.status_code == 200
     assert 'src="/static/htmx.min.js"' in page.text
-    assert 'href="/static/dashboard.css?v=1.0.1"' in page.text
-    assert 'src="/static/dashboard.js?v=1.0.1"' in page.text
+    assert f'href="/static/dashboard.css?v={__version__}"' in page.text
+    assert f'src="/static/dashboard.js?v={__version__}"' in page.text
     assert "unpkg.com" not in page.text
     assert page.headers["x-frame-options"] == "DENY"
     policy = page.headers["content-security-policy"]
