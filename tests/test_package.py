@@ -157,6 +157,8 @@ def test_demo_badge_is_explicit_and_opt_in() -> None:
     assert 'data-demo="false"' in production_page
     assert "demo data" in demo_page
     assert 'data-demo="true"' in demo_page
+    assert 'hx-trigger="load, every' in production_page
+    assert 'hx-trigger="load, every' not in demo_page
 
 
 def test_fixture_source_contains_only_synthetic_identifiers() -> None:

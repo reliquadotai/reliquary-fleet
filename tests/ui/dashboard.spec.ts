@@ -95,9 +95,10 @@ test("preserves internal panel scroll after an HTMX refresh", async ({ page }) =
 
   const restored = await area.evaluate(async (element) => {
     element.scrollTop = 72;
-    await new Promise<void>((resolve) => {
-      element.addEventListener("htmx:afterSwap", () => resolve(), { once: true });
-      window.htmx.trigger(element, "load");
+    await window.htmx.ajax("GET", element.getAttribute("hx-get") || "/api/windows", {
+      source: element,
+      target: element,
+      swap: "innerHTML",
     });
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     return element.scrollTop;

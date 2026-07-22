@@ -6391,7 +6391,7 @@ def make_app(
 
     @app.get("/", response_class=HTMLResponse)
     def index():
-        return (
+        page = (
             PAGE.replace("{refresh_s}", str(int(refresh_s)))
             .replace("{asset_version}", __version__)
             .replace("{demo_mode}", "true" if demo_mode else "false")
@@ -6400,6 +6400,13 @@ def make_app(
                 '<span class="demo-badge">demo data</span>' if demo_mode else "",
             )
         )
+        if demo_mode:
+            page = re.sub(
+                r'hx-trigger="load,\s*every [^"]+"',
+                'hx-trigger="load"',
+                page,
+            )
+        return page
 
     @app.get("/logs", response_class=HTMLResponse)
     def logs_page():
