@@ -9,7 +9,8 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   workers: process.env.CI ? 2 : 1,
   reporter: process.env.CI ? [["line"], ["html", { open: "never" }]] : "line",
-  snapshotPathTemplate: "{testDir}/__screenshots__/{projectName}/{arg}{ext}",
+  snapshotPathTemplate:
+    "{testDir}/__screenshots__/{projectName}-{platform}/{arg}{ext}",
   expect: {
     timeout: 10_000,
     toHaveScreenshot: {
