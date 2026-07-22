@@ -4334,13 +4334,13 @@ def fetch_chain_state(cs: ChainState, ssh_alias: str | None = None) -> None:
     # the remote box runs against the operator's hotkeys + subnet, not a
     # hardcoded fleet. json.dumps prevents any odd character in a label or
     # hotkey from breaking the heredoc.
+    # Hardened hosts commonly keep the production venv root-only, so each
+    # fixed interpreter path also gets a non-interactive sudo attempt.
     our_dict_literal = json.dumps(OUR_SS58)
     netuid_literal = json.dumps(NETUID)
     snippet = f"""set -u
-last_rc=127
-for py in /opt/miner-venv-py312/bin/python3.12 /opt/miner-venv-py312/bin/python3 /opt/reliquary-venv/bin/python python3; do
-    if [ -x "$py" ] || command -v "$py" >/dev/null 2>&1; then
-        "$py" - <<'PYEOF'
+probe_python() {{
+    "$@" - <<'PYEOF'
 import json
 OUR = {our_dict_literal}
 NETUID = {netuid_literal}
@@ -4394,12 +4394,23 @@ for uid, hk in enumerate(hotkeys):
         out["emit"] += e
 print(json.dumps(out, separators=(",", ":")))
 PYEOF
+}}
+
+last_rc=127
+for py in /opt/miner-venv-py312/bin/python3.12 /opt/miner-venv-py312/bin/python3 /opt/reliquary-venv/bin/python python3; do
+    if [ -x "$py" ] || command -v "$py" >/dev/null 2>&1; then
+        probe_python "$py"
         last_rc=$?
-        if [ "$last_rc" -eq 0 ]; then
-            exit 0
-        fi
-        echo "candidate $py failed rc=$last_rc" >&2
+    elif sudo -n test -x "$py" >/dev/null 2>&1; then
+        probe_python sudo -n "$py"
+        last_rc=$?
+    else
+        continue
     fi
+    if [ "$last_rc" -eq 0 ]; then
+        exit 0
+    fi
+    echo "candidate $py failed rc=$last_rc" >&2
 done
 echo "chain probe failed on all python candidates" >&2
 exit ${{last_rc:-1}}
@@ -4418,7 +4429,15 @@ exit ${{last_rc:-1}}
                 for ln in (stderr or stdout or "").splitlines()
                 if ln.strip()
             ]
-            msg = "; ".join(lines[-4:]) if lines else f"chain probe failed rc={rc}"
+            causes = [
+                line
+                for line in lines
+                if line.startswith(
+                    ("metagraph failed:", "import bittensor failed:", "Subtensor unavailable:")
+                )
+            ]
+            msg_lines = causes[:4] or lines[-4:]
+            msg = "; ".join(msg_lines) if msg_lines else f"chain probe failed rc={rc}"
             failures.append(f"{source_alias}: {msg[:120]}")
             continue
 

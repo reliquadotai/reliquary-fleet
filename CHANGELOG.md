@@ -3,6 +3,13 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 this project uses [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-07-22
+
+### Fixed
+
+- Restored live chain/metagraph probes on hardened miner hosts where the
+  Bittensor virtual environment is readable only through non-interactive sudo.
+
 ## [1.0.1] - 2026-07-22
 
 ### Added
@@ -49,5 +56,6 @@ this project uses [Semantic Versioning](https://semver.org/).
 - Same-origin header required for star mutations and restrictive browser headers.
 - HTMX 2.0.10 is bundled and checksum-documented; no runtime CDN is required.
 
+[1.0.2]: https://github.com/reliquadotai/reliquary-fleet/releases/tag/v1.0.2
 [1.0.1]: https://github.com/reliquadotai/reliquary-fleet/releases/tag/v1.0.1
 [1.0.0]: https://github.com/reliquadotai/reliquary-fleet/releases/tag/v1.0.0
