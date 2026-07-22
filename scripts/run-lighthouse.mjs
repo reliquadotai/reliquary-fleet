@@ -42,6 +42,9 @@ try {
     output: "json",
     logLevel: "warn",
     onlyCategories: ["performance", "accessibility", "best-practices"],
+    // Fleet is a localhost application, so score the connection it ships for
+    // instead of modeling a public mobile-network round trip.
+    throttlingMethod: "provided",
     formFactor: "desktop",
     screenEmulation: {
       mobile: false,

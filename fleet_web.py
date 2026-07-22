@@ -6155,7 +6155,7 @@ PAGE = """<!doctype html>
 <script src="/static/htmx.min.js" defer></script>
 <link rel="stylesheet" href="/static/dashboard.css?v={asset_version}">
 </head>
-<body>
+<body data-demo="{demo_mode}">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
 <header class="app-header">
   <div class="brand-lockup">
@@ -6394,6 +6394,7 @@ def make_app(
         return (
             PAGE.replace("{refresh_s}", str(int(refresh_s)))
             .replace("{asset_version}", __version__)
+            .replace("{demo_mode}", "true" if demo_mode else "false")
             .replace(
                 "{demo_badge}",
                 '<span class="demo-badge">demo data</span>' if demo_mode else "",

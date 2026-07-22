@@ -151,10 +151,12 @@ def test_web_assets_and_security_headers_are_local() -> None:
 
 
 def test_demo_badge_is_explicit_and_opt_in() -> None:
-    assert "demo data" not in _request(fleet_web.make_app(5), "GET", "/").text
-    assert "demo data" in _request(
-        fleet_web.make_app(5, demo_mode=True), "GET", "/"
-    ).text
+    production_page = _request(fleet_web.make_app(5), "GET", "/").text
+    demo_page = _request(fleet_web.make_app(5, demo_mode=True), "GET", "/").text
+    assert "demo data" not in production_page
+    assert 'data-demo="false"' in production_page
+    assert "demo data" in demo_page
+    assert 'data-demo="true"' in demo_page
 
 
 def test_fixture_source_contains_only_synthetic_identifiers() -> None:

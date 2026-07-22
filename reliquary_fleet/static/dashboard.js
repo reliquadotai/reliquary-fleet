@@ -1,6 +1,12 @@
 (() => {
   "use strict";
 
+  if (document.body.dataset.demo === "true") {
+    document.querySelectorAll('[hx-trigger*="every"]').forEach((element) => {
+      element.setAttribute("hx-trigger", "load");
+    });
+  }
+
   const drawer = document.getElementById("drawer");
   const backdrop = document.getElementById("drawer-backdrop");
   const soundToggle = document.getElementById("sound-toggle");

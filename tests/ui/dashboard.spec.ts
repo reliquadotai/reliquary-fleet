@@ -22,6 +22,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("matches the sanitized viewport baseline", async ({ page }) => {
+  await expect(page.locator('[hx-trigger*="every"]')).toHaveCount(0);
   await expect(page).toHaveScreenshot("dashboard-viewport.png");
 });
 
