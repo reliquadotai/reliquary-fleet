@@ -19,3 +19,22 @@ htmx is provided under the Zero-Clause BSD license:
 > WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
 > OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 > CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+Reliquary Fleet bundles a UI character subset of the Geist variable web font
+from <https://github.com/vercel/geist-font> as `geist-sans.woff2`. Its SHA-256 is:
+
+```text
+82b361515059424243ce0bf8b591dc222991b4893349a41e41db270fc574c7b7
+```
+
+Reliquary Fleet bundles a UI character subset of the JetBrains Mono variable
+web font from <https://github.com/JetBrains/JetBrainsMono> as
+`jetbrains-mono.woff2`. Its SHA-256 is:
+
+```text
+1fddc567a4157a44570a8de103a7efa6327736f510dfd582a49a1a7212746a3c
+```
+
+Both fonts are provided under the SIL Open Font License 1.1. Complete license
+texts are distributed as `OFL-Geist.txt` and `OFL-JetBrainsMono.txt` beside the
+font files.

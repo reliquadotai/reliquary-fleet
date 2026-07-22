@@ -1,0 +1,19 @@
+{
+  "name": "reliquary-fleet-quality",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test:ui": "playwright test",
+    "test:ui:update": "playwright test --update-snapshots",
+    "test:lighthouse": "node scripts/run-lighthouse.mjs",
+    "capture:launch": "node scripts/capture-launch.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1",
+    "chrome-launcher": "1.2.1",
+    "lighthouse": "13.4.1"
+  }
+}

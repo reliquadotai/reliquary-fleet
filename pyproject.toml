@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reliquary-fleet"
-version = "1.0.0"
+version = "1.0.1"
 description = "Private-by-default operations dashboard for Reliquary miner fleets"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -64,7 +64,13 @@ py-modules = ["fleet", "fleet_web", "r2_query", "settings", "starred"]
 include = ["reliquary_fleet*"]
 
 [tool.setuptools.package-data]
-reliquary_fleet = ["config.example.yaml", "static/*.js"]
+reliquary_fleet = [
+  "config.example.yaml",
+  "static/*.css",
+  "static/*.js",
+  "static/brand/*.svg",
+  "static/fonts/*",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

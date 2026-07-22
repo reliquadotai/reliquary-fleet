@@ -4,4 +4,5 @@ include LICENSE
 include README.md
 include SECURITY.md
 include THIRD_PARTY_NOTICES.md
+recursive-include reliquary_fleet/static *
 recursive-include tests *.py

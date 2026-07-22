@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120" role="img" aria-label="Reliquary">
+  <title>Reliquary mark</title>
+  <line x1="8" y1="60" x2="112" y2="60" stroke="#e87a3e" stroke-width="1" opacity="0.55"/>
+  <path d="M 60 12 L 108 60 L 60 108 L 12 60 Z" fill="none" stroke="#e87a3e" stroke-width="2" stroke-linejoin="miter"/>
+  <path d="M 60 36 L 84 60 L 60 84 L 36 60 Z" fill="none" stroke="#e87a3e" stroke-width="2"/>
+  <circle cx="60" cy="60" r="2.4" fill="#e87a3e"/>
+</svg>

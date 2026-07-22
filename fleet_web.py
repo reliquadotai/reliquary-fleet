@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from importlib import resources as package_resources
 from pathlib import Path
 
+from reliquary_fleet import __version__
+
 # Reuse the polling primitives from the TUI module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -62,6 +64,7 @@ except ImportError as e:
 try:
     from fastapi import FastAPI, Header, HTTPException
     from fastapi.responses import HTMLResponse, JSONResponse, Response
+    from starlette.middleware.gzip import GZipMiddleware
     import uvicorn
 except ImportError:
     sys.exit("missing dep: pip install --user fastapi 'uvicorn[standard]'")
@@ -90,9 +93,22 @@ _ema_window_count: int = 0
 _deployment = DeploymentState()
 _deployment_last: float = 0.0
 _instance_lock_handle = None
-_HTMX_JS = package_resources.files("reliquary_fleet").joinpath(
-    "static/htmx.min.js"
-).read_text(encoding="utf-8")
+_STATIC_ROOT = package_resources.files("reliquary_fleet").joinpath("static")
+_STATIC_MEDIA_TYPES = {
+    "brand/mark-outline.svg": "image/svg+xml",
+    "brand/relic.svg": "image/svg+xml",
+    "dashboard.css": "text/css",
+    "dashboard.js": "text/javascript",
+    "fonts/geist-sans.woff2": "font/woff2",
+    "fonts/jetbrains-mono.woff2": "font/woff2",
+    "htmx.min.js": "text/javascript",
+    "logs.css": "text/css",
+    "logs.js": "text/javascript",
+}
+_STATIC_ASSETS = {
+    name: _STATIC_ROOT.joinpath(name).read_bytes()
+    for name in _STATIC_MEDIA_TYPES
+}
 
 
 def _is_loopback_bind(host: str) -> bool:
@@ -163,6 +179,30 @@ def _release_instance_lock() -> None:
             _instance_lock_handle.close()
         finally:
             _instance_lock_handle = None
+
+
+def _start_collectors_after_ready(
+    server,
+    collectors: list[tuple[str, object, tuple]],
+    *,
+    on_ready=None,
+    wait_s: float = 0.02,
+) -> bool:
+    """Start remote work only after Uvicorn has bound its local socket."""
+    while not bool(getattr(server, "started", False)):
+        if bool(getattr(server, "should_exit", False)):
+            return False
+        time.sleep(wait_s)
+    for name, target, thread_args in collectors:
+        threading.Thread(
+            name=f"reliquary-fleet-{name}",
+            target=target,
+            args=thread_args,
+            daemon=True,
+        ).start()
+    if on_ready is not None:
+        on_ready()
+    return True
 
 
 # Auction payout semantics are an exact-source contract.  PR156 introduced a
@@ -843,7 +883,7 @@ def render_fleet_html() -> str:
             lane_title += f"; unexpected={','.join(unexpected_units)}"
         rows.append(f"""
 <tr>
-  <td><span class="lbl" style="color:{b.color}">{html.escape(b.label)}</span></td>
+  <td><button class="fleet-detail-button" type="button" data-box-label="{html.escape(b.label)}" aria-label="Open details for {html.escape(b.label)}"><span class="lbl" style="color:{b.color}">{html.escape(b.label)}</span></button></td>
   <td class="mono" title="{html.escape(b.hotkey)}">{html.escape(hk)}</td>
   <td style="color:{alive_color};text-align:center;font-size:1.4em">{alive}</td>
   <td class="mono" style="color:{lane_color}" title="{html.escape(lane_title)}">{html.escape(lane_label)}<div class="dim small">{html.escape(lane_sub)} · pid {int(getattr(b, 'active_pid', 0) or 0)} · r{int(getattr(b, 'restart_count', 0) or 0)}</div></td>
@@ -3372,7 +3412,7 @@ def render_frontier_html() -> str:
 
     return f"""
 <div class="panel">
-  <h2>Prompt frontier <span class="dim small">reference priors · checkpoint mix · submitter timing</span></h2>
+  <h2>Prompt frontier</h2>
   <table class="grid compact pipeline-table">
     <thead><tr>
       <th>worker</th><th class="num">file age</th><th class="num">newest</th>
@@ -5130,6 +5170,7 @@ def render_ema_leaderboard_html(top_n: int = 12, mode: str = "top") -> str:
         star_btn = (
             f"<button class='star-btn' data-hk='{html.escape(hk)}' "
             f"title='{'Unstar (remove from your set)' if is_ours else 'Star this hotkey'}'"
+            f" aria-label='{'Remove hotkey from targets' if is_ours else 'Add hotkey to targets'}'"
             f" style='color:{star_color}'>{star_glyph}</button>"
         )
         scope = (
@@ -5196,7 +5237,7 @@ def render_ema_leaderboard_html(top_n: int = 12, mode: str = "top") -> str:
   <div class="target-context-row">{target_chips}</div>
   <table class="grid compact">
     <thead><tr>
-      <th class='num'>#</th><th></th><th>scope</th><th>hotkey</th>
+      <th class='num'>#</th><th aria-label='Target status'><span class='visually-hidden'>Target status</span></th><th>scope</th><th>hotkey</th>
       <th class='num'>weight</th>
       <th class='num' title='Slots in last 12 windows'>last 12</th>
     </tr></thead>
@@ -5211,7 +5252,11 @@ def render_box_detail_html(label: str) -> str:
     with _lock:
         b = next((x for x in _boxes if x.label == label), None)
     if not b:
-        return f"<button class='close' onclick=\"document.getElementById('drawer').classList.remove('open')\">×</button><h3>unknown box: {html.escape(label)}</h3>"
+        return (
+            "<button class='close' type='button' data-drawer-close "
+            "aria-label='Close miner details'>×</button>"
+            f"<h3>unknown box: {html.escape(label)}</h3>"
+        )
     pct = b.gpu_mem_mb * 100 // max(b.gpu_total_mb, 1)
     events = list(b.recent_lines)
     event_rows = []
@@ -5225,7 +5270,7 @@ def render_box_detail_html(label: str) -> str:
         )
     ev_html = "".join(event_rows) or "<span class='dim'>no high-signal recent events</span>"
     return f"""
-<button class="close" onclick="document.getElementById('drawer').classList.remove('open')">×</button>
+<button class="close" type="button" data-drawer-close aria-label="Close miner details">×</button>
 <h3 style="color:{b.color}">{html.escape(b.label)} · {html.escape(b.hotkey)}</h3>
 <div style="margin-bottom:14px">
   <div class="kpi-row">
@@ -6024,221 +6069,26 @@ LOGS_PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SN81 fleet — logs</title>
-<script src="/static/htmx.min.js"></script>
-<style>
-  :root {
-    --bg: #0a0a0b;
-    --panel: #111114;
-    --panel-2: #14141a;
-    --border: #1f1f24;
-    --text: #e6dfd1;
-    --bone: #e6dfd1;
-    --dim: #6b6b6b;
-    --stone: #6b6b6b;
-    --amber: #e87a3e;
-    --green: #e87a3e;
-    --yellow: #d4a13e;
-    --reject: #d44d7a;
-    --red: #d44d7a;
-    --ledger: #4fb8e0;
-    --cyan: #4fb8e0;
-    --magenta: #d44d7a;
-    --orange: #e87a3e;
-  }
-  * { box-sizing: border-box; }
-  html, body {
-    margin: 0; padding: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12.5px;
-  }
-  header.logs-header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding: 14px 18px 12px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
-  }
-  header.logs-header h1 {
-    margin: 0;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: var(--bone);
-  }
-  header.logs-header a {
-    color: var(--stone);
-    text-decoration: none;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    margin-left: 14px;
-  }
-  header.logs-header a:hover { color: var(--amber); }
-  .filter-bar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    align-items: center;
-    padding: 12px 18px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel-2);
-  }
-  .filter-bar label {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--stone);
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .filter-bar input[type=text] {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--bone);
-    font-family: inherit;
-    font-size: 12px;
-    padding: 4px 8px;
-    width: 180px;
-  }
-  .filter-bar input[type=text]:focus {
-    outline: none;
-    border-color: var(--amber);
-  }
-  .kind-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 3px 9px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--stone);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    cursor: pointer;
-    user-select: none;
-  }
-  .kind-pill[data-on="1"] {
-    border-color: var(--amber);
-    color: var(--amber);
-  }
-  .kind-pill[data-kind="reject"][data-on="1"],
-  .kind-pill[data-kind="late_drop"][data-on="1"],
-  .kind-pill[data-kind="fail"][data-on="1"],
-  .kind-pill[data-kind="worker_fail"][data-on="1"],
-  .kind-pill[data-kind="window_timeout"][data-on="1"] {
-    border-color: var(--reject);
-    color: var(--reject);
-  }
-  .kind-pill[data-kind="seal"][data-on="1"] {
-    border-color: var(--ledger);
-    color: var(--ledger);
-  }
-  .toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    user-select: none;
-  }
-  .toggle input { accent-color: var(--amber); }
-  .pause-btn {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--bone);
-    padding: 4px 12px;
-    cursor: pointer;
-    font: inherit;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-  }
-  .pause-btn[data-paused="1"] { border-color: var(--reject); color: var(--reject); }
-  .pause-btn:hover { border-color: var(--amber); }
-  .log-meta {
-    padding: 8px 18px;
-    font-size: 11px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel-2);
-  }
-  .log-meta .dim { color: var(--stone); }
-  table.log-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
-  table.log-table thead th {
-    text-align: left;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    font-size: 10px;
-    font-weight: 500;
-    color: var(--stone);
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel-2);
-    position: sticky;
-    top: 0;
-  }
-  table.log-table tbody td {
-    padding: 5px 12px;
-    border-bottom: 1px solid rgba(31,31,36,0.5);
-    vertical-align: top;
-  }
-  .log-row:hover td { background: rgba(232,122,62,0.04); }
-  .log-row:hover .log-msg { color: var(--bone); }
-  td.log-ts { white-space: nowrap; font-size: 11px; }
-  td.log-kind { white-space: nowrap; }
-  td.log-hk code.hk {
-    color: var(--bone);
-    background: rgba(255,255,255,0.02);
-    padding: 1px 5px;
-    border: 1px solid var(--border);
-    font-size: 11px;
-  }
-  td.log-msg {
-    color: var(--stone);
-    font-size: 11.5px;
-    line-height: 1.4;
-    word-break: break-all;
-  }
-  .log-reason {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-  }
-  .chip-v23, .chip-dep, .chip-ours {
-    font-size: 9px;
-    letter-spacing: 0.16em;
-    padding: 1px 4px;
-    border: 1px solid currentColor;
-    margin-left: 4px;
-    text-transform: uppercase;
-  }
-  .chip-ours { color: var(--amber); margin-right: 4px; margin-left: 0; }
-  .chip-dep { color: var(--stone); }
-  .mono { font-family: inherit; }
-  .small { font-size: 10px; }
-  .dim, .stone { color: var(--stone); }
-  /* When ours-only is the active filter, dim everything that ISN'T ours
-     so the eye locks onto fleet rows even when 200+ events stream past. */
-  table.log-table.ours-mode tbody tr[data-ours="0"] { display: none; }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0a0b">
+<title>Reliquary Fleet · Logs</title>
+<link rel="icon" href="/static/brand/relic.svg?v={asset_version}" type="image/svg+xml">
+<link rel="preload" href="/static/fonts/geist-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
+<script src="/static/htmx.min.js" defer></script>
+<link rel="stylesheet" href="/static/logs.css?v={asset_version}">
 </head>
 <body>
 <header class="logs-header">
-  <h1>SN81 · validator logs <span style="color:var(--stone);font-weight:400;letter-spacing:0;text-transform:none;font-size:11px">· full buffer · filterable</span></h1>
-  <div>
-    <a href="/">↩ dashboard</a>
-    <a href="/api/export.json" target="_blank">↓ export</a>
+  <div class="logs-brand">
+    <img src="/static/brand/mark-outline.svg?v={asset_version}" alt="" width="24" height="24">
+    <h1>Reliquary Fleet · Logs <span>full local buffer</span></h1>
   </div>
+  <nav aria-label="Log tools">
+    <a href="/" aria-label="Back to dashboard" title="Back to dashboard">← Dashboard</a>
+    <a href="/api/export.json" target="_blank" aria-label="Download JSON export" title="Download JSON export">↓ JSON</a>
+  </nav>
 </header>
 
 <form class="filter-bar" id="filter-bar"
@@ -6246,34 +6096,35 @@ LOGS_PAGE = """<!doctype html>
       hx-trigger="change, keyup changed delay:300ms from:input[type=text], every 2s[!isPaused()]"
       hx-target="#log-out"
       hx-swap="innerHTML">
-  <label>kinds
+  <fieldset class="kind-fieldset">
+    <legend>kinds</legend>
     <span id="kind-pills">
-      <span class="kind-pill" data-kind="accept"     data-on="1">accept</span>
-      <span class="kind-pill" data-kind="reject"     data-on="1">reject</span>
-      <span class="kind-pill" data-kind="late_drop"  data-on="1">late_drop</span>
-      <span class="kind-pill" data-kind="selected"   data-on="1">selected</span>
-      <span class="kind-pill" data-kind="reward"     data-on="1">reward</span>
-      <span class="kind-pill" data-kind="seal"       data-on="0">seal</span>
-      <span class="kind-pill" data-kind="fail"       data-on="1">fail</span>
-      <span class="kind-pill" data-kind="worker_fail" data-on="1">worker_fail</span>
-      <span class="kind-pill" data-kind="window_timeout" data-on="1">window_timeout</span>
-      <span class="kind-pill" data-kind="randomness_retry" data-on="0">randomness_retry</span>
-      <span class="kind-pill" data-kind="randomness_ok"    data-on="0">randomness_ok</span>
+      <button type="button" class="kind-pill" data-kind="accept" data-on="1" aria-pressed="true">accept</button>
+      <button type="button" class="kind-pill" data-kind="reject" data-on="1" aria-pressed="true">reject</button>
+      <button type="button" class="kind-pill" data-kind="late_drop" data-on="1" aria-pressed="true">late_drop</button>
+      <button type="button" class="kind-pill" data-kind="selected" data-on="1" aria-pressed="true">selected</button>
+      <button type="button" class="kind-pill" data-kind="reward" data-on="1" aria-pressed="true">reward</button>
+      <button type="button" class="kind-pill" data-kind="seal" data-on="0" aria-pressed="false">seal</button>
+      <button type="button" class="kind-pill" data-kind="fail" data-on="1" aria-pressed="true">fail</button>
+      <button type="button" class="kind-pill" data-kind="worker_fail" data-on="1" aria-pressed="true">worker_fail</button>
+      <button type="button" class="kind-pill" data-kind="window_timeout" data-on="1" aria-pressed="true">window_timeout</button>
+      <button type="button" class="kind-pill" data-kind="randomness_retry" data-on="0" aria-pressed="false">randomness_retry</button>
+      <button type="button" class="kind-pill" data-kind="randomness_ok" data-on="0" aria-pressed="false">randomness_ok</button>
     </span>
     <input type="hidden" name="kinds" id="kinds-input" value="accept,reject,late_drop,selected,reward,fail,worker_fail,window_timeout">
-  </label>
+  </fieldset>
   <label>reason <input type="text" name="reason" placeholder="grail_fail / wrong_…"></label>
   <label>hotkey <input type="text" name="hotkey" placeholder="5D76… / 5Grw…"></label>
   <label class="toggle"><input type="checkbox" name="ours" value="1"> ours only</label>
   <label>limit
-    <select name="limit" style="background:var(--bg);border:1px solid var(--border);color:var(--bone);font-family:inherit;font-size:12px;padding:3px 6px">
+    <select name="limit" class="filter-select">
       <option value="200">200</option>
       <option value="500" selected>500</option>
       <option value="1500">1500</option>
       <option value="6000">all (6000)</option>
     </select>
   </label>
-  <button type="button" class="pause-btn" id="pause-btn" data-paused="0">▶ live</button>
+  <button type="button" class="pause-btn" id="pause-btn" data-paused="0" aria-pressed="false">● Live</button>
 </form>
 
 <div id="log-out"
@@ -6281,64 +6132,10 @@ LOGS_PAGE = """<!doctype html>
      hx-trigger="load"
      hx-include="#filter-bar"
      hx-swap="innerHTML">
-  <div style="padding:24px;text-align:center;color:var(--stone)">loading…</div>
+  <div style="padding:24px;text-align:center;color:var(--stone)" role="status">Loading...</div>
 </div>
 
-<script>
-  // Toggle a kind pill on/off → update the hidden kinds input, fire htmx.
-  const kindsInput = document.getElementById('kinds-input');
-  function syncKinds() {
-    const on = Array.from(document.querySelectorAll('#kind-pills .kind-pill[data-on="1"]'))
-      .map(p => p.getAttribute('data-kind'));
-    kindsInput.value = on.join(',');
-    // Re-fire the form so htmx re-fetches with the new value.
-    htmx.trigger(document.getElementById('filter-bar'), 'change');
-  }
-  document.getElementById('kind-pills').addEventListener('click', (e) => {
-    const p = e.target.closest('.kind-pill');
-    if (!p) return;
-    p.setAttribute('data-on', p.getAttribute('data-on') === '1' ? '0' : '1');
-    syncKinds();
-  });
-  // Pause toggle controls the auto-refresh. While paused the user can
-  // freely copy text without the row vanishing under the cursor.
-  const pauseBtn = document.getElementById('pause-btn');
-  pauseBtn.addEventListener('click', () => {
-    const on = pauseBtn.getAttribute('data-paused') === '1';
-    pauseBtn.setAttribute('data-paused', on ? '0' : '1');
-    pauseBtn.textContent = on ? '▶ live' : '⏸ paused';
-  });
-  // htmx every-2s trigger checks this each fire — return true to skip.
-  window.isPaused = () => pauseBtn.getAttribute('data-paused') === '1';
-  // Highlight ours-only rows by adding a class to the table.
-  document.body.addEventListener('change', (e) => {
-    if (e.target.name === 'ours') {
-      const table = document.querySelector('#log-out .log-table');
-      if (!table) return;
-      if (e.target.checked) table.classList.add('ours-mode');
-      else table.classList.remove('ours-mode');
-    }
-  });
-  // Click a row to copy the raw line to clipboard.
-  document.body.addEventListener('click', (e) => {
-    const row = e.target.closest('.log-row');
-    if (!row) return;
-    // Don't trigger when the user is selecting text.
-    if (window.getSelection && window.getSelection().toString().length > 0) return;
-    const ts = row.querySelector('.log-ts')?.textContent?.trim() ?? '';
-    const kind = row.querySelector('.log-kind')?.textContent?.trim() ?? '';
-    const reason = row.querySelector('.log-reason-cell')?.textContent?.trim() ?? '';
-    const hk = row.querySelector('.log-hk')?.textContent?.trim() ?? '';
-    const msg = row.querySelector('.log-msg')?.textContent ?? '';
-    const line = `${ts} ${kind} ${reason} ${hk} ${msg}`.trim();
-    if (navigator.clipboard) {
-      navigator.clipboard.writeText(line).then(() => {
-        row.style.background = 'rgba(232,122,62,0.18)';
-        setTimeout(() => { row.style.background = ''; }, 320);
-      });
-    }
-  });
-</script>
+<script src="/static/logs.js?v={asset_version}" defer></script>
 </body>
 </html>
 """
@@ -6348,895 +6145,160 @@ PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0a0b">
 <title>Reliquary Fleet</title>
-<script src="/static/htmx.min.js"></script>
-<style>
-  :root {
-    /* Reliquary brand palette. Obsidian canvas + amber accent + bone
-       text + JetBrains Mono everywhere. Existing render code uses the
-       legacy --green/--yellow/--red/--cyan/--magenta/--orange names;
-       we keep them as aliases so we don't have to rewrite every
-       individual color hint in the panel renderers. The new tokens
-       (--amber, --bone, --stone, --reject, --ledger) are preferred
-       for any new render code. */
-    --bg: #0a0a0b;
-    --panel: #111114;
-    --panel-2: #14141a;
-    --border: #1f1f24;
-    --text: #e6dfd1;
-    --bone: #e6dfd1;
-    --dim: #6b6b6b;
-    --stone: #6b6b6b;
-    --amber: #e87a3e;
-    --green: #e87a3e;   /* good / accepted — amber per brand */
-    --yellow: #d4a13e;  /* warning — desaturated amber */
-    --reject: #d44d7a;
-    --red: #d44d7a;
-    --ledger: #4fb8e0;
-    --cyan: #4fb8e0;
-    --magenta: #d44d7a;
-    --orange: #e87a3e;
-    /* Window/share data scale: intentionally not tied to Reliquary orange/yellow. */
-    --window-id: #a78bfa;
-    --share-none: #6b7280;
-    --share-zero: #fb7185;
-    --share-low: #a78bfa;
-    --share-mid: #38bdf8;
-    --share-good: #34d399;
-    --share-great: #22c55e;
-  }
-  * { box-sizing: border-box; }
-  html, body {
-    margin: 0; padding: 0;
-    background: var(--bg);
-    color: var(--text);
-    /* Reliquary brand: JetBrains Mono everywhere on the operator
-       dashboard. The serif/sans pair on reliquary-web only applies
-       to the marketing site; this is a dense data view. */
-    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
-    font-size: 11.4px;
-  }
-  ::selection { background: rgba(232,122,62,0.30); color: var(--bone); }
-  .grid-layout {
-    display: grid;
-    grid-template-columns:
-      minmax(240px, 1fr)
-      minmax(280px, 1.15fr)
-      minmax(320px, 1.3fr)
-      minmax(320px, 1.3fr);
-    grid-auto-rows: min-content;
-    gap: 9px;
-    padding: 9px;
-    align-items: start;
-    /* Operator-first order:
-       1) health and current score
-       2) live mission + recent windows
-       3) execution tables
-       4) deep diagnostics and event tails */
-    grid-template-areas:
-      "score score summary summary"
-      "windows windows forensics forensics"
-      "ema ema pipeline pipeline"
-      "fleet fleet frontier frontier"
-      "labs labs labs labs"
-      "rundown rundown valevents valevents"
-      "diagnostics diagnostics diagnostics diagnostics";
-  }
-  .grid-layout > * { min-width: 0; min-height: 0; }
-  .area-summary { grid-area: summary; }
-  .area-score { grid-area: score; }
-  .area-pipeline { grid-area: pipeline; max-height: 400px; overflow: auto; align-self: start; }
-  .area-frontier { grid-area: frontier; max-height: 400px; overflow: auto; align-self: start; }
-  /* EMA panel — capped + scrollable so the "all active" mode (up to
-     ~256 hotkeys on a saturated subnet) doesn't blow the dashboard
-     into a 4000-pixel-tall page. Operator switches modes via the
-     pills inline in the header. */
-  .area-ema {
-    grid-area: ema;
-    max-height: 400px;
-    overflow: auto;
-  }
-  /* Panel inside .area-ema must not also scroll — otherwise the
-     scrollTop save/restore on htmx swaps targets the wrong element
-     and the EMA table jumps back to the top on every 30 s refresh. */
-  .area-ema > .panel { height: auto; overflow: visible; }
-  .area-fleet { grid-area: fleet; max-height: 400px; overflow: auto; align-self: start; }
-  .area-labs { grid-area: labs; max-height: 320px; overflow: auto; align-self: start; }
-  .area-diagnostics {
-    grid-area: diagnostics;
-    display: grid;
-    grid-template-columns:
-      minmax(340px, 1.35fr)
-      minmax(220px, 0.9fr)
-      minmax(240px, 1fr)
-      minmax(320px, 1.25fr);
-    gap: 9px;
-    align-items: start;
-  }
-  .diag-column {
-    display: grid;
-    gap: 9px;
-    align-content: start;
-    min-width: 0;
-  }
-  .area-chain { max-height: min(500px, 56vh); overflow: auto; align-self: start; }
-  .area-baseline { max-height: 280px; overflow: auto; align-self: start; }
-  .area-rtt { max-height: 330px; overflow: auto; align-self: start; }
-  .area-slotrank { max-height: 330px; overflow: auto; align-self: start; }
-  .area-competitors { max-height: 330px; overflow: auto; align-self: start; }
-  .area-quality { max-height: 280px; overflow: auto; align-self: start; }
-  .area-forensics { grid-area: forensics; max-height: 400px; min-height: 240px; overflow: auto; align-self: start; }
-  /* Scrollable data panels. The OUTER grid item is the scroll
-     container so htmx innerHTML swaps don't reset scrollTop — the JS
-     handler at the bottom also captures+restores scroll across swaps. */
-  .area-valevents { grid-area: valevents; max-height: 400px; min-height: 240px; overflow: auto; align-self: start; }
-  .area-windows { grid-area: windows; max-height: 400px; min-height: 240px; overflow: auto; align-self: start; }
-  .area-events { max-height: 390px; overflow: auto; align-self: start; }
-  .area-rundown { grid-area: rundown; max-height: 400px; min-height: 220px; overflow: auto; align-self: start; }
-  /* Inside a scroll-container area, the .panel must NOT also scroll —
-     otherwise the inner element captures the wheel and the outer
-     element's scrollTop never advances (so our preserve logic never
-     sees the right value). */
-  .area-pipeline > .panel,
-  .area-fleet > .panel,
-  .area-labs > .panel,
-  .area-frontier > .panel,
-  .area-chain > .panel,
-  .area-baseline > .panel,
-  .area-rtt > .panel,
-  .area-slotrank > .panel,
-  .area-competitors > .panel,
-  .area-quality > .panel,
-  .area-valevents > .panel,
-  .area-windows > .panel,
-  .area-forensics > .panel,
-  .area-events > .panel,
-  .area-rundown > .panel { height: auto; overflow: visible; }
-
-  .overview-panel { overflow: hidden; }
-  .overview-table { table-layout: fixed; }
-  .overview-table th:first-child,
-  .overview-table td:first-child { width: 62px; }
-  .overview-table th,
-  .overview-table td {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    vertical-align: top;
-  }
-  table.grid.compact.overview-table td { padding: 1px 4px; }
-  .overview-main {
-    font-size: 11.5px;
-    font-weight: 700;
-    line-height: 1;
-    white-space: nowrap;
-  }
-  .overview-sub {
-    display: none;
-    color: var(--stone);
-    font-size: 8px;
-    line-height: 1;
-    margin-top: 1px;
-    white-space: nowrap;
-  }
-  .score-grid {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    grid-auto-rows: auto;
-    gap: 8px;
-    height: auto;
-    min-height: 0;
-  }
-  .score-card {
-    background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.015));
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    padding: 7px 9px;
-    min-height: 56px;
-  }
-  .score-label {
-    color: var(--stone);
-    font-size: 8.8px;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    margin-bottom: 5px;
-  }
-  .score-value {
-    color: var(--bone);
-    font-size: 18px;
-    font-weight: 700;
-    line-height: 1;
-  }
-  .score-sub {
-    color: var(--stone);
-    font-size: 9.6px;
-    margin-top: 5px;
-    line-height: 1.25;
-  }
-  .area-score > .panel { overflow: hidden; }
-
-  .mission-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
-    gap: 7px;
-  }
-  .mission-card {
-    background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.012));
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    min-height: 58px;
-    padding: 7px 8px;
-  }
-  .mission-label {
-    color: var(--stone);
-    font-size: 8.8px;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    margin-bottom: 5px;
-  }
-  .mission-value {
-    color: var(--bone);
-    font-size: 18px;
-    font-weight: 700;
-    line-height: 1;
-  }
-  .mission-value .dim { font-size: 12px; font-weight: 500; }
-  .mission-sub {
-    color: var(--stone);
-    font-size: 9.6px;
-    margin-top: 5px;
-    line-height: 1.25;
-  }
-  .mission-diagnosis {
-    margin-top: 8px;
-    border: 1px solid;
-    border-radius: 4px;
-    padding: 7px 9px;
-    background: rgba(255,255,255,0.025);
-    font-weight: 600;
-  }
-  .mission-hotkeys {
-    margin-top: 8px;
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    max-height: 74px;
-    overflow: auto;
-    padding-right: 4px;
-  }
-  .mission-chip {
-    display: inline-flex;
-    gap: 6px;
-    align-items: baseline;
-    background: rgba(255,255,255,0.035);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 4px 8px;
-    color: var(--dim);
-  }
-  .pipeline-table td, .pipeline-table th { white-space: nowrap; }
-  .mini-meter {
-    height: 8px;
-    width: 100%;
-    min-width: 110px;
-    background: var(--border);
-    border-radius: 999px;
-    overflow: hidden;
-  }
-  .mini-meter span { display:block; height:100%; }
-  .share-meter {
-    background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.05);
-  }
-  .window-share-summary {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 6px 10px;
-    margin: 0 0 8px 0;
-  }
-  .share-stat {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 5px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: rgba(255,255,255,0.025);
-    padding: 3px 7px;
-    color: var(--stone);
-    white-space: nowrap;
-  }
-  .share-stat b { color: var(--bone); }
-  .share-stat em {
-    color: var(--stone);
-    font-size: 10px;
-    font-style: normal;
-  }
-  .share-legend {
-    display: inline-flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-left: auto;
-  }
-  .share-band {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--stone);
-    font-size: 10px;
-    white-space: nowrap;
-  }
-  .share-band i {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 2px;
-  }
-
-  /* Star button in the EMA leaderboard. Borderless, inherits row color,
-     just a tap target for the toggle. */
-  .star-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    font-size: 14px;
-    padding: 0 2px;
-    line-height: 1;
-    transition: transform 0.08s ease-out;
-  }
-  .star-btn:hover { transform: scale(1.25); }
-  .star-btn:disabled { opacity: 0.5; cursor: wait; }
-  .target-context-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin: -2px 0 10px 0;
-  }
-  .target-context-chip,
-  .scope-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    padding: 2px 6px;
-    font-size: 10px;
-    line-height: 1.2;
-    white-space: nowrap;
-  }
-  .target-context-chip {
-    background: rgba(255,184,108,0.10);
-    color: var(--amber);
-  }
-  .scope-chip {
-    font-family: "SF Mono", Menlo, monospace;
-    text-transform: uppercase;
-    letter-spacing: 0;
-  }
-  .scope-target {
-    border-color: rgba(63,185,80,0.42);
-    background: rgba(63,185,80,0.12);
-    color: var(--green);
-  }
-  .scope-network {
-    background: rgba(255,255,255,0.035);
-    color: var(--stone);
-  }
-
-  /* Rundown panel — dense, structured KPIs over a configurable timeframe.
-     The visual chrome reuses .panel; this scopes the inner structure. */
-  .rd-tf-row {
-    display: flex;
-    gap: 6px;
-    margin: 4px 0 10px 0;
-    flex-wrap: wrap;
-  }
-  .rd-pill {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 2px 9px;
-    font-size: 11px;
-    color: var(--dim);
-    text-decoration: none;
-    font-family: "SF Mono", Menlo, monospace;
-  }
-  .rd-pill:hover { color: var(--text); background: rgba(255,255,255,0.07); }
-  .rd-pill-active {
-    background: rgba(88,166,255,0.16);
-    border-color: var(--cyan);
-    color: var(--cyan);
-  }
-  .rd-deploy {
-    background: rgba(255,255,255,0.02);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 6px 10px;
-    margin-bottom: 10px;
-  }
-  .rd-deploy-line { font-size: 12px; line-height: 1.5; }
-  .rd-section { margin-bottom: 10px; }
-  .rd-section:last-child { margin-bottom: 0; }
-  .rd-section-title {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--dim);
-    font-weight: 600;
-    margin-bottom: 4px;
-    border-top: 1px dashed rgba(255,255,255,0.06);
-    padding-top: 6px;
-  }
-  .rd-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-  }
-  .rd-list li {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    padding: 1px 0;
-    font-size: 12px;
-  }
-  .rd-list.rd-reasons li {
-    gap: 8px;
-    justify-content: flex-start;
-  }
-  .rd-label { color: var(--dim); }
-  .rd-val {
-    font-family: "SF Mono", Menlo, monospace;
-    font-weight: 600;
-  }
-  .rd-dim { color: var(--dim); }
-
-  @media (max-width: 1350px) {
-    .grid-layout {
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      grid-template-areas:
-        "score summary"
-        "windows forensics"
-        "ema ema"
-        "pipeline pipeline"
-        "fleet fleet"
-        "frontier frontier"
-        "labs labs"
-        "rundown valevents"
-        "diagnostics diagnostics";
-    }
-    .mission-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  }
-
-  @media (max-width: 1180px) {
-    .area-diagnostics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  }
-
-  /* On narrow screens: stack everything */
-  @media (max-width: 900px) {
-    .grid-layout {
-      grid-template-columns: 1fr;
-      grid-template-areas:
-        "score" "summary" "windows" "forensics"
-        "ema" "pipeline" "frontier" "fleet"
-        "labs"
-        "rundown" "valevents"
-        "diagnostics";
-    }
-    .area-diagnostics { grid-template-columns: 1fr; }
-    .overview-table th:first-child,
-    .overview-table td:first-child { width: 52px; }
-    .overview-main { font-size: 11.5px; }
-    .overview-sub { display: none; }
-    .area-valevents,
-    .area-forensics,
-    .area-windows,
-    .area-events,
-    .area-rundown,
-    .area-pipeline,
-    .area-fleet,
-    .area-labs,
-    .area-frontier,
-    .area-chain,
-    .area-baseline,
-    .area-rtt,
-    .area-slotrank,
-    .area-competitors,
-    .area-quality { max-height: 360px; }
-    .score-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .mission-grid { grid-template-columns: 1fr; }
-  }
-
-  /* Inline KPI mini-tags for chain / baseline panels */
-  .kpi-row { display: flex; gap: 9px; flex-wrap: wrap; }
-  .kpi-mini {
-    background: rgba(255,255,255,0.03);
-    padding: 3px 8px;
-    border-radius: 4px;
-    font-size: 10.6px;
-    color: var(--dim);
-  }
-  .kpi-mini b { color: var(--text); margin-left: 4px; font-size: 11.6px; }
-
-  /* KPI tiles in fleet summary */
-  .kpis {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 9px;
-  }
-  .kpi {
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-radius: 2px;
-    padding: 6px 9px;
-  }
-  .kpi-label {
-    font-size: 8.8px;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--stone);
-    font-weight: 500;
-    margin-bottom: 4px;
-  }
-  .kpi-value {
-    font-size: 17px;
-    font-weight: 600;
-    color: var(--bone);
-    font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
-    line-height: 1.1;
-  }
-  .kpi-value .dim { font-size: 11.5px; font-weight: 400; }
-  .kpi-sub {
-    font-size: 9px;
-    color: var(--stone);
-    margin-top: 3px;
-    font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
-    word-break: break-all;
-  }
-
-  /* Sparkline glyphs need a slightly larger line-height to render cleanly */
-  .spark {
-    font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
-    font-size: 12px;
-    letter-spacing: 0;
-  }
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 2px;
-    padding: 8px 10px;
-    height: 100%;
-    overflow: auto;
-  }
-  h2 {
-    margin: 0 0 6px 0;
-    font-size: 10px;
-    font-weight: 500;
-    color: var(--bone);
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 5px;
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  h2 .dim, h2 .small { text-transform: none; letter-spacing: 0; }
-  .dim { color: var(--dim); }
-  .red { color: var(--red); }
-  .green { color: var(--green); }
-  .yellow { color: var(--yellow); }
-  .cyan { color: var(--cyan); }
-  .magenta { color: var(--magenta); }
-  .small { font-size: 10px; }
-  .mono { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
-  .num { text-align: right; }
-  .lbl { font-weight: 700; }
-  table.grid {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 11px;
-  }
-  table.grid th, table.grid td {
-    padding: 3px 6px;
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-  }
-  table.grid th {
-    color: var(--dim);
-    font-weight: 600;
-    text-transform: uppercase;
-    font-size: 9px;
-    letter-spacing: 0.05em;
-  }
-  table.grid.compact th, table.grid.compact td {
-    padding: 2px 5px;
-  }
-  .bar-wrap {
-    position: relative;
-    background: var(--border);
-    height: 18px;
-    border-radius: 3px;
-    overflow: hidden;
-    width: 200px;
-  }
-  .bar {
-    height: 100%;
-    transition: width 0.3s ease;
-  }
-  .bar-text {
-    position: absolute;
-    left: 0; right: 0; top: 0;
-    line-height: 18px;
-    text-align: center;
-    color: var(--bg);
-    font-weight: 700;
-    font-size: 11px;
-    text-shadow: 0 0 2px rgba(0,0,0,0.4);
-    mix-blend-mode: difference;
-  }
-  .share-bar-wrap {
-    width: 230px;
-    max-width: 100%;
-    background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.05);
-  }
-  .share-bar-text {
-    color: var(--bone);
-    mix-blend-mode: normal;
-    text-shadow: 0 1px 2px rgba(0,0,0,0.85);
-  }
-  .total {
-    margin-top: 8px;
-    padding-top: 6px;
-    border-top: 1px dashed var(--border);
-    text-align: right;
-    font-size: 12px;
-  }
-  .events {
-    font-family: "SF Mono", Menlo, monospace;
-    font-size: 11px;
-    line-height: 1.4;
-  }
-  .evt {
-    padding: 2px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.03);
-  }
-  .evt-lbl {
-    display: inline-block;
-    width: 50px;
-    font-weight: 700;
-  }
-  .evt-msg { white-space: pre-wrap; }
-  .evt-ok .evt-msg { color: var(--green); }
-  .evt-bad .evt-msg { color: var(--red); }
-  .evt-info .evt-msg { color: var(--text); }
-  /* Validator-events panel — "ours" rows highlight strongly so the eye lands
-     on emission-earning events first. Non-ours rows stay dim. */
-  .evt-ok-ours { background: rgba(232, 122, 62, 0.07); }
-  .evt-ok-ours .evt-msg { color: var(--amber); font-weight: 600; }
-  .evt-ok-ours .evt-kind { color: var(--amber); }
-  .evt-bad-ours { background: rgba(212, 77, 122, 0.10); }
-  .evt-bad-ours .evt-msg { color: var(--reject); font-weight: 600; }
-  .evt-bad-ours .evt-kind { color: var(--reject); }
-  .evt-ts {
-    display: inline-block;
-    width: 64px;
-    margin-right: 6px;
-  }
-  .evt-kind {
-    display: inline-block;
-    width: 60px;
-    margin-right: 6px;
-    color: var(--dim);
-  }
-
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
-  }
-  header h1 {
-    margin: 0;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: var(--bone);
-  }
-  header .subtitle {
-    color: var(--stone);
-    font-size: 11px;
-    letter-spacing: 0.04em;
-  }
-  .header-meta,
-  .poll-status,
-  header nav {
-    display: flex;
-    align-items: center;
-  }
-  .header-meta { gap: 12px; }
-  .poll-status { gap: 6px; white-space: nowrap; }
-  header nav { gap: 14px; }
-  header a {
-    color: var(--stone);
-    text-decoration: none;
-    margin-left: 0;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-  }
-  header a:hover { color: var(--amber); }
-  /* Drill-down drawer (slides in from right when a box row is clicked) */
-  #drawer {
-    position: fixed;
-    top: 0; right: 0; bottom: 0;
-    width: 480px;
-    background: var(--panel);
-    border-left: 1px solid var(--border);
-    padding: 14px;
-    overflow-y: auto;
-    transform: translateX(100%);
-    transition: transform 0.2s ease;
-    box-shadow: -4px 0 24px rgba(0,0,0,0.4);
-    z-index: 1000;
-  }
-  #drawer.open { transform: translateX(0); }
-  #drawer h3 { margin: 0 0 10px; font-size: 14px; }
-  #drawer .close {
-    float: right; cursor: pointer;
-    color: var(--dim); font-size: 18px;
-    background: none; border: none;
-  }
-  table.grid tbody tr { cursor: pointer; }
-  table.grid tbody tr:hover { background: rgba(255,255,255,0.04); }
-  /* Alert flash when health goes red — add this class via JS */
-  .health-alert .kpi-value { animation: blink 1s infinite; }
-  @keyframes blink { 50% { opacity: 0.4; } }
-  .pulse {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    background: var(--green);
-    border-radius: 50%;
-    animation: pulse 1.6s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(0.7); }
-  }
-  @media (max-width: 900px) {
-    header {
-      padding: 8px 10px;
-      flex-wrap: wrap;
-      gap: 6px 10px;
-    }
-    header h1 {
-      font-size: 10px;
-      letter-spacing: 0.12em;
-      white-space: nowrap;
-    }
-    .header-meta {
-      flex: 1;
-      justify-content: flex-end;
-      min-width: 220px;
-    }
-    header nav { gap: 10px; }
-    header a { font-size: 9px; }
-  }
-  @media (max-width: 600px) {
-    .header-meta {
-      flex-basis: 100%;
-      min-width: 0;
-      justify-content: space-between;
-      gap: 8px;
-      font-size: 9px;
-    }
-    header nav { gap: 9px; }
-    .overview-table th:nth-child(4),
-    .overview-table td:nth-child(4) { display: none; }
-    .area-windows th:nth-child(4),
-    .area-windows td:nth-child(4),
-    .area-windows th:nth-child(5),
-    .area-windows td:nth-child(5),
-    .area-forensics th:nth-child(5),
-    .area-forensics td:nth-child(5),
-    .area-forensics th:nth-child(6),
-    .area-forensics td:nth-child(6) { display: none; }
-    .area-windows .share-bar-wrap,
-    .area-forensics .share-bar-wrap { width: min(190px, 52vw); }
-  }
-</style>
+<link rel="icon" href="/static/brand/relic.svg?v={asset_version}" type="image/svg+xml">
+<link rel="preload" href="/static/fonts/geist-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
+<script src="/static/htmx.min.js" defer></script>
+<link rel="stylesheet" href="/static/dashboard.css?v={asset_version}">
 </head>
 <body>
-<header>
-  <h1>Reliquary fleet · <span class="dim">live</span></h1>
+<a class="skip-link" href="#main-content">Skip to dashboard</a>
+<header class="app-header">
+  <div class="brand-lockup">
+    <img src="/static/brand/mark-outline.svg?v={asset_version}" alt="" width="26" height="26">
+    <h1>Reliquary <span>Fleet</span></h1>
+    <span class="live-label">live</span>
+    {demo_badge}
+  </div>
   <div class="subtitle header-meta">
-    <span class="poll-status"><span class="pulse"></span>{refresh_s}s poll</span>
+    <span class="poll-status" title="Local dashboard refresh cadence"><span class="pulse"></span>{refresh_s}s</span>
     <nav aria-label="Dashboard tools">
-      <a href="/logs">↗ logs</a>
-      <a href="/api/export.json" target="_blank" title="Download JSON export">↓ JSON</a>
-      <a href="#" id="sound-toggle">sound on</a>
+      <a class="tool-button" href="/logs" title="Open event logs" aria-label="Open event logs">
+        <span class="tool-icon" aria-hidden="true">↗</span><span class="tool-label">Logs</span>
+      </a>
+      <a class="tool-button" href="/api/export.json" target="_blank" title="Download JSON export" aria-label="Download JSON export">
+        <span class="tool-icon" aria-hidden="true">↓</span><span class="tool-label">JSON</span>
+      </a>
+      <button class="tool-button" type="button" id="sound-toggle" aria-pressed="false" title="Enable alert sound">
+        <span class="tool-icon" data-sound-icon aria-hidden="true">♪</span><span class="tool-label" data-sound-label>Sound off</span>
+      </button>
     </nav>
   </div>
 </header>
 
 <!-- Drill-down drawer (populated on row click) -->
-<div id="drawer" hx-target="this" hx-swap="innerHTML"></div>
+<button id="drawer-backdrop" type="button" aria-label="Close miner details" hidden></button>
+<aside id="drawer" role="dialog" aria-modal="true" aria-hidden="true" aria-label="Miner details" tabindex="-1" hx-target="this" hx-swap="innerHTML" inert></aside>
 
-<div class="grid-layout">
-  <div class="area-summary"
+<main class="dashboard-shell" id="main-content">
+  <div class="dashboard-core">
+    <div class="dashboard-stack dashboard-stack-primary">
+      <section class="area-score dashboard-area"
+           aria-busy="true"
+           aria-label="Window score"
+           hx-get="/api/scoreboard"
+           hx-trigger="load, every 3s"
+           hx-swap="innerHTML">
+        <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+      <section class="area-windows dashboard-area"
+           aria-busy="true"
+           aria-label="Window history"
+           hx-get="/api/windows"
+           hx-trigger="load, every 6s"
+           hx-swap="innerHTML">
+        <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+      <section class="area-ema dashboard-area"
+           aria-busy="true"
+           aria-label="EMA leaderboard"
+           hx-get="/api/ema?mode=top"
+           hx-trigger="load, every 30s"
+           hx-swap="innerHTML"
+           id="ema-area"
+           data-mode="top">
+        <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+      <section class="area-fleet dashboard-area"
+           aria-busy="true"
+           aria-label="Fleet health"
+           hx-get="/api/fleet"
+           hx-trigger="load, every 3s"
+           hx-swap="innerHTML">
+        <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+    </div>
+
+    <div class="dashboard-stack dashboard-stack-secondary">
+      <section class="area-summary dashboard-area"
+       aria-busy="true"
+       aria-label="Operations overview"
        hx-get="/api/summary"
        hx-trigger="load, every 3s"
        hx-swap="innerHTML">
-  </div>
-  <div class="area-score"
-       hx-get="/api/scoreboard"
-       hx-trigger="load, every 3s"
-       hx-swap="innerHTML">
-  </div>
-  <div class="area-forensics"
+        <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+      <section class="area-forensics dashboard-area"
+       aria-busy="true"
+       aria-label="Window forensics"
        hx-get="/api/window_forensics"
        hx-trigger="load, every 6s"
        hx-swap="innerHTML">
-  </div>
-  <div class="area-windows"
-       hx-get="/api/windows"
-       hx-trigger="load, every 6s"
-       hx-swap="innerHTML">
-  </div>
-  <div class="area-ema"
-       hx-get="/api/ema?mode=top"
-       hx-trigger="load, every 30s"
-       hx-swap="innerHTML"
-       id="ema-area"
-       data-mode="top">
-  </div>
-  <div class="area-pipeline"
+        <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+      <section class="area-pipeline dashboard-area"
+       aria-busy="true"
+       aria-label="GPU and reference pipeline"
        hx-get="/api/pipeline"
        hx-trigger="load, every 3s"
        hx-swap="innerHTML">
-  </div>
-  <div class="area-fleet"
-       hx-get="/api/fleet"
-       hx-trigger="load, every 3s"
-       hx-swap="innerHTML">
-  </div>
-  <div class="area-labs"
-       hx-get="/api/labs"
-       hx-trigger="load, every 5s"
-       hx-swap="innerHTML">
-  </div>
-  <div class="area-frontier"
+        <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+      <section class="area-frontier dashboard-area"
+       aria-busy="true"
+       aria-label="Frontier selection"
        hx-get="/api/frontier"
        hx-trigger="load, every 5s"
        hx-swap="innerHTML">
+        <div class="panel skeleton-panel" aria-hidden="true"><h2>Prompt frontier</h2><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+      </section>
+    </div>
   </div>
-  <div class="area-rundown"
+
+  <section class="area-labs dashboard-area"
+       aria-busy="true"
+       aria-label="Submit-disabled accelerator labs"
+       hx-get="/api/labs"
+       hx-trigger="load, every 5s"
+       hx-swap="innerHTML">
+    <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+  </section>
+
+  <div class="dashboard-tail">
+    <section class="area-rundown dashboard-area"
+       aria-busy="true"
+       aria-label="Validator rundown"
        hx-get="/api/validator_rundown?tf=30m"
        hx-trigger="load, every 5s"
        hx-swap="innerHTML"
        id="rundown-area"
        data-tf="30m">
-  </div>
-  <div class="area-valevents"
+      <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+    </section>
+    <section class="area-valevents dashboard-area"
+       aria-busy="true"
+       aria-label="Validator events"
        hx-get="/api/validator_events"
        hx-trigger="load, every 2s"
        hx-swap="innerHTML">
+      <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+    </section>
   </div>
+
   <div class="area-diagnostics">
     <div class="diag-column">
       <div class="area-chain"
+           aria-label="Chain and metagraph"
            hx-get="/api/chain"
            hx-trigger="load, every 30s"
            hx-swap="innerHTML">
       </div>
       <div class="area-slotrank"
+           aria-label="Canonical rank distribution"
            hx-get="/api/slotrank"
            hx-trigger="load, every 6s"
            hx-swap="innerHTML">
@@ -7244,11 +6306,13 @@ PAGE = """<!doctype html>
     </div>
     <div class="diag-column">
       <div class="area-baseline"
+           aria-label="Throughput baseline"
            hx-get="/api/baseline"
            hx-trigger="load, every 10s"
            hx-swap="innerHTML">
       </div>
       <div class="area-competitors"
+           aria-label="Top competing miners"
            hx-get="/api/competitors"
            hx-trigger="load, every 6s"
            hx-swap="innerHTML">
@@ -7256,11 +6320,13 @@ PAGE = """<!doctype html>
     </div>
     <div class="diag-column">
       <div class="area-rtt"
+           aria-label="Network latency"
            hx-get="/api/rtt"
            hx-trigger="load, every 15s"
            hx-swap="innerHTML">
       </div>
       <div class="area-quality"
+           aria-label="Quality distribution"
            hx-get="/api/quality"
            hx-trigger="load, every 6s"
            hx-swap="innerHTML">
@@ -7268,159 +6334,16 @@ PAGE = """<!doctype html>
     </div>
     <div class="diag-column">
       <div class="area-events"
+           aria-label="Live miner event tail"
            hx-get="/api/events"
            hx-trigger="load, every 3s"
            hx-swap="innerHTML">
       </div>
     </div>
   </div>
-</div>
+</main>
 
-<script>
-  // Sound alert: ping when health goes red.
-  let soundOn = true;
-  let lastHealth = null;
-  document.getElementById('sound-toggle').addEventListener('click', (e) => {
-    e.preventDefault();
-    soundOn = !soundOn;
-    e.target.textContent = soundOn ? 'sound on' : 'sound off';
-  });
-  function ping() {
-    if (!soundOn) return;
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain); gain.connect(ctx.destination);
-    osc.frequency.value = 880; gain.gain.value = 0.05;
-    osc.start(); osc.stop(ctx.currentTime + 0.15);
-  }
-  // Watch the summary panel for ALERT/DEGRADED — fires on htmx:afterSwap.
-  document.body.addEventListener('htmx:afterSwap', (e) => {
-    if (e.target.classList && e.target.classList.contains('area-summary')) {
-      const txt = e.target.textContent;
-      const cur = txt.includes('ALERT') ? 'alert' : txt.includes('DEGRADED') ? 'degraded' : 'ok';
-      if (lastHealth && lastHealth !== cur && cur !== 'ok') ping();
-      lastHealth = cur;
-    }
-  });
-  // Drill-down: click a row in the fleet table to load box detail.
-  document.body.addEventListener('click', (e) => {
-    const row = e.target.closest('.area-fleet table.grid tbody tr');
-    if (!row) return;
-    const label = row.querySelector('.lbl')?.textContent;
-    if (!label) return;
-    fetch('/api/box/' + encodeURIComponent(label.trim()))
-      .then(r => r.text())
-      .then(html => {
-        const drawer = document.getElementById('drawer');
-        drawer.innerHTML = html;
-        drawer.classList.add('open');
-      });
-  });
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') document.getElementById('drawer').classList.remove('open');
-  });
-  // Rundown timeframe pills — rewrite the area's hx-get + force an
-  // immediate reload. We persist the selection on the area's data-tf
-  // attribute so subsequent auto-refreshes hit the same timeframe.
-  document.body.addEventListener('click', (e) => {
-    const pill = e.target.closest('#rundown-tf-row .rd-pill, #rundown-tf-row .rd-pill-active');
-    if (!pill) return;
-    e.preventDefault();
-    const tf = pill.getAttribute('data-tf');
-    if (!tf) return;
-    const area = document.getElementById('rundown-area');
-    if (!area) return;
-    area.setAttribute('data-tf', tf);
-    area.setAttribute('hx-get', '/api/validator_rundown?tf=' + encodeURIComponent(tf));
-    if (window.htmx) {
-      window.htmx.process(area);
-      window.htmx.trigger(area, 'load');
-    }
-  });
-  // EMA leaderboard mode pills — same pattern as rundown timeframe.
-  // The pills live INSIDE the EMA panel which gets re-rendered on
-  // every auto-refresh; the click target is recreated each swap, so
-  // we delegate from document.body to catch clicks after the swap
-  // completes (htmx re-attaches automatically).
-  document.body.addEventListener('click', (e) => {
-    const pill = e.target.closest('#ema-mode-row .rd-pill, #ema-mode-row .rd-pill-active');
-    if (!pill) return;
-    e.preventDefault();
-    const mode = pill.getAttribute('data-mode');
-    if (!mode) return;
-    const area = document.getElementById('ema-area');
-    if (!area) return;
-    area.setAttribute('data-mode', mode);
-    area.setAttribute('hx-get', '/api/ema?mode=' + encodeURIComponent(mode));
-    if (window.htmx) {
-      window.htmx.process(area);
-      window.htmx.trigger(area, 'load');
-    }
-  });
-  // Star toggle — clicking a ★ in the EMA leaderboard posts the new
-  // state and forces a fresh EMA render so the row + summary KPIs
-  // re-tint without waiting for the next 30s refresh.
-  document.body.addEventListener('click', (e) => {
-    const btn = e.target.closest('.star-btn');
-    if (!btn) return;
-    e.preventDefault();
-    e.stopPropagation();    // don't trigger the row-click drilldown
-    const hk = btn.getAttribute('data-hk');
-    if (!hk) return;
-    btn.disabled = true;
-    fetch('/api/star/' + encodeURIComponent(hk), {
-      method: 'POST',
-      headers: { 'X-Reliquary-Fleet': '1' }
-    })
-      .then(r => r.json())
-      .then(() => {
-        const ema = document.querySelector('.area-ema');
-        if (ema && window.htmx) window.htmx.trigger(ema, 'load');
-        const summary = document.querySelector('.area-summary');
-        if (summary && window.htmx) window.htmx.trigger(summary, 'load');
-        const score = document.querySelector('.area-score');
-        if (score && window.htmx) window.htmx.trigger(score, 'load');
-      })
-      .catch(err => console.warn('star toggle failed', err))
-      .finally(() => { btn.disabled = false; });
-  });
-  // Scroll preservation across htmx swaps. When an .area-* element
-  // gets innerHTML-swapped, its child .panel is destroyed and rebuilt
-  // — the browser would reset scrollTop to 0 on the new element. We
-  // capture scrollTop on the OUTER scroll container (.area-*) before
-  // the swap and restore it after. The CSS sibling change moves the
-  // overflow:auto from .panel to .area-* so the container itself
-  // survives the swap, but for the rundown/events areas (which
-  // rebuild their entire inner DOM) we still need to remember the
-  // previous scroll position explicitly.
-  const SCROLLABLE = [
-    'area-ema', 'area-windows', 'area-forensics', 'area-pipeline', 'area-fleet', 'area-labs', 'area-frontier',
-    'area-chain', 'area-baseline', 'area-rtt', 'area-slotrank', 'area-competitors', 'area-quality',
-    'area-valevents', 'area-events', 'area-rundown'
-  ];
-  document.body.addEventListener('htmx:beforeSwap', (e) => {
-    const t = e.detail.target;
-    if (!t || !t.classList) return;
-    for (const cls of SCROLLABLE) {
-      if (t.classList.contains(cls)) {
-        t.dataset.savedScroll = String(t.scrollTop);
-        break;
-      }
-    }
-  });
-  document.body.addEventListener('htmx:afterSwap', (e) => {
-    const t = e.detail.target;
-    if (!t || !t.dataset || !t.dataset.savedScroll) return;
-    // Restore on the next animation frame so the new content has had
-    // a chance to lay out — otherwise scrollTop would clamp to 0
-    // because content height is still being measured.
-    requestAnimationFrame(() => {
-      const top = parseInt(t.dataset.savedScroll, 10);
-      if (!Number.isNaN(top)) t.scrollTop = top;
-    });
-  });
-</script>
+<script src="/static/dashboard.js?v={asset_version}" defer></script>
 </body>
 </html>
 """
@@ -7431,8 +6354,10 @@ def make_app(
     refresh_s: float,
     *,
     poll_stale_s: float | None = None,
+    demo_mode: bool = False,
 ) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None)
+    app.add_middleware(GZipMiddleware, minimum_size=500)
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -7440,7 +6365,7 @@ def make_app(
         response.headers.setdefault("Cache-Control", "no-store")
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
             "connect-src 'self'; object-src 'none'; base-uri 'none'; "
             "frame-ancestors 'none'",
@@ -7454,23 +6379,32 @@ def make_app(
         response.headers.setdefault("X-Frame-Options", "DENY")
         return response
 
-    @app.get("/static/htmx.min.js", include_in_schema=False)
-    def htmx_asset():
+    @app.get("/static/{asset_path:path}", include_in_schema=False)
+    def static_asset(asset_path: str):
+        if asset_path not in _STATIC_ASSETS:
+            raise HTTPException(status_code=404, detail="asset not found")
         return Response(
-            _HTMX_JS,
-            media_type="text/javascript",
+            _STATIC_ASSETS[asset_path],
+            media_type=_STATIC_MEDIA_TYPES[asset_path],
             headers={"Cache-Control": "public, max-age=31536000, immutable"},
         )
 
     @app.get("/", response_class=HTMLResponse)
     def index():
-        return PAGE.replace("{refresh_s}", str(int(refresh_s)))
+        return (
+            PAGE.replace("{refresh_s}", str(int(refresh_s)))
+            .replace("{asset_version}", __version__)
+            .replace(
+                "{demo_badge}",
+                '<span class="demo-badge">demo data</span>' if demo_mode else "",
+            )
+        )
 
     @app.get("/logs", response_class=HTMLResponse)
     def logs_page():
         """Dedicated forensic-grade logs page. Full deque (6000 events),
         filterable, no truncation."""
-        return LOGS_PAGE
+        return LOGS_PAGE.replace("{asset_version}", __version__)
 
     @app.get("/api/logs", response_class=HTMLResponse)
     def api_logs(
@@ -7864,49 +6798,52 @@ def main(argv: list[str] | None = None) -> int:
             _ema_window_count = len(cached_windows)
         except Exception:
             pass
-    # Every network probe begins in a daemon thread. In particular, chain
-    # discovery no longer delays the HTTP listener when an old SSH host is
-    # unreachable; the panel shows a bounded warming/error state instead.
-    def start_thread(name: str, target, thread_args: tuple = ()) -> None:
-        threading.Thread(
-            name=f"reliquary-fleet-{name}",
-            target=target,
-            args=thread_args,
-            daemon=True,
-        ).start()
-
-    start_thread("poller", poller_loop, (args.refresh, args.history))
-    start_thread("chain", chain_loop, (300,))
-    start_thread("rtt", rtt_loop, (60,))
-    start_thread("baseline", baseline_loop, (60,))
-    # Validator lifecycle tail: one long-lived SSH "docker logs -f" stream
-    # parsed into _validator_events. It complements (but does not override)
-    # the exact `/verdicts` feed used for fleet acceptance counters.
-    start_thread("validator-tail", validator_tail_loop)
-    # Validator deployment probe: docker inspect via SSH every 60 s so the
-    # rundown panel can fingerprint which image is live + how long it's
-    # been up.
-    start_thread("deployment", deployment_loop)
-
-    start_thread("r2", r2_loop, (args.history, 30))
-    print(f"[fleet_web] background pollers started · open http://{args.host}:{args.port}",
-          file=sys.stderr)
-
-    if args.open:
-        browser_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
-        threading.Timer(
-            1.0,
-            webbrowser.open,
-            args=(f"http://{browser_host}:{args.port}",),
-        ).start()
-
     app = make_app(
         args.refresh,
         poll_stale_s=_settings.SETTINGS.health_poll_stale_seconds,
     )
+    config = uvicorn.Config(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config)
+    collectors = [
+        ("poller", poller_loop, (args.refresh, args.history)),
+        ("chain", chain_loop, (300,)),
+        ("rtt", rtt_loop, (60,)),
+        ("baseline", baseline_loop, (60,)),
+        # The log tail complements the exact /verdicts feed; R2 remains
+        # authoritative for final selection and reward.
+        ("validator-tail", validator_tail_loop, ()),
+        ("deployment", deployment_loop, ()),
+        ("r2", r2_loop, (args.history, 30)),
+    ]
+
+    def ready() -> None:
+        print(
+            "[fleet_web] local socket ready; background pollers started · "
+            f"open http://{args.host}:{args.port}",
+            file=sys.stderr,
+        )
+        if args.open:
+            browser_host = (
+                "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+            )
+            webbrowser.open(f"http://{browser_host}:{args.port}")
+
+    threading.Thread(
+        name="reliquary-fleet-collector-supervisor",
+        target=_start_collectors_after_ready,
+        args=(server, collectors),
+        kwargs={"on_ready": ready},
+        daemon=True,
+    ).start()
     try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+        server.run()
     finally:
+        server.should_exit = True
         _release_instance_lock()
     return 0
 
