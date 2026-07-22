@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import socket
 import stat
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
@@ -28,8 +32,8 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     return asyncio.run(run())
 
 
-def test_release_version_is_1_0_0() -> None:
-    assert __version__ == "1.0.0"
+def test_release_version_is_1_0_1() -> None:
+    assert __version__ == "1.0.1"
 
 
 def test_packaged_config_matches_repository_template() -> None:
@@ -110,9 +114,14 @@ def test_web_assets_and_security_headers_are_local() -> None:
     page = _request(app, "GET", "/")
     assert page.status_code == 200
     assert 'src="/static/htmx.min.js"' in page.text
+    assert 'href="/static/dashboard.css?v=1.0.1"' in page.text
+    assert 'src="/static/dashboard.js?v=1.0.1"' in page.text
     assert "unpkg.com" not in page.text
     assert page.headers["x-frame-options"] == "DENY"
-    assert "default-src 'self'" in page.headers["content-security-policy"]
+    policy = page.headers["content-security-policy"]
+    assert "default-src 'self'" in policy
+    assert "script-src 'self';" in policy
+    assert "script-src 'self' 'unsafe-inline'" not in policy
 
     asset = _request(app, "GET", "/static/htmx.min.js")
     digest = hashlib.sha384(asset.content).digest()
@@ -121,6 +130,63 @@ def test_web_assets_and_security_headers_are_local() -> None:
         "1f94ab71fca01e602e4c366984c1ea0492dcdc586cb0a8c6ef0fc2782a4545e49"
         "fc015834caa64ccf3fc73e70bb0af95"
     )
+
+    expected_assets = {
+        "/static/dashboard.css": "text/css",
+        "/static/dashboard.js": "text/javascript",
+        "/static/logs.css": "text/css",
+        "/static/logs.js": "text/javascript",
+        "/static/brand/mark-outline.svg": "image/svg+xml",
+        "/static/brand/relic.svg": "image/svg+xml",
+        "/static/fonts/geist-sans.woff2": "font/woff2",
+        "/static/fonts/jetbrains-mono.woff2": "font/woff2",
+    }
+    for path, media_type in expected_assets.items():
+        response = _request(app, "GET", path)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith(media_type)
+        assert response.headers["cache-control"].endswith("immutable")
+        assert response.content
+    assert _request(app, "GET", "/static/not-packaged.js").status_code == 404
+
+
+def test_demo_badge_is_explicit_and_opt_in() -> None:
+    production_page = _request(fleet_web.make_app(5), "GET", "/").text
+    demo_page = _request(fleet_web.make_app(5, demo_mode=True), "GET", "/").text
+    assert "demo data" not in production_page
+    assert 'data-demo="false"' in production_page
+    assert "demo data" in demo_page
+    assert 'data-demo="true"' in demo_page
+    assert 'hx-trigger="load, every' in production_page
+    assert 'hx-trigger="load, every' not in demo_page
+
+
+def test_fixture_source_contains_only_synthetic_identifiers() -> None:
+    fixture = Path(__file__).with_name("ui_fixture_server.py").read_text(
+        encoding="utf-8"
+    )
+    ipv4 = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", fixture))
+    assert ipv4 <= {"127.0.0.1"}
+    assert re.search(r"\b[1-9A-HJ-NP-Za-km-z]{40,64}\b", fixture) is None
+    assert "prompt_idx" not in fixture
+
+
+def test_collectors_wait_for_uvicorn_readiness() -> None:
+    server = SimpleNamespace(started=False, should_exit=False)
+    collector_started = threading.Event()
+    supervisor = threading.Thread(
+        target=fleet_web._start_collectors_after_ready,
+        args=(server, [("fixture", collector_started.set, ())]),
+        kwargs={"wait_s": 0.001},
+    )
+    supervisor.start()
+    time.sleep(0.02)
+    assert collector_started.is_set() is False
+
+    server.started = True
+    assert collector_started.wait(1.0)
+    supervisor.join(1.0)
+    assert supervisor.is_alive() is False
 
 
 def test_star_mutation_requires_same_origin_header() -> None:

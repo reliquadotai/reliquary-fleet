@@ -11,6 +11,10 @@ chain/metagraph state in one responsive page at `http://127.0.0.1:9091`.
 Reliquary Fleet uses read-only HTTP, R2, and SSH probes. It does not require a
 wallet seed, coldkey, or hotkey private key.
 
+![Reliquary Fleet dashboard with sanitized demo data showing live window score, miner health, validator status, and recent window history.](https://raw.githubusercontent.com/reliquadotai/reliquary-fleet/main/docs/assets/reliquary-fleet-v1.0.1-x.png)
+
+_Dashboard preview uses deterministic demo data._
+
 ## What you get
 
 - **Fleet summary** — live health, exact provisioned model/checkpoint parity, throughput, OOM-free streak, current window + state, per-environment math/code fill, and validator pool/proof admission rate.

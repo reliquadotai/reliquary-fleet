@@ -31,6 +31,10 @@ coverage.xml
 htmlcov/
 .pytest_cache/
 .ruff_cache/
+node_modules/
+playwright-report/
+test-results/
+.lighthouseci/
 
 # --- Editor / OS ----------------------------------------------------------
 .DS_Store
