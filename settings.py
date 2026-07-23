@@ -21,6 +21,7 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     import yaml
@@ -132,6 +133,17 @@ class Settings:
     r2_bucket: str = "reliquary"
     r2_access_key_id: str = ""
     r2_secret_access_key: str = ""
+    # Optional cacheable HTTPS origin for immutable archive objects. This is
+    # preferred for broad distribution because S3 API requests bypass
+    # Cloudflare's edge cache.
+    r2_public_base_url: str = ""
+    # Exhaustive bucket LIST is intentionally opt-in. A missing validator
+    # archive index should serve the last-good cache instead of scanning an
+    # entire shared prefix from every installation.
+    r2_allow_list_fallback: bool = False
+    r2_fetch_batch_size: int = 8
+    r2_fetch_workers: int = 2
+    r2_refresh_seconds: float = 60.0
 
     # Dashboard runtime
     dashboard_host: str = "127.0.0.1"
@@ -143,6 +155,18 @@ class Settings:
     # substantially longer than the idle delay between generations.
     health_poll_stale_seconds: float = 60.0
     history_windows: int = 216
+
+    # Shared-upstream budgets. Miner SSH still follows refresh_seconds because
+    # each operator owns that traffic; validator and chain reads are bounded
+    # independently so opening Fleet cannot multiply a shared service at the
+    # UI cadence.
+    validator_state_seconds: float = 15.0
+    validator_health_seconds: float = 30.0
+    validator_verdict_seconds: float = 60.0
+    max_verdict_hotkeys: int = 8
+    chain_refresh_seconds: float = 300.0
+    rtt_refresh_seconds: float = 120.0
+    startup_jitter_seconds: float = 30.0
 
 
 # Mutable singleton. Importers can `from settings import SETTINGS`.
@@ -206,6 +230,100 @@ def positive_finite_seconds(value: Any, field_name: str) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"{field_name} must be a finite positive number")
     return seconds
+
+
+def _bounded_seconds(
+    value: Any,
+    field_name: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    seconds = positive_finite_seconds(value, field_name)
+    if not minimum <= seconds <= maximum:
+        raise ValueError(
+            f"{field_name} must be between {minimum:g} and {maximum:g} seconds"
+        )
+    return seconds
+
+
+def _bounded_int(
+    value: Any,
+    field_name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(
+            f"{field_name} must be in {minimum}..{maximum}"
+        )
+    return parsed
+
+
+def _bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be true or false")
+    return value
+
+
+def _public_base_url(value: Any) -> str:
+    url = str(value or "").strip().rstrip("/")
+    if not url:
+        return ""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "r2.public_base_url must be a credential-free http(s) base URL"
+        )
+    return url
+
+
+def _validator_base_url(value: Any) -> str:
+    url = str(value or "").strip().rstrip("/")
+    if not url:
+        return ""
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("validator.url has an invalid port") from exc
+    hostname = str(parsed.hostname or "")
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or not re.fullmatch(r"[A-Za-z0-9._:-]+", hostname)
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise ValueError(
+            "validator.url must be a credential-free http(s) origin"
+        )
+    return url
+
+
+def _ss58_hotkey(value: Any, field_name: str) -> str:
+    hotkey = str(value or "").strip()
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{40,64}", hotkey):
+        raise ValueError(f"{field_name} must be a full SS58 value")
+    return hotkey
 
 
 def _expand(path: str) -> str:
@@ -356,7 +474,7 @@ def load(path: Path | str = "config.yaml") -> Settings:
 
     v = _mapping(raw.get("validator"), "validator")
     vssh = _mapping(v.get("ssh"), "validator.ssh")
-    SETTINGS.validator_url = str(v.get("url") or "").strip()
+    SETTINGS.validator_url = _validator_base_url(v.get("url"))
     SETTINGS.validator_ssh_host = _ssh_host(
         vssh.get("host"),
         "validator.ssh.host",
@@ -431,6 +549,7 @@ def load(path: Path | str = "config.yaml") -> Settings:
             label = ""
         if not hk:
             continue
+        hk = _ss58_hotkey(hk, "starred_hotkeys entry")
         SETTINGS.starred_hotkeys_seed.append(hk)
         if label:
             SETTINGS.starred_hotkey_labels[hk] = label
@@ -459,6 +578,33 @@ def load(path: Path | str = "config.yaml") -> Settings:
         "AWS_SECRET_ACCESS_KEY", r2.get("secret_access_key", "")
     )
     SETTINGS.r2_secret_access_key = str(SETTINGS.r2_secret_access_key or "").strip()
+    SETTINGS.r2_public_base_url = _public_base_url(
+        os.environ.get("R2_PUBLIC_BASE_URL", r2.get("public_base_url", ""))
+    )
+    SETTINGS.r2_allow_list_fallback = _bool(
+        r2.get("allow_list_fallback", False),
+        "r2.allow_list_fallback",
+    )
+    SETTINGS.r2_fetch_batch_size = _bounded_int(
+        r2.get("fetch_batch_size", 8),
+        "r2.fetch_batch_size",
+        minimum=1,
+        maximum=32,
+    )
+    SETTINGS.r2_fetch_workers = _bounded_int(
+        r2.get("fetch_workers", 2),
+        "r2.fetch_workers",
+        minimum=1,
+        maximum=8,
+    )
+    if SETTINGS.r2_fetch_workers > SETTINGS.r2_fetch_batch_size:
+        raise ValueError("r2.fetch_workers must not exceed r2.fetch_batch_size")
+    SETTINGS.r2_refresh_seconds = _bounded_seconds(
+        r2.get("refresh_seconds", 60),
+        "r2.refresh_seconds",
+        minimum=30,
+        maximum=3600,
+    )
 
     dash = _mapping(raw.get("dashboard"), "dashboard")
     SETTINGS.dashboard_host = str(dash.get("host") or "127.0.0.1").strip()
@@ -482,6 +628,50 @@ def load(path: Path | str = "config.yaml") -> Settings:
         raise ValueError("dashboard.history_windows must be an integer") from exc
     if not 1 <= SETTINGS.history_windows <= 10_000:
         raise ValueError("dashboard.history_windows must be in 1..10000")
+
+    upstream = _mapping(raw.get("upstream"), "upstream")
+    SETTINGS.validator_state_seconds = _bounded_seconds(
+        upstream.get("validator_state_seconds", 15),
+        "upstream.validator_state_seconds",
+        minimum=10,
+        maximum=300,
+    )
+    SETTINGS.validator_health_seconds = _bounded_seconds(
+        upstream.get("validator_health_seconds", 30),
+        "upstream.validator_health_seconds",
+        minimum=30,
+        maximum=600,
+    )
+    SETTINGS.validator_verdict_seconds = _bounded_seconds(
+        upstream.get("validator_verdict_seconds", 60),
+        "upstream.validator_verdict_seconds",
+        minimum=30,
+        maximum=600,
+    )
+    SETTINGS.max_verdict_hotkeys = _bounded_int(
+        upstream.get("max_verdict_hotkeys", 8),
+        "upstream.max_verdict_hotkeys",
+        minimum=1,
+        maximum=64,
+    )
+    SETTINGS.chain_refresh_seconds = _bounded_seconds(
+        upstream.get("chain_refresh_seconds", 300),
+        "upstream.chain_refresh_seconds",
+        minimum=120,
+        maximum=3600,
+    )
+    SETTINGS.rtt_refresh_seconds = _bounded_seconds(
+        upstream.get("rtt_refresh_seconds", 120),
+        "upstream.rtt_refresh_seconds",
+        minimum=60,
+        maximum=1800,
+    )
+    SETTINGS.startup_jitter_seconds = _bounded_seconds(
+        upstream.get("startup_jitter_seconds", 30),
+        "upstream.startup_jitter_seconds",
+        minimum=1,
+        maximum=300,
+    )
 
     return SETTINGS
 
@@ -572,6 +762,21 @@ def apply_to_fleet_module() -> None:
     fleet.VALIDATOR_PORT = SETTINGS.validator_ssh_port
     fleet.VALIDATOR_CONTAINER = SETTINGS.validator_container
     fleet.NETUID = SETTINGS.netuid
+    fleet.VALIDATOR_MAX_VERDICT_HOTKEYS = SETTINGS.max_verdict_hotkeys
+    fleet.VALIDATOR_VERDICT_STALE_SECONDS = max(
+        120.0,
+        SETTINGS.validator_verdict_seconds * 3.0,
+    )
+    fleet.R2_PUBLIC_BASE_URL = SETTINGS.r2_public_base_url
+    fleet.R2_ALLOW_LIST_FALLBACK = SETTINGS.r2_allow_list_fallback
+    fleet.R2_FETCH_BATCH_SIZE = SETTINGS.r2_fetch_batch_size
+    fleet.R2_FETCH_WORKERS = SETTINGS.r2_fetch_workers
+    # A reload in a long-lived test or embedded process must not retain the
+    # prior operator's archive transport.
+    fleet._r2_client = None
+    with fleet._http_cache_lock:
+        fleet._http_conditional_cache.clear()
+    fleet._validator_retry_after_until = 0.0
 
     # R2 env vars expected by boto3 / the existing R2 code path.
     if SETTINGS.r2_endpoint:
@@ -582,3 +787,7 @@ def apply_to_fleet_module() -> None:
         os.environ.setdefault("AWS_ACCESS_KEY_ID", SETTINGS.r2_access_key_id)
     if SETTINGS.r2_secret_access_key:
         os.environ.setdefault("AWS_SECRET_ACCESS_KEY", SETTINGS.r2_secret_access_key)
+    if SETTINGS.r2_public_base_url:
+        os.environ["R2_PUBLIC_BASE_URL"] = SETTINGS.r2_public_base_url
+    else:
+        os.environ.pop("R2_PUBLIC_BASE_URL", None)

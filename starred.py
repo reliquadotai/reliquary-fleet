@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -24,9 +25,15 @@ _STATE_DIR = Path(os.environ.get("RELIQUARY_FLEET_STATE_DIR", "state")).expandus
 _STARRED_FILE = _STATE_DIR / "starred.json"
 
 _LOCK = threading.Lock()
+_SS58_HOTKEY_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{40,64}")
 # Hotkey prefix length used by the legacy event matcher (`hk[:12]`).
 # Storing full SS58 here — the dashboard truncates for the prefix
 # comparison at use time.
+
+
+def _valid_hotkey(value: object) -> str:
+    hotkey = str(value or "").strip()
+    return hotkey if _SS58_HOTKEY_RE.fullmatch(hotkey) else ""
 
 
 def configure_state_dir(path: str | Path) -> None:
@@ -45,7 +52,11 @@ def _read() -> set[str]:
             return set()
         raw = json.loads(_STARRED_FILE.read_text())
         if isinstance(raw, list):
-            return {str(x).strip() for x in raw if str(x).strip()}
+            return {
+                hotkey
+                for value in raw
+                if (hotkey := _valid_hotkey(value))
+            }
         return set()
     except (json.JSONDecodeError, OSError):
         return set()
@@ -80,7 +91,7 @@ def load() -> set[str]:
 
 def add(hotkey: str) -> set[str]:
     """Mark a hotkey as starred. Returns the new full set."""
-    hotkey = (hotkey or "").strip()
+    hotkey = _valid_hotkey(hotkey)
     if not hotkey:
         return load()
     with _LOCK:
@@ -92,7 +103,9 @@ def add(hotkey: str) -> set[str]:
 
 def remove(hotkey: str) -> set[str]:
     """Unstar a hotkey. Returns the new full set."""
-    hotkey = (hotkey or "").strip()
+    hotkey = _valid_hotkey(hotkey)
+    if not hotkey:
+        return load()
     with _LOCK:
         current = _read()
         current.discard(hotkey)
@@ -102,7 +115,7 @@ def remove(hotkey: str) -> set[str]:
 
 def toggle(hotkey: str) -> tuple[bool, set[str]]:
     """Flip the star for a hotkey. Returns (now_starred, full_set)."""
-    hotkey = (hotkey or "").strip()
+    hotkey = _valid_hotkey(hotkey)
     if not hotkey:
         return (False, load())
     with _LOCK:

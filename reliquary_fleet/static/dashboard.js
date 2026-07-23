@@ -9,6 +9,14 @@
   let soundOn = false;
   let lastHealth = null;
   let audioContext = null;
+  let snapshotRequest = null;
+  let snapshotTimer = null;
+  let snapshotFailures = 0;
+  let snapshotLoaded = false;
+  const demoMode = document.body.dataset.demo === "true";
+  const snapshotIntervalMs =
+    Math.max(5, Number.parseFloat(document.body.dataset.refreshSeconds) || 5) *
+    1000;
 
   function setSound(enabled) {
     soundOn = enabled;
@@ -209,8 +217,7 @@
       "hx-get",
       `/api/validator_rundown?tf=${encodeURIComponent(timeframe)}`,
     );
-    window.htmx.process(area);
-    window.htmx.trigger(area, "load");
+    refreshSnapshot(true);
   });
 
   document.body.addEventListener("click", (event) => {
@@ -224,8 +231,7 @@
     if (!mode || !area) return;
     area.dataset.mode = mode;
     area.setAttribute("hx-get", `/api/ema?mode=${encodeURIComponent(mode)}`);
-    window.htmx.process(area);
-    window.htmx.trigger(area, "load");
+    refreshSnapshot(true);
   });
 
   document.body.addEventListener("click", (event) => {
@@ -245,10 +251,7 @@
         return response.json();
       })
       .then(() => {
-        [".area-ema", ".area-summary", ".area-score"].forEach((selector) => {
-          const area = document.querySelector(selector);
-          if (area) window.htmx.trigger(area, "load");
-        });
+        refreshSnapshot(true);
       })
       .catch((error) => console.warn("Star toggle failed", error))
       .finally(() => {
@@ -275,6 +278,123 @@
     "area-rundown",
   ]);
 
+  function preservePanelScroll(target) {
+    if (
+      Array.from(target.classList).some((name) => scrollableClasses.has(name))
+    ) {
+      target.dataset.savedScroll = String(target.scrollTop);
+    }
+  }
+
+  function restorePanelScroll(target) {
+    if (!Object.hasOwn(target.dataset, "savedScroll")) return;
+    requestAnimationFrame(() => {
+      const top = Number.parseInt(target.dataset.savedScroll, 10);
+      if (!Number.isNaN(top)) target.scrollTop = top;
+      delete target.dataset.savedScroll;
+    });
+  }
+
+  function applyPanelHTML(target, markup) {
+    preservePanelScroll(target);
+    target.innerHTML = markup;
+    target.setAttribute("aria-busy", "false");
+    target.classList.remove("is-stale");
+    enhanceTables(target);
+    enhanceFleetRows(target);
+    enhanceScrollableRegions(target);
+    updateHealth(target);
+    restorePanelScroll(target);
+  }
+
+  function snapshotURL() {
+    const query = new URLSearchParams({
+      ema_mode: document.getElementById("ema-area")?.dataset.mode || "top",
+      rundown_tf: document.getElementById("rundown-area")?.dataset.tf || "30m",
+    });
+    return `/api/dashboard-snapshot?${query.toString()}`;
+  }
+
+  function clearSnapshotTimer() {
+    if (snapshotTimer !== null) {
+      window.clearTimeout(snapshotTimer);
+      snapshotTimer = null;
+    }
+  }
+
+  function scheduleSnapshot() {
+    clearSnapshotTimer();
+    if (demoMode || document.hidden) return;
+    const backoff = Math.min(
+      60_000,
+      snapshotIntervalMs * 2 ** Math.min(snapshotFailures, 4),
+    );
+    const jitter = 0.85 + Math.random() * 0.3;
+    snapshotTimer = window.setTimeout(() => {
+      refreshSnapshot();
+    }, backoff * jitter);
+  }
+
+  async function refreshSnapshot(force = false) {
+    if (document.hidden && !force) return;
+    if (demoMode && snapshotLoaded && !force) return;
+    clearSnapshotTimer();
+    if (snapshotRequest) {
+      if (!force) return;
+      snapshotRequest.abort();
+    }
+    const request = new AbortController();
+    snapshotRequest = request;
+    document.querySelectorAll("[data-panel]").forEach((panel) => {
+      panel.setAttribute("aria-busy", "true");
+    });
+    try {
+      const response = await fetch(snapshotURL(), {
+        signal: request.signal,
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      const panels = payload?.panels || {};
+      Object.entries(panels).forEach(([name, markup]) => {
+        const target = document.querySelector(`[data-panel="${name}"]`);
+        if (target && typeof markup === "string") applyPanelHTML(target, markup);
+      });
+      const errors = payload?.errors || {};
+      Object.keys(errors).forEach((name) => {
+        const target = document.querySelector(`[data-panel="${name}"]`);
+        target?.setAttribute("aria-busy", "false");
+        target?.classList.add("is-stale");
+      });
+      snapshotFailures = 0;
+      snapshotLoaded = true;
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      snapshotFailures += 1;
+      document.querySelectorAll("[data-panel]").forEach((panel) => {
+        panel.setAttribute("aria-busy", "false");
+        panel.classList.add("is-stale");
+      });
+    } finally {
+      if (snapshotRequest === request) {
+        snapshotRequest = null;
+        scheduleSnapshot();
+      }
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearSnapshotTimer();
+      snapshotRequest?.abort();
+      snapshotRequest = null;
+      return;
+    }
+    refreshSnapshot(true);
+  });
+
+  window.reliquaryFleetRefresh = () => refreshSnapshot(true);
+
   document.body.addEventListener("htmx:beforeRequest", (event) => {
     const target = panelForEvent(event);
     target?.setAttribute?.("aria-busy", "true");
@@ -283,9 +403,7 @@
   document.body.addEventListener("htmx:beforeSwap", (event) => {
     const target = panelForEvent(event);
     if (!target?.classList) return;
-    if (Array.from(target.classList).some((name) => scrollableClasses.has(name))) {
-      target.dataset.savedScroll = String(target.scrollTop);
-    }
+    preservePanelScroll(target);
   });
 
   document.body.addEventListener("htmx:afterSwap", (event) => {
@@ -297,13 +415,7 @@
     enhanceFleetRows(target);
     enhanceScrollableRegions(target);
     updateHealth(target);
-    if (target.dataset && Object.hasOwn(target.dataset, "savedScroll")) {
-      requestAnimationFrame(() => {
-        const top = Number.parseInt(target.dataset.savedScroll, 10);
-        if (!Number.isNaN(top)) target.scrollTop = top;
-        delete target.dataset.savedScroll;
-      });
-    }
+    restorePanelScroll(target);
   });
 
   ["htmx:responseError", "htmx:sendError", "htmx:timeout"].forEach((name) => {
@@ -318,4 +430,5 @@
   enhanceFleetRows();
   enhanceScrollableRegions();
   setSound(false);
+  refreshSnapshot(true);
 })();

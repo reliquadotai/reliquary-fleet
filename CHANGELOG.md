@@ -3,6 +3,42 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 this project uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-07-23
+
+### Added
+
+- HTTP-only validator mode; SSH log tail and deployment fingerprint are now
+  optional operator enhancements.
+- Cacheable credential-free archive transport through `r2.public_base_url`.
+- Explicit shared-upstream request budgets in `/healthz` and JSON export.
+- Conditional log responses with `ETag`/`304 Not Modified`.
+
+### Changed
+
+- Consolidated 18 browser panel timers into one visibility-aware dashboard
+  snapshot request, reducing visible-tab local traffic from 230 to 12 requests
+  per minute and stopping it entirely while hidden.
+- Split validator state, health, and verdict polling into independent bounded
+  cadences. Verdict polling now retains a rolling cache and uses a two-minute
+  overlap after the initial one-hour sync.
+- Added pooled HTTP keep-alive connections, randomized startup, recurring
+  jitter, exponential failure backoff, and validator `Retry-After` handling.
+- Reduced archive cold-start work to eight objects per pass with two workers.
+  Exhaustive R2 LIST fallback is now opt-in.
+- Reduced validator log reconnect history to two minutes and added exponential
+  reconnect backoff.
+
+### Security
+
+- Bounded validator response, compressed archive, and decompressed archive
+  sizes.
+- Validator origins and every config/disk/browser hotkey source are validated
+  before they can enter HTTP or remote probe commands.
+- Watch-cap omissions are visible in both `doctor` and the operator overview;
+  configured fleet keys retain priority.
+- General-user onboarding no longer requires or encourages distributing
+  validator SSH or private R2 credentials.
+
 ## [1.0.2] - 2026-07-22
 
 ### Fixed
@@ -56,6 +92,7 @@ this project uses [Semantic Versioning](https://semver.org/).
 - Same-origin header required for star mutations and restrictive browser headers.
 - HTMX 2.0.10 is bundled and checksum-documented; no runtime CDN is required.
 
+[1.1.0]: https://github.com/reliquadotai/reliquary-fleet/releases/tag/v1.1.0
 [1.0.2]: https://github.com/reliquadotai/reliquary-fleet/releases/tag/v1.0.2
 [1.0.1]: https://github.com/reliquadotai/reliquary-fleet/releases/tag/v1.0.1
 [1.0.0]: https://github.com/reliquadotai/reliquary-fleet/releases/tag/v1.0.0

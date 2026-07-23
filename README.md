@@ -8,8 +8,10 @@ Private-by-default operations dashboard for Reliquary miners. It combines live
 miner health, validator truth, sealed-window rewards, exact reward EMA, and
 chain/metagraph state in one responsive page at `http://127.0.0.1:9091`.
 
-Reliquary Fleet uses read-only HTTP, R2, and SSH probes. It does not require a
-wallet seed, coldkey, or hotkey private key.
+Reliquary Fleet uses read-only HTTP and archive probes, plus SSH only for miner
+hosts or optional validator diagnostics you explicitly configure. It does not
+require a wallet seed, coldkey, hotkey private key, hosted account, or
+telemetry connection.
 
 ![Reliquary Fleet dashboard with sanitized demo data showing live window score, miner health, validator status, and recent window history.](https://raw.githubusercontent.com/reliquadotai/reliquary-fleet/main/docs/assets/reliquary-fleet-v1.0.1-x.png)
 
@@ -68,8 +70,10 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 $EDITOR config.yaml
 
-# Optionally export R2 creds via env instead of putting them in yaml.
-# Env wins over yaml when both are set.
+# Prefer the validator's cache-enabled public archive origin when available.
+export R2_PUBLIC_BASE_URL="https://archives.example.org"
+
+# Operators of a private bucket may instead use scoped read-only S3 access.
 export R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
 export R2_BUCKET="reliquary"
 export AWS_ACCESS_KEY_ID="..."
@@ -81,9 +85,10 @@ export AWS_SECRET_ACCESS_KEY="..."
 
 ## Prerequisites
 
-- **SSH access** to every box you list in `fleet:` and to the validator host. Passwordless key auth — the dashboard runs `ssh -i <key> -o BatchMode=yes ...` and a password prompt will hang the poller. Test with `ssh root@<host> 'docker ps'` first.
+- **Validator HTTP access** to its read-only `/state`, `/health`, and per-hotkey `/verdicts` surfaces.
+- **SSH access to each configured miner or lab host.** Passwordless key auth is required for rows under `fleet:` or `labs:`. Validator SSH is optional; when omitted, only the direct log-tail and deployment-fingerprint panels are disabled.
 - **Read-only lab access** for every optional `labs:` host. A running lab service must expose `RELIQUARY_SUBMIT_DISABLED_LAB=1` and `RELIQUARY_LANE_START_ALLOWED=0`; evidence databases are opened in SQLite read-only mode, while completed artifact-only jobs are read from an immutable checksummed manifest. Only aggregate counters and whitelisted artifact metadata leave the host.
-- **Cloudflare R2 read access** to the bucket the validator publishes window archives to. The validator writes `reliquary/dataset/window-<N>.json.gz` — you need GET + LIST on that prefix. A scoped Access Key ID + Secret with read-only is sufficient.
+- **Sealed-window archive access** for exact score and EMA history. A cache-enabled HTTPS custom domain is recommended. Private-bucket operators can instead provide a scoped read-only R2 key; exhaustive bucket listing is disabled unless explicitly opted in.
 - **Python 3.10-3.13** on Linux or macOS.
 
 ## Configuration
@@ -96,8 +101,9 @@ inline in `config.example.yaml`. The minimum useful configuration is:
 ```yaml
 validator:
   url: "http://YOUR_VALIDATOR_IP:8080"
+  # Optional operator-only diagnostics:
   ssh:
-    host: "root@YOUR_VALIDATOR_IP"
+    host: ""
     key:  "~/.ssh/id_ed25519"
 
 fleet:
@@ -114,11 +120,11 @@ labs:
     source_manifest: "/srv/reliquary-miner-pro/state/source-manifest.env"
 
 r2:
-  endpoint: "https://<account>.r2.cloudflarestorage.com"
-  bucket:   "reliquary"
-  access_key_id:     "..."
-  secret_access_key: "..."
+  public_base_url: "https://archives.example.org"
 ```
+
+For a private operator bucket, leave `public_base_url` blank and configure
+`endpoint`, `bucket`, `access_key_id`, and `secret_access_key` instead.
 
 `labs:` is deliberately not an alternate fleet syntax. A lab entry rejects a
 `hotkey`, never enters the owned-key set, and cannot affect `/healthz` fleet
@@ -150,6 +156,13 @@ the maximum duration of the SSH and validator work itself. `/healthz` uses the
 separate `dashboard.health_poll_stale_seconds` budget (60 seconds by default)
 so normal bounded probes do not flap readiness; set it just above the slowest
 expected complete probe cycle so a stuck poller still fails closed.
+
+Shared validator and chain reads have separate lower-bounded cadences under
+`upstream:`. The defaults are intentionally safe for distributed installs:
+state every 15 seconds, health every 30 seconds, incremental verdicts every
+60 seconds, at most eight watched verdict hotkeys, RTT every 120 seconds, and
+chain/metagraph every five minutes. Do not lower these by patching the package;
+configuration validation rejects unsafe values.
 
 When a logical box can switch between the legacy reference service and the
 named Math/Code services, keep the legacy `unit`/`env_file` and explicitly
@@ -248,16 +261,55 @@ Use this order when you open the dashboard. It keeps the brain calm and prevents
 4. **Per-box health**: check **Fleet** for process alive, uptime, the atomic source-manifest model identity, GPU memory/utilization, disk, OOM age, and validator-confirmed `pool/30m`. The model cell compares the provisioned checkpoint (or explicitly reset clean base) with live validator state, unless PID/start-bound load or generation evidence attests a newer exact runtime checkpoint. `pool/30m` is `/verdicts` proof/pool admission, not selection or earnings. A live GPU with `pool/30m = 0` means the box is running but not entering the validator pool.
 5. **Pipeline**: check **GPU/cache pipeline** for ready/inflight/submitted. If these stay zero while GPU memory is loaded, inspect miner logs for local skip/reward filtering.
 6. **Validator liveness**: use the **auction-v2 ingress liveness** block to separate queue pressure from expensive preparation. Compare Math/Code queue depth, workers, prepare p95/p99, commit-lock p99 and total p95/p99; then verify each seal drain is `ok` and its queue/workers/reservations snapshot is empty. Archive enqueue gaps and seal timeouts make `/healthz` degraded only when the validator explicitly reports them; an older schema with no fields remains compatible.
-7. **Validator proof**: use **Validator-side events** and **Validator rundown** for proof/pool truth. Good results require this sequence for the target hotkey: submit received, proof finished accepted=true, then candidate accepted into the pool. That still does not imply earnings; use sealed R2 rows for final batch selection and `rewards_by_hotkey`.
+7. **Validator proof**: use direct `/verdicts` for proof/pool truth. Operators who configure validator SSH also get **Validator-side events** and the deployment fingerprint. Pool acceptance still does not imply earnings; use sealed archive rows for final batch selection and `rewards_by_hotkey`.
 8. **Recent windows**: use **Last N windows** for the last 24-window result quality. Archive-v2 `completed` objects remain reward evidence. `aborted` tombstones retain numeric continuity and show their failure stage/type, but are excluded from slots, rewards, EMA and training interpretation.
 
 When the dashboard and chain disagree, trust chain registration for ownership/stake, direct `/verdicts` only for proof/pool acceptance, and sealed R2 rows for final selection plus `rewards_by_hotkey` for reward. Miner-local logs are useful for debugging, but neither they nor `/verdicts accepted=true` prove earnings.
 
-## Architecture (one paragraph)
+## Scale and request boundaries
 
-`fleet.py` is the data layer — pure helpers for SSH-polling each box, fetching `/state`, `/health`, and full-hotkey `/verdicts` from the validator, downloading + caching multi-environment R2 archives, replaying `rewards_by_hotkey` exactly, and parsing the validator's structured lifecycle stream.
+The browser talks only to its localhost Fleet process. A visible dashboard tab
+uses one consolidated snapshot request every five seconds, or 12 local
+requests per minute; hidden tabs stop polling. The logs view uses conditional
+requests, pauses while hidden, and returns `304 Not Modified` without
+regenerating HTML when its filtered buffer has not changed.
 
-`fleet_web.py` is the presentation layer — a FastAPI app that renders each panel as an HTMX fragment. A background poller thread keeps state warm so each `/api/*` endpoint returns in <1 ms. The HTML page itself polls each fragment endpoint on its own cadence (1–30 s) via HTMX.
+For `H` watched hotkeys and `B` miner boxes, the default conservative shared
+validator envelope is:
+
+```text
+6 + H + 0.5 × (B + 1) requests/minute/install
+```
+
+That is 12.5 requests/minute for four hotkeys on four boxes. The first verdict
+sync requests one hour; later syncs retain a local rolling cache and request
+only a two-minute overlap. Every collector starts with randomized delay, uses
+jittered recurrence, honors validator `Retry-After`, and exponentially backs
+off after failure. `/healthz` and `/api/export.json` expose the effective
+per-install request budget.
+
+Archive cold starts fetch eight immutable objects per pass with at most two
+workers. Missing validator archive indexes serve the last-good cache and never
+trigger an automatic bucket scan. For broad distribution, publish archives
+through a Cloudflare-cached custom domain; R2 S3 API requests do not use the
+edge cache.
+
+Fleet contains no central account or tenant service and sends no runtime data
+to `reliqua.ai`. Very large public rollouts still require normal validator
+capacity planning or a shared read-only relay; the package protections prevent
+accidental request storms but do not manufacture upstream capacity.
+
+## Architecture
+
+`fleet.py` is the data layer: SSH probes for explicitly configured hosts,
+pooled validator HTTP reads, incremental verdict caching, bounded immutable
+archive retrieval, exact reward EMA replay, and optional structured validator
+log parsing.
+
+`fleet_web.py` is the presentation layer. Background collectors keep immutable
+snapshots warm; one failure-isolated `/api/dashboard-snapshot` response updates
+all 18 panels while the existing `/api/*` HTML fragments remain backward
+compatible.
 
 `/api/export.json` keeps the validator's full `health_raw` payload and also adds a stable normalized `validator.liveness` object. Consumers can read the normalized object across old and new validator builds: `reported=false`, empty maps and `null` counters mean “not reported,” never a measured zero. Archive-v2 lifecycle and per-environment seal-drain evidence are exported on each explicit-lifecycle window.
 
@@ -280,8 +332,10 @@ checkouts retain the compatible `./state` layout.
 
 | Symptom | Likely cause |
 |---|---|
-| `R2 unavailable` on every panel | `R2_ENDPOINT` / `R2_BUCKET` unset or credentials lack `GetObject`/`ListBucket` on the prefix |
+| `R2 unavailable` on every panel | `r2.public_base_url` is missing/unreachable, or private R2 credentials lack `GetObject` on the prefix |
+| `archive index unavailable; serving cache` | validator `/health` does not currently expose `archive_last_uploaded_window`; Fleet deliberately avoids a shared bucket scan |
 | Validator panel shows "unreachable" | `validator.url` wrong, validator container down, or `:8080` blocked by host firewall |
+| Validator event tail says HTTP-only mode | expected when `validator.ssh.host` is blank; `/verdicts` and sealed-window score remain active |
 | Box stuck at "warming…" | passwordless SSH to that box not working — test with `ssh <alias> 'true'` |
 | one environment's `valid/target` never moves | inspect `/health` proof reservations/rejects and miner parity/quarantine state; the aggregate `/state` count can hide a starved environment |
 | `port already in use` on launch | another instance is still running — `lsof -nP -iTCP:9091 -sTCP:LISTEN` then `kill <pid>` |
