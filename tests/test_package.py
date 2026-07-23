@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import socket
@@ -32,8 +33,8 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     return asyncio.run(run())
 
 
-def test_release_version_is_1_0_2() -> None:
-    assert __version__ == "1.0.2"
+def test_release_version_is_1_1_0() -> None:
+    assert __version__ == "1.1.0"
 
 
 def test_packaged_config_matches_repository_template() -> None:
@@ -90,9 +91,8 @@ def test_starter_config_requires_operator_changes(tmp_path: Path) -> None:
 
     assert loaded is not None
     assert any("example validator URL" in failure for failure in failures)
-    assert any("example validator SSH host" in failure for failure in failures)
     assert any("full SS58" in failure for failure in failures)
-    assert warnings == []
+    assert any("validator SSH is not configured" in warning for warning in warnings)
 
 
 def test_state_files_follow_configured_private_directory(tmp_path: Path) -> None:
@@ -106,6 +106,19 @@ def test_state_files_follow_configured_private_directory(tmp_path: Path) -> None
     assert Path(fleet.BASELINE_FILE).parent == tmp_path
     assert stat.S_IMODE(Path(fleet.BASELINE_FILE).stat().st_mode) == 0o600
     assert stat.S_IMODE((tmp_path / "starred.json").stat().st_mode) == 0o600
+
+
+def test_star_state_ignores_non_ss58_values(tmp_path: Path) -> None:
+    starred.configure_state_dir(tmp_path)
+    valid = "5" + "A" * 47
+    (tmp_path / "starred.json").write_text(
+        json.dumps([valid, "not-a-hotkey", "../health"]),
+        encoding="utf-8",
+    )
+
+    assert starred.load() == {valid}
+    assert starred.add("../state") == {valid}
+    assert starred.toggle("invalid") == (False, {valid})
 
 
 def test_web_assets_and_security_headers_are_local() -> None:
@@ -157,8 +170,12 @@ def test_demo_badge_is_explicit_and_opt_in() -> None:
     assert 'data-demo="false"' in production_page
     assert "demo data" in demo_page
     assert 'data-demo="true"' in demo_page
-    assert 'hx-trigger="load, every' in production_page
+    assert 'hx-trigger="load, every' not in production_page
     assert 'hx-trigger="load, every' not in demo_page
+    assert production_page.count('data-panel="') == 18
+    assert "/api/dashboard-snapshot" in _request(
+        fleet_web.make_app(5), "GET", "/static/dashboard.js"
+    ).text
 
 
 def test_fixture_source_contains_only_synthetic_identifiers() -> None:

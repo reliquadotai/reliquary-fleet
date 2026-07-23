@@ -32,9 +32,11 @@ import argparse
 import copy
 import concurrent.futures
 import gzip
+import io
 import json
 import math
 import os
+import random
 import re
 import shlex
 import stat
@@ -45,6 +47,7 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 
@@ -160,6 +163,18 @@ CODE_GRADER_SOCKET: str = "/tmp/reliquary-grader.sock"
 CODE_GRADER_BUNDLE_LINK: str = "/opt/reliquary-code-grader/current"
 CODE_GRADER_METRICS_PORT: int = 9876
 CODE_GRADER_SOCKET_MODE: int = 0o660
+VALIDATOR_MAX_VERDICT_HOTKEYS: int = 8
+VALIDATOR_VERDICT_STALE_SECONDS: float = 180.0
+# Exhaustive archive listing is an explicit opt-in in every entry path.
+R2_PUBLIC_BASE_URL: str = ""
+R2_ALLOW_LIST_FALLBACK: bool = False
+R2_FETCH_BATCH_SIZE: int = 8
+R2_FETCH_WORKERS: int = 2
+_SS58_HOTKEY_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{40,64}")
+
+
+def _is_ss58_hotkey(value: object) -> bool:
+    return bool(_SS58_HOTKEY_RE.fullmatch(str(value or "").strip()))
 
 
 def merge_starred_into_our_ss58(extra_hotkeys: set[str]) -> None:
@@ -172,8 +187,8 @@ def merge_starred_into_our_ss58(extra_hotkeys: set[str]) -> None:
     OUR_SS58 keep their existing label.
     """
     for hk in extra_hotkeys:
-        hk = (hk or "").strip()
-        if not hk:
+        hk = str(hk or "").strip()
+        if not _is_ss58_hotkey(hk):
             continue
         if hk not in OUR_SS58:
             OUR_SS58[hk] = hk[:10]
@@ -4177,6 +4192,7 @@ class ValidatorState:
     verdicts_by_hotkey: dict[str, dict[str, Any]] = field(default_factory=dict)
     verdicts_last_fetch_at: float = 0.0
     verdicts_error: str = ""
+    verdicts_warning: str = ""
 
 
 # --- Chain RPC poller (slow, separate thread) ------------------------------
@@ -4539,11 +4555,8 @@ def probe_rtt(boxes: list, vs_url: str, rtt: RTTState) -> None:
     if httpx:
         try:
             t0 = time.time()
-            r = httpx.get(f"{vs_url}/state", timeout=6.0)
-            if r.status_code == 200:
-                rtt.rtt_ms["mac"] = int((time.time() - t0) * 1000)
-            else:
-                rtt.rtt_ms["mac"] = -1
+            _http_json("state", timeout=6.0)
+            rtt.rtt_ms["mac"] = int((time.time() - t0) * 1000)
         except Exception:
             rtt.rtt_ms["mac"] = -1
 
@@ -4552,8 +4565,9 @@ def probe_rtt(boxes: list, vs_url: str, rtt: RTTState) -> None:
         # curl's -w gives time_total; we also capture http_code so a slow
         # but successful response counts (3s validator response shouldn't
         # appear as "down").
+        state_url = shlex.quote(f"{vs_url.rstrip('/')}/state")
         cmd = (f"curl -s -o /dev/null -w '%{{time_total}} %{{http_code}}' "
-               f"--max-time 6 {vs_url}/state 2>/dev/null")
+               f"--max-time 6 {state_url} 2>/dev/null")
         rc, out, _ = ssh_run(b.alias, cmd, timeout_s=10)
         if rc == 0 and out.strip():
             try:
@@ -4617,14 +4631,104 @@ def _validator_state_via_ssh() -> dict | None:
     return _validator_json_via_ssh("state")
 
 
+_http_client_instance = None
+_http_client_lock = threading.Lock()
+_http_cache_lock = threading.Lock()
+_http_conditional_cache: dict[str, tuple[str, dict[str, Any]]] = {}
+_validator_retry_after_until = 0.0
+_MAX_VALIDATOR_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
+def _http_client():
+    """Return one process-wide keep-alive client for read-only upstreams."""
+    global _http_client_instance
+    if httpx is None:
+        raise RuntimeError("httpx missing")
+    if _http_client_instance is None:
+        with _http_client_lock:
+            if _http_client_instance is None:
+                _http_client_instance = httpx.Client(
+                    timeout=httpx.Timeout(8.0, connect=4.0),
+                    limits=httpx.Limits(
+                        max_connections=16,
+                        max_keepalive_connections=8,
+                        keepalive_expiry=30.0,
+                    ),
+                    follow_redirects=False,
+                )
+    return _http_client_instance
+
+
+def _retry_after_seconds(response: Any) -> float:
+    raw = str(getattr(response, "headers", {}).get("retry-after", "") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, min(float(raw), 900.0))
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            min((parsed - datetime.now(timezone.utc)).total_seconds(), 900.0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def validator_retry_after_remaining(*, now: float | None = None) -> float:
+    """Seconds left in the latest validator-provided Retry-After window."""
+    current = time.time() if now is None else float(now)
+    return max(0.0, _validator_retry_after_until - current)
+
+
 def _http_json(path: str, *, timeout: float = 8.0) -> dict:
-    response = httpx.get(f"{VALIDATOR_URL}/{path.lstrip('/')}", timeout=timeout)
+    global _validator_retry_after_until
+    normalized_path = path.lstrip("/")
+    cacheable = normalized_path in {"state", "health"}
+    headers: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": "reliquary-fleet",
+    }
+    cached_payload: dict[str, Any] | None = None
+    if cacheable:
+        with _http_cache_lock:
+            cached = _http_conditional_cache.get(normalized_path)
+        if cached:
+            etag, cached_payload = cached
+            if etag:
+                headers["If-None-Match"] = etag
+    response = _http_client().get(
+        f"{VALIDATOR_URL.rstrip('/')}/{normalized_path}",
+        timeout=timeout,
+        headers=headers,
+    )
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code == 304 and cached_payload is not None:
+        return dict(cached_payload)
+    if status_code in {429, 503}:
+        retry_after = _retry_after_seconds(response)
+        if retry_after > 0:
+            _validator_retry_after_until = max(
+                _validator_retry_after_until,
+                time.time() + retry_after,
+            )
     raise_for_status = getattr(response, "raise_for_status", None)
     if callable(raise_for_status):
         raise_for_status()
+    content = getattr(response, "content", b"")
+    if isinstance(content, (bytes, bytearray)) and len(content) > _MAX_VALIDATOR_RESPONSE_BYTES:
+        raise ValueError("validator response exceeds 32 MiB")
     payload = response.json()
     if not isinstance(payload, dict):
         raise ValueError("validator response is not an object")
+    if cacheable:
+        etag = str(getattr(response, "headers", {}).get("etag", "") or "")
+        with _http_cache_lock:
+            _http_conditional_cache[normalized_path] = (etag, dict(payload))
     return payload
 
 
@@ -5167,32 +5271,124 @@ def summarize_verdicts(verdicts: list[dict], *, now: float | None = None) -> dic
     return summary
 
 
+_verdict_cache_lock = threading.Lock()
+_verdict_rows_by_hotkey: dict[str, list[dict[str, Any]]] = {}
+_verdict_cursor_by_hotkey: dict[str, float] = {}
+_VERDICT_OVERLAP_SECONDS = 120.0
+_VERDICT_CACHE_LIMIT = 5_000
+
+
+def _selected_verdict_hotkeys() -> tuple[list[str], list[str]]:
+    """Prioritize configured miner keys, then cap additional watched keys."""
+    configured = [
+        str(row[1])
+        for row in FLEET
+        if len(row) > 1 and _is_ss58_hotkey(row[1])
+    ]
+    watched = [str(hotkey) for hotkey in OUR_SS58 if _is_ss58_hotkey(hotkey)]
+    ordered = list(dict.fromkeys([*configured, *watched]))
+    limit = max(1, int(VALIDATOR_MAX_VERDICT_HOTKEYS))
+    return ordered[:limit], ordered[limit:]
+
+
+def _verdict_identity(row: dict[str, Any]) -> str:
+    try:
+        return json.dumps(
+            row,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return repr(sorted((str(key), repr(value)) for key, value in row.items()))
+
+
+def _merge_verdict_rows(
+    existing: list[dict[str, Any]],
+    incoming: list[Any],
+    *,
+    now: float,
+) -> list[dict[str, Any]]:
+    cutoff = now - 3660.0
+    future_limit = now + 60.0
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in [*existing, *incoming]:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        ts = _as_float(row.get("ts"))
+        if ts > 0 and not cutoff <= ts <= future_limit:
+            continue
+        merged[_verdict_identity(row)] = row
+    rows = list(merged.values())
+    rows.sort(key=lambda row: _as_float(row.get("ts")))
+    return rows[-_VERDICT_CACHE_LIMIT:]
+
+
 def _fetch_validator_verdicts(vs: ValidatorState) -> None:
-    hotkeys = list(dict.fromkeys(hk for hk in OUR_SS58 if hk))
+    hotkeys, omitted = _selected_verdict_hotkeys()
+    vs.verdicts_warning = (
+        f"watch limit: polling {len(hotkeys)} of {len(hotkeys) + len(omitted)} hotkeys"
+        if omitted
+        else ""
+    )
     if not hotkeys:
         vs.verdicts_error = "no hotkeys configured"
         return
     now = time.time()
-    updated = dict(vs.verdicts_by_hotkey)
+    updated = {
+        hotkey: summary
+        for hotkey, summary in vs.verdicts_by_hotkey.items()
+        if hotkey in hotkeys
+    }
     errors: list[str] = []
+    successes = 0
     for hk in hotkeys:
         try:
+            with _verdict_cache_lock:
+                existing = list(_verdict_rows_by_hotkey.get(hk, []))
+                cursor = float(_verdict_cursor_by_hotkey.get(hk, 0.0) or 0.0)
+            if (
+                not existing
+                or cursor <= 0
+                or cursor < now - 7200.0
+                or cursor > now + 60.0
+            ):
+                since = now - 3600.0
+            else:
+                since = max(now - 3600.0, cursor - _VERDICT_OVERLAP_SECONDS)
             payload = _http_json(
-                f"verdicts/{hk}?since={now - 3600:.3f}", timeout=6.0
+                f"verdicts/{hk}?since={since:.3f}", timeout=6.0
             )
             rows = payload.get("verdicts")
             if not isinstance(rows, list):
                 raise ValueError("verdicts missing")
-            updated[hk] = summarize_verdicts(rows, now=now)
+            merged = _merge_verdict_rows(existing, rows, now=now)
+            with _verdict_cache_lock:
+                _verdict_rows_by_hotkey[hk] = merged
+                # Advancing to request time plus a two-minute overlap bounds
+                # traffic without losing verdicts published slightly late.
+                _verdict_cursor_by_hotkey[hk] = now
+            summary = summarize_verdicts(merged, now=now)
+            summary["_fetched_at"] = now
+            updated[hk] = summary
+            successes += 1
         except Exception as exc:
             errors.append(f"{hk[:12]}:{type(exc).__name__}")
     vs.verdicts_by_hotkey = updated
     vs.verdicts_error = "; ".join(errors)[:240]
-    if not errors:
-        vs.verdicts_last_fetch_at = time.time()
+    if successes:
+        vs.verdicts_last_fetch_at = now
 
 
-def fetch_validator(vs: ValidatorState) -> None:
+def fetch_validator(
+    vs: ValidatorState,
+    *,
+    poll_state: bool = True,
+    poll_health: bool = True,
+    poll_verdicts: bool = True,
+) -> None:
     """Poll independent state, health and final-verdict authority surfaces."""
     if not httpx:
         vs.error = "httpx missing"
@@ -5200,24 +5396,27 @@ def fetch_validator(vs: ValidatorState) -> None:
         vs.verdicts_error = "httpx missing"
         return
 
-    try:
-        state_payload = _http_json("state", timeout=8.0)
-        _apply_validator_state(vs, state_payload, source="http")
-    except Exception as exc:
-        state_payload = _validator_state_via_ssh()
-        if state_payload is None:
-            vs.error = type(exc).__name__
-        else:
-            _apply_validator_state(vs, state_payload, source="ssh")
+    if poll_state:
+        try:
+            state_payload = _http_json("state", timeout=8.0)
+            _apply_validator_state(vs, state_payload, source="http")
+        except Exception as exc:
+            state_payload = _validator_state_via_ssh()
+            if state_payload is None:
+                vs.error = type(exc).__name__
+            else:
+                _apply_validator_state(vs, state_payload, source="ssh")
 
-    try:
-        _apply_validator_health(vs, _http_json("health", timeout=8.0))
-    except Exception as exc:
-        # Preserve last-good health fields; freshness/error communicates that
-        # they are no longer authoritative.
-        vs.health_error = type(exc).__name__
+    if poll_health and validator_retry_after_remaining() <= 0:
+        try:
+            _apply_validator_health(vs, _http_json("health", timeout=8.0))
+        except Exception as exc:
+            # Preserve last-good health fields; freshness/error communicates
+            # that they are no longer authoritative.
+            vs.health_error = type(exc).__name__
 
-    _fetch_validator_verdicts(vs)
+    if poll_verdicts and validator_retry_after_remaining() <= 0:
+        _fetch_validator_verdicts(vs)
 
 
 # ---------------------------------------------------------------------------
@@ -5501,6 +5700,8 @@ def validator_tail_loop():
     Started once at dashboard boot from ``init_state``.
     """
     global _validator_tail_proc
+    if not VALIDATOR_SSH:
+        return
     # The grep mirrors the prefilter in ``_classify_validator_line``. Keeping
     # the patterns in sync is fine: each pattern is the unique log-line
     # substring for an outcome we render.
@@ -5509,11 +5710,13 @@ def validator_tail_loop():
     # keeps the wire-side filter tight while letting the rundown panel
     # surface the full taxonomy of validator-side events.
     remote_command = (
-        f"docker logs {shlex.quote(VALIDATOR_CONTAINER)} -f --since 30m 2>&1 | "
+        f"docker logs {shlex.quote(VALIDATOR_CONTAINER)} -f --since 2m 2>&1 | "
         f"grep --line-buffered -E {shlex.quote(_VALIDATOR_TAIL_GREP_EXPR)}"
     )
     cmd = _validator_ssh_args(remote_command, server_alive=True)
+    failures = 0
     while True:
+        connected_at = time.monotonic()
         try:
             _validator_tail_proc = subprocess.Popen(
                 cmd,
@@ -5529,7 +5732,7 @@ def validator_tail_loop():
                 ev = _classify_validator_line(line)
                 if ev is None:
                     continue
-                # Dedup. SSH reconnects (and the `--since 30m` re-read on
+                # Dedup. SSH reconnects (and the bounded `--since` re-read on
                 # restart) duplicate any event in the lookback window; we
                 # skip the second copy here so downstream counters don't
                 # double up. Modern validator logs can emit both the JSON
@@ -5560,8 +5763,18 @@ def validator_tail_loop():
                     _validator_events.append(ev)
         except Exception:
             pass
-        # Backoff before reconnect; SSH dropouts are usually transient.
-        time.sleep(5)
+        finally:
+            process = _validator_tail_proc
+            if process is not None and process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+        lived_s = max(0.0, time.monotonic() - connected_at)
+        failures = 0 if lived_s >= 60.0 else failures + 1
+        ceiling = min(300.0, 5.0 * (2 ** min(max(failures - 1, 0), 6)))
+        # Equal jitter avoids reconnect waves while retaining a lower bound.
+        time.sleep(random.uniform(ceiling * 0.5, ceiling))
 
 
 def validator_events_snapshot(limit: int = 50) -> list[ValidatorEvent]:
@@ -5683,11 +5896,11 @@ def recompute_validator_acpts(
             if ev.ts_epoch > cutoff_30:
                 late_30[pref] = late_30.get(pref, 0) + 1
     seen_hotkeys: set[str] = set()
-    verdicts_fresh = bool(
+    verdicts_globally_fresh = bool(
         validator_state
         and validator_state.verdicts_last_fetch_at
-        and now - validator_state.verdicts_last_fetch_at <= 30.0
-        and not validator_state.verdicts_error
+        and now - validator_state.verdicts_last_fetch_at
+        <= VALIDATOR_VERDICT_STALE_SECONDS
     )
     for box in boxes:
         ss58 = label_to_ss58.get(box.hotkey) or box.hotkey
@@ -5733,11 +5946,21 @@ def recompute_validator_acpts(
         # worker decision, unlike miner-side provisional submit responses or
         # a best-effort SSH log tail.  When fresh, it overrides the fallback
         # event counters (including an authoritative empty result).
-        verdict_summary = (
-            validator_state.verdicts_by_hotkey.get(ss58)
-            if verdicts_fresh and validator_state is not None
-            else None
-        )
+        verdict_summary = None
+        if verdicts_globally_fresh and validator_state is not None:
+            candidate = validator_state.verdicts_by_hotkey.get(ss58)
+            if isinstance(candidate, dict):
+                fetched_at = _as_float(
+                    candidate.get(
+                        "_fetched_at",
+                        validator_state.verdicts_last_fetch_at,
+                    )
+                )
+                if (
+                    fetched_at > 0
+                    and now - fetched_at <= VALIDATOR_VERDICT_STALE_SECONDS
+                ):
+                    verdict_summary = candidate
         if isinstance(verdict_summary, dict):
             box.acpt_30m = _as_int(verdict_summary.get("accepted_30m"))
             box.acpt_60m = _as_int(verdict_summary.get("accepted_60m"))
@@ -6270,6 +6493,15 @@ def window_cache_load() -> int:
         return 0
 
 _r2_client = None
+_MAX_R2_COMPRESSED_BYTES = 8 * 1024 * 1024
+_MAX_R2_DECOMPRESSED_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _PublicR2Client:
+    """Marker for a cacheable, credential-free immutable archive origin."""
+
+    base_url: str
 
 
 class _R2HTTPError(RuntimeError):
@@ -6287,6 +6519,13 @@ class _R2ObjectNotFound(FileNotFoundError):
 
 def r2():
     global _r2_client
+    if _r2_client is None:
+        public_base_url = str(
+            R2_PUBLIC_BASE_URL or os.environ.get("R2_PUBLIC_BASE_URL", "")
+        ).strip().rstrip("/")
+        if public_base_url:
+            _r2_client = _PublicR2Client(public_base_url)
+            return _r2_client
     if _r2_client is None and boto3:
         endpoint = os.environ.get("R2_ENDPOINT")
         if not endpoint:
@@ -6337,7 +6576,9 @@ def _r2_curl_bytes(url: str, *, timeout_s: int = 10) -> bytes:
     result = subprocess.run(
         [
             "/usr/bin/curl", "--fail", "--silent", "--show-error",
-            "--location", "--max-time", str(timeout_s), "--config", "-",
+            "--location", "--max-time", str(timeout_s),
+            "--max-filesize", str(_MAX_R2_COMPRESSED_BYTES),
+            "--config", "-",
         ],
         input=config,
         capture_output=True,
@@ -6354,6 +6595,8 @@ def _r2_curl_bytes(url: str, *, timeout_s: int = 10) -> bytes:
         )
         status = int(status_match.group(1)) if status_match else 0
         raise _R2HTTPError(result.returncode, status)
+    if len(result.stdout) > _MAX_R2_COMPRESSED_BYTES:
+        raise ValueError("R2 object exceeds 8 MiB")
     return result.stdout
 
 
@@ -6407,10 +6650,35 @@ def _r2_list_objects(cli: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 
 def _r2_get_object(cli: Any, *, bucket: str, key: str) -> bytes:
     """Bounded GET transport; fake/unit-test clients retain native calls."""
+    if isinstance(cli, _PublicR2Client):
+        from urllib.parse import quote
+
+        if _window_number_from_key(key) is None:
+            raise ValueError("unsupported public archive key")
+        url = f"{cli.base_url}/{quote(key, safe='/-._')}"
+        response = _http_client().get(
+            url,
+            timeout=10.0,
+            headers={
+                "Accept": "application/gzip, application/octet-stream",
+                "User-Agent": "reliquary-fleet",
+            },
+        )
+        if response.status_code == 404:
+            raise _R2ObjectNotFound(key)
+        response.raise_for_status()
+        raw = bytes(response.content)
+        if len(raw) > _MAX_R2_COMPRESSED_BYTES:
+            raise ValueError("R2 object exceeds 8 MiB")
+        return raw
     presign = getattr(cli, "generate_presigned_url", None)
     if not callable(presign):
         try:
-            return cli.get_object(Bucket=bucket, Key=key)["Body"].read()
+            body = cli.get_object(Bucket=bucket, Key=key)["Body"]
+            raw = body.read(_MAX_R2_COMPRESSED_BYTES + 1)
+            if len(raw) > _MAX_R2_COMPRESSED_BYTES:
+                raise ValueError("R2 object exceeds 8 MiB")
+            return raw
         except Exception as exc:
             response = getattr(exc, "response", {})
             error = response.get("Error", {}) if isinstance(response, dict) else {}
@@ -6492,8 +6760,15 @@ def _parse_window_object(key: str, raw: bytes) -> Optional[WindowSummary]:
     Result: ~1 KB per window vs 180 KB → 99.5% reduction in cache size.
     """
     try:
+        if len(raw) > _MAX_R2_COMPRESSED_BYTES:
+            raise ValueError("R2 object exceeds compressed size limit")
         if key.endswith(".gz"):
-            raw = gzip.decompress(raw)
+            with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as archive:
+                raw = archive.read(_MAX_R2_DECOMPRESSED_BYTES + 1)
+            if len(raw) > _MAX_R2_DECOMPRESSED_BYTES:
+                raise ValueError("R2 object exceeds decompressed size limit")
+        elif len(raw) > _MAX_R2_DECOMPRESSED_BYTES:
+            raise ValueError("R2 object exceeds decompressed size limit")
         d = json.loads(raw)
         n = int(key.split("window-")[1].split(".")[0])
         lifecycle = _parse_archive_lifecycle(d, window_n=n)
@@ -6830,22 +7105,32 @@ def _record_r2_coverage(
         )
 
 
-def fetch_recent_windows(history: int) -> list[WindowSummary]:
+_ARCHIVE_HEALTH_UNSET = object()
+
+
+def fetch_recent_windows(
+    history: int,
+    *,
+    archive_health: Any = _ARCHIVE_HEALTH_UNSET,
+    allow_list_fallback: bool | None = None,
+) -> list[WindowSummary]:
     """Return the latest configured archive history with explicit coverage.
 
     The validator's health endpoint is the primary index: its
     ``archive_last_uploaded_window`` value lets us construct exact numeric R2
-    keys and avoid S3's lexicographic ordering entirely.  If that field is
-    unavailable, the fallback exhaustively paginates LIST before doing a
-    numeric sort.  Immutable parsed windows stay cached; cold/schema upgrades
-    warm at most 32 objects per refresh. Numeric windows that the validator
-    never archived are represented separately from archives that exist but
-    are unavailable or inexact, matching the validator's EMA replay which
-    skips ``NoSuchKey`` entries inside the numeric lookback.
+    keys and avoid S3's lexicographic ordering entirely. Exhaustive LIST is
+    available only when explicitly enabled; package configs otherwise serve
+    the last-good cache until the index returns. Immutable parsed windows stay
+    cached, while cold/schema upgrades warm in a bounded batch.
     """
     global _R2_LAST_ATTEMPT_AT, _R2_LAST_SUCCESS_AT, _R2_LAST_ERROR
     global _R2_LATEST_WINDOW, _R2_LATEST_WINDOW_SEEN_AT
     history = max(0, _as_int(history))
+    list_fallback_enabled = (
+        R2_ALLOW_LIST_FALLBACK
+        if allow_list_fallback is None
+        else bool(allow_list_fallback)
+    )
     _R2_LAST_ATTEMPT_AT = time.time()
     if history <= 0:
         _record_r2_coverage(0, [], source="disabled")
@@ -6867,7 +7152,12 @@ def fetch_recent_windows(history: int) -> list[WindowSummary]:
         archive_queue_oldest_window: Optional[int] = None
         confirmed_absent: set[int] = set()
         try:
-            health = _http_json("health", timeout=3.0)
+            if archive_health is _ARCHIVE_HEALTH_UNSET:
+                health = _http_json("health", timeout=3.0)
+            elif isinstance(archive_health, dict):
+                health = archive_health
+            else:
+                health = {}
             latest_n = _as_int(health.get("archive_last_uploaded_window"))
             if "archive_queue_depth" in health:
                 queue_depth = _as_int(health.get("archive_queue_depth"), -1)
@@ -6892,6 +7182,22 @@ def fetch_recent_windows(history: int) -> list[WindowSummary]:
                 for window_n in reversed(expected_numbers)
             ]
         else:
+            if isinstance(cli, _PublicR2Client):
+                list_fallback_enabled = False
+            if not list_fallback_enabled:
+                source = "cache_without_archive_index"
+                latest_cached = max(_window_cache, default=0)
+                expected_numbers = list(
+                    range(
+                        max(0, latest_cached - history + 1),
+                        latest_cached + 1,
+                    )
+                )
+                _R2_LAST_ERROR = "archive index unavailable; serving cache"
+                _record_r2_coverage(history, expected_numbers, source=source)
+                return sorted(
+                    _window_cache.values(), key=lambda window: -window.n
+                )[:history]
             source = "r2_list_exhaustive"
             listed = _list_all_window_candidates(
                 cli, bucket=bucket, prefix=prefix
@@ -6944,7 +7250,7 @@ def fetch_recent_windows(history: int) -> list[WindowSummary]:
             )
         )
     ]
-    to_fetch = pending_fetch[:32]
+    to_fetch = pending_fetch[: max(1, int(R2_FETCH_BATCH_SIZE))]
     fetch_errors: list[str] = []
     not_found: list[int] = []
     fetched_count = 0
@@ -6965,7 +7271,7 @@ def fetch_recent_windows(history: int) -> list[WindowSummary]:
             return n, None, f"w{n}:{type(exc).__name__}", False
 
     if to_fetch:
-        workers = min(8, len(to_fetch))
+        workers = min(max(1, int(R2_FETCH_WORKERS)), len(to_fetch))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             for n, ws, error, object_absent in executor.map(fetch_one, to_fetch):
                 if ws is not None:

@@ -112,13 +112,30 @@ def _doctor_config(config_path: Path) -> tuple[object | None, list[str], list[st
     if parsed.username or parsed.password:
         failures.append("validator.url must not contain embedded credentials")
     if not loaded.validator_ssh_host:
-        failures.append("validator.ssh.host is required")
+        warnings.append(
+            "validator SSH is not configured; direct log tail and deployment "
+            "fingerprint panels will be unavailable"
+        )
     elif loaded.validator_ssh_host.endswith(".example"):
         failures.append("replace the example validator SSH host")
     if parsed.hostname and parsed.hostname.endswith(".example"):
         failures.append("replace the example validator URL")
     if not loaded.fleet:
         warnings.append("fleet is empty; miner panels will have no rows")
+    configured_hotkeys = list(
+        dict.fromkeys(
+            [
+                *(box.hotkey for box in loaded.fleet if box.hotkey),
+                *(hotkey for hotkey in loaded.starred_hotkeys_seed if hotkey),
+            ]
+        )
+    )
+    if len(configured_hotkeys) > loaded.max_verdict_hotkeys:
+        warnings.append(
+            "upstream.max_verdict_hotkeys limits direct verdict polling to "
+            f"{loaded.max_verdict_hotkeys} of {len(configured_hotkeys)} configured "
+            "hotkeys; fleet rows are prioritized"
+        )
     for box in loaded.fleet:
         if (
             not box.alias
@@ -150,14 +167,17 @@ def _doctor_config(config_path: Path) -> tuple[object | None, list[str], list[st
             "and pass --allow-remote deliberately"
         )
 
+    configured_keys = [
+        *(
+            [loaded.validator_ssh_key]
+            if loaded.validator_ssh_host and loaded.validator_ssh_key
+            else []
+        ),
+        *(box.ssh_key for box in loaded.fleet),
+        *(lab.ssh_key for lab in loaded.labs),
+    ]
     key_paths = {
-        Path(str(key)).expanduser()
-        for key in [
-            loaded.validator_ssh_key,
-            *(box.ssh_key for box in loaded.fleet),
-            *(lab.ssh_key for lab in loaded.labs),
-        ]
-        if key
+        Path(str(key)).expanduser() for key in configured_keys if key
     }
     for key_path in sorted(key_paths):
         if not key_path.is_file():
@@ -167,9 +187,19 @@ def _doctor_config(config_path: Path) -> tuple[object | None, list[str], list[st
         if key_mode & 0o077:
             warnings.append(f"SSH key permissions are {key_mode:04o}: {key_path}")
 
-    for binary in ("ssh", "curl"):
+    required_binaries: list[str] = []
+    if loaded.validator_ssh_host or loaded.fleet or loaded.labs:
+        required_binaries.append("ssh")
+    if loaded.r2_endpoint and not loaded.r2_public_base_url:
+        required_binaries.append("curl")
+    for binary in required_binaries:
         if not shutil.which(binary):
             failures.append(f"required executable not found: {binary}")
+
+    if loaded.r2_public_base_url:
+        public = urlsplit(loaded.r2_public_base_url)
+        if public.scheme != "https" and not _is_loopback(public.hostname or ""):
+            warnings.append("r2.public_base_url should use HTTPS")
 
     return loaded, failures, warnings
 

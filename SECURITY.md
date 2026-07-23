@@ -24,6 +24,17 @@ TLS reverse proxy or use an SSH tunnel. Never expose the dashboard directly to
 the public internet: its read APIs contain operational topology and performance
 data.
 
-Keep R2 credentials out of YAML where possible, scope them to read-only access,
-and use a dedicated unprivileged SSH identity. The generated config is mode
-`0600`; `reliquary-fleet doctor` warns about unsafe local permissions.
+Prefer a credential-free, cache-enabled HTTPS archive origin for distributed
+installs. If a private R2 bucket is required, keep credentials out of YAML
+where possible and scope them to `GetObject` on the archive prefix. Exhaustive
+bucket LIST is disabled by default.
+
+Validator SSH is optional. When enabled, use a dedicated unprivileged identity
+that can read only the intended container logs and metadata; never distribute
+a shared production SSH key as part of public onboarding. Miner and lab keys
+should likewise be per-operator and narrowly scoped. The generated config is
+mode `0600`; `reliquary-fleet doctor` warns about unsafe local permissions.
+
+Fleet has no telemetry or hosted control-plane dependency. Browser requests are
+same-origin and local by default. Shared validator reads use bounded independent
+cadences, incremental cursors, jitter, `Retry-After`, and exponential backoff.

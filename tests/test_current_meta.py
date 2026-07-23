@@ -3102,7 +3102,7 @@ def test_r2_exhaustive_list_marks_interior_archive_gap_complete(monkeypatch):
     )
     monkeypatch.setenv("R2_BUCKET", "test-bucket")
 
-    windows = fleet.fetch_recent_windows(3)
+    windows = fleet.fetch_recent_windows(3, allow_list_fallback=True)
     status = fleet.r2_status()
 
     assert [window.n for window in windows] == [102, 100]
@@ -3212,7 +3212,7 @@ def test_r2_fallback_exhaustively_lists_through_lexical_wrap(monkeypatch):
     )
     monkeypatch.setenv("R2_BUCKET", "test-bucket")
 
-    windows = fleet.fetch_recent_windows(3)
+    windows = fleet.fetch_recent_windows(3, allow_list_fallback=True)
 
     assert [window.n for window in windows] == [102, 101, 100]
     assert len(fake.list_calls) == 2
@@ -4285,7 +4285,7 @@ def test_healthz_reports_healthy_stale_down_and_quarantined(monkeypatch):
     assert budgeted["checks"]["poll_fresh"] is True
     assert "stale" not in budgeted["fleet"][0]["issues"]
     assert budgeted["thresholds_s"]["poll"] == 60
-    assert budgeted["thresholds_s"]["verdicts"] == 60
+    assert budgeted["thresholds_s"]["verdicts"] == 180
 
     strict = fleet_web.compute_healthz(5, now=now)
     assert strict["checks"]["poll_fresh"] is False

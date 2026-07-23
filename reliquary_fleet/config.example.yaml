@@ -5,21 +5,20 @@
 # `reliquary-fleet serve`. Source checkouts may still copy it to config.yaml.
 
 # ---------------------------------------------------------------------------
-# Validator under test. The dashboard SSHes into this host to tail the
-# validator container's logs (events feed) and HTTP-polls /state, /health,
-# and full-hotkey /verdicts for live window/runtime/final-outcome KPIs.
+# Validator under test. HTTP provides live window/runtime/final-outcome KPIs.
+# Validator SSH is optional and adds the direct container event tail plus
+# deployment fingerprint for operators who control that host.
 # ---------------------------------------------------------------------------
 validator:
   # FastAPI URL exposed by the validator container (default port 8080).
   url: "http://validator.example:8080"
   ssh:
-    # Either user@host (passwordless key login) or an alias from
-    # ~/.ssh/config. The same identity must be able to run
-    # `docker logs <container>` non-interactively.
-    host: "ops@validator.example"
+    # Optional. Use either user@host (passwordless key login) or an alias from
+    # ~/.ssh/config. Leave blank for the safe HTTP-only client mode.
+    host: ""
     port: 22
-    # Absolute path or ~-expansion. The user running the dashboard needs
-    # read access to this file.
+    # Used only when host is set (and as the default for configured miner
+    # boxes that omit their own ssh_key).
     key: "~/.ssh/id_ed25519"
   # Docker container name to tail logs from. Standard reliquary builds
   # name it "reliquary-trainer".
@@ -122,22 +121,48 @@ starred_hotkeys: []
 netuid: 81
 
 # ---------------------------------------------------------------------------
-# Cloudflare R2 — the dashboard reads validator-published window archives
-# to compute slot share / EMA leaderboard / reject summaries.
+# Cloudflare R2 — the dashboard reads validator-published immutable window
+# archives to compute slot share / EMA leaderboard / reject summaries.
 #
-# All four fields can also be set via env vars; env wins over yaml so a
-# shared config.yaml + per-operator .env works. Bash export form:
+# Prefer a cache-enabled custom domain in public_base_url for distributed
+# installs. S3 API requests bypass Cloudflare's edge cache and should remain
+# an operator-only fallback with narrowly scoped read credentials.
 #
-#   export R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
-#   export R2_BUCKET="reliquary"
-#   export AWS_ACCESS_KEY_ID="..."
-#   export AWS_SECRET_ACCESS_KEY="..."
+# Environment variables win over YAML:
+#   R2_PUBLIC_BASE_URL, R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID,
+#   AWS_SECRET_ACCESS_KEY.
 # ---------------------------------------------------------------------------
 r2:
+  # Example: https://archives.example.org
+  # Objects must be available below
+  # /reliquary/dataset/window-<N>.json.gz with immutable cache headers.
+  public_base_url: ""
   endpoint: ""
   bucket: "reliquary"
   access_key_id: ""
   secret_access_key: ""
+  # Never scan a shared bucket when /health temporarily lacks its archive
+  # index. Operators with a small private bucket may opt in deliberately.
+  allow_list_fallback: false
+  # Cold history warms progressively instead of opening a large burst.
+  fetch_batch_size: 8
+  fetch_workers: 2
+  refresh_seconds: 60
+
+# ---------------------------------------------------------------------------
+# Shared upstream request budgets. These are intentionally independent from
+# the fast per-miner SSH refresh. Lower values are rejected by configuration
+# validation so one installation cannot accidentally poll a shared validator
+# at browser-frame cadence.
+# ---------------------------------------------------------------------------
+upstream:
+  validator_state_seconds: 15
+  validator_health_seconds: 30
+  validator_verdict_seconds: 60
+  max_verdict_hotkeys: 8
+  chain_refresh_seconds: 300
+  rtt_refresh_seconds: 120
+  startup_jitter_seconds: 30
 
 # ---------------------------------------------------------------------------
 # Dashboard runtime tuning. Defaults match the previously-shipped fleet.py.

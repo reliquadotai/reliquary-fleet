@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-"""SN81 fleet web dashboard — single-file FastAPI + HTMX.
+"""SN81 fleet web dashboard built on FastAPI with local static assets.
 
 Same data sources as fleet.py (SSH probes, validator /state, R2 window
 history) but served as a self-refreshing HTML page on localhost. Open
-http://localhost:9091 in any browser. The page uses HTMX to swap each
-panel independently — no full-page reloads, no JS framework.
+http://localhost:9091 in any browser. One visibility-aware local snapshot
+request refreshes the complete page without full-page reloads.
 
 A background poller thread keeps the data warm so HTTP requests return
 in milliseconds instead of waiting on SSH round trips.
 
 Run (from the repo root, after copying config.example.yaml -> config.yaml):
   ./run.sh
-  ./run.sh --port 9091 --refresh 3
+  ./run.sh --port 9091 --refresh 5
   python3 fleet_web.py --config /alt/path/to/config.yaml
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import ipaddress
 import json
 import math
 import os
+import random
 import re
 import shlex
 import socket
@@ -51,6 +53,7 @@ try:
         aggregate_k_histogram, aggregate_competitors,
         compute_ema_leaderboard, window_cache_load,
         validator_tail_loop, validator_events_snapshot,
+        VALIDATOR_SSH,
         # New: validator-rundown plumbing.
         current_window_accept_count, validator_events_in_window,
         validator_events_query,
@@ -62,7 +65,7 @@ except ImportError as e:
     sys.exit(f"could not import fleet.py from same dir: {e}")
 
 try:
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     from starlette.middleware.gzip import GZipMiddleware
     import uvicorn
@@ -109,6 +112,7 @@ _STATIC_ASSETS = {
     name: _STATIC_ROOT.joinpath(name).read_bytes()
     for name in _STATIC_MEDIA_TYPES
 }
+_RNG = random.SystemRandom()
 
 
 def _is_loopback_bind(host: str) -> bool:
@@ -183,7 +187,7 @@ def _release_instance_lock() -> None:
 
 def _start_collectors_after_ready(
     server,
-    collectors: list[tuple[str, object, tuple]],
+    collectors: list[tuple],
     *,
     on_ready=None,
     wait_s: float = 0.02,
@@ -193,16 +197,48 @@ def _start_collectors_after_ready(
         if bool(getattr(server, "should_exit", False)):
             return False
         time.sleep(wait_s)
-    for name, target, thread_args in collectors:
+    for collector in collectors:
+        name, target, thread_args = collector[:3]
+        startup_jitter_s = float(collector[3]) if len(collector) > 3 else 0.0
         threading.Thread(
             name=f"reliquary-fleet-{name}",
-            target=target,
-            args=thread_args,
+            target=_run_collector_after_delay,
+            args=(target, thread_args, startup_jitter_s),
             daemon=True,
         ).start()
     if on_ready is not None:
         on_ready()
     return True
+
+
+def _jittered_delay(base_s: float, ratio: float = 0.2) -> float:
+    """Bound one recurring cadence while desynchronizing installations."""
+    base = max(0.05, float(base_s))
+    spread = max(0.0, min(float(ratio), 0.5))
+    return base * _RNG.uniform(1.0 - spread, 1.0 + spread)
+
+
+def _backoff_delay(
+    base_s: float,
+    failures: int,
+    *,
+    cap_s: float = 900.0,
+) -> float:
+    """Equal-jitter exponential backoff; never returns a hot-looping zero."""
+    exponent = max(0, min(int(failures) - 1, 6))
+    ceiling = min(float(cap_s), max(0.1, float(base_s)) * (2 ** exponent))
+    return _RNG.uniform(ceiling * 0.5, ceiling)
+
+
+def _run_collector_after_delay(
+    target: object,
+    thread_args: tuple,
+    startup_jitter_s: float,
+) -> None:
+    delay = _RNG.uniform(0.0, max(0.0, float(startup_jitter_s)))
+    if delay:
+        time.sleep(delay)
+    target(*thread_args)
 
 
 # Auction payout semantics are an exact-source contract.  PR156 introduced a
@@ -245,7 +281,7 @@ def sync_fleet_globals() -> None:
     NETUID = _fleet_mod.NETUID
 
 
-def deployment_loop():
+def deployment_loop(period_s: float = 60.0):
     """Slow poll — SSH + docker inspect every 60 s for image/uptime data.
 
     The validator's container restart is the operational event the
@@ -255,13 +291,20 @@ def deployment_loop():
     that the SSH round trips don't compete with the fast box-probe loop.
     """
     global _deployment_last
+    failures = 0
     while True:
         try:
             fetch_deployment_state(_deployment)
         except Exception:
-            pass
+            _deployment.error = "probe failed"
         _deployment_last = time.time()
-        time.sleep(60)
+        if _deployment.error:
+            failures += 1
+            delay = _backoff_delay(period_s, failures)
+        else:
+            failures = 0
+            delay = _jittered_delay(period_s)
+        time.sleep(delay)
 
 
 def init_state():
@@ -349,6 +392,27 @@ def poller_loop(refresh_s: float, history: int):
     (~225/30m per box on a busy fleet) where the operator expects
     actual validator pool/proof admissions (~5-15/30m per box).
     """
+    import fleet as _fleet_mod
+    from settings import SETTINGS as _settings
+
+    periods = {
+        "state": float(_settings.validator_state_seconds),
+        "health": float(_settings.validator_health_seconds),
+        "verdicts": float(_settings.validator_verdict_seconds),
+    }
+    startup_now = time.monotonic()
+    startup_spread = float(_settings.startup_jitter_seconds)
+    first_poll_spread = {
+        "state": min(5.0, startup_spread),
+        "health": min(15.0, startup_spread),
+        "verdicts": startup_spread,
+    }
+    next_due = {
+        name: startup_now
+        + _RNG.uniform(0.0, first_poll_spread[name])
+        for name in periods
+    }
+    failures = {name: 0 for name in periods}
     while True:
         with _lock:
             current_boxes = list(_boxes)
@@ -370,15 +434,70 @@ def poller_loop(refresh_s: float, history: int):
             threading.Thread(target=collect_lab, args=(index, lab))
             for index, lab in enumerate(current_labs)
         ]
-        v_thread = threading.Thread(target=fetch_validator, args=(_vs,))
-        for t in threads + lab_threads + [v_thread]:
+        now_mono = time.monotonic()
+        retry_after = _fleet_mod.validator_retry_after_remaining()
+        if retry_after > 0:
+            for name in next_due:
+                next_due[name] = max(next_due[name], now_mono + retry_after)
+        due = {
+            name: now_mono >= next_due[name]
+            for name in periods
+        }
+        previous_fetch = {
+            "state": float(_vs.last_fetch_at or 0.0),
+            "health": float(_vs.health_last_fetch_at or 0.0),
+            "verdicts": float(_vs.verdicts_last_fetch_at or 0.0),
+        }
+        v_thread = None
+        if any(due.values()):
+            v_thread = threading.Thread(
+                target=fetch_validator,
+                args=(_vs,),
+                kwargs={
+                    "poll_state": due["state"],
+                    "poll_health": due["health"],
+                    "poll_verdicts": due["verdicts"],
+                },
+            )
+        active_threads = threads + lab_threads + (
+            [v_thread] if v_thread is not None else []
+        )
+        for t in active_threads:
             t.start()
         # Wait for every private snapshot's bounded SSH/HTTP work to finish;
         # publishing only complete generations prevents overlapping rounds and
         # keeps the previous generation stable for concurrent HTTP readers.
         for t in threads + lab_threads:
             t.join()
-        v_thread.join()
+        if v_thread is not None:
+            v_thread.join()
+            fetched_at = {
+                "state": float(_vs.last_fetch_at or 0.0),
+                "health": float(_vs.health_last_fetch_at or 0.0),
+                "verdicts": float(_vs.verdicts_last_fetch_at or 0.0),
+            }
+            surface_error = {
+                "state": _vs.error not in ("", "ssh-state"),
+                "health": bool(_vs.health_error),
+                "verdicts": bool(_vs.verdicts_error),
+            }
+            scheduled_at = time.monotonic()
+            for name, was_due in due.items():
+                if not was_due:
+                    continue
+                succeeded = (
+                    fetched_at[name] > previous_fetch[name]
+                    and fetched_at[name] > 0
+                    and not surface_error[name]
+                )
+                if succeeded:
+                    failures[name] = 0
+                    delay = _jittered_delay(periods[name])
+                else:
+                    failures[name] += 1
+                    delay = _backoff_delay(periods[name], failures[name])
+                retry_after = _fleet_mod.validator_retry_after_remaining()
+                next_due[name] = scheduled_at + max(delay, retry_after)
         # Reproject final validator verdicts onto each box. Runs after
         # the SSH-collect joins so we have the latest box list and the
         # validator-events deque is up to date (the tail subprocess
@@ -392,21 +511,41 @@ def poller_loop(refresh_s: float, history: int):
             labs=lab_snapshots,
             polled_at=time.time(),
         )
-        time.sleep(refresh_s)
+        time.sleep(_jittered_delay(refresh_s, ratio=0.1))
 
 
-def r2_loop(history: int, period_s: int = 30):
-    """Refresh R2 windows every 30s. Cached fetcher only downloads new windows
-    (windows seal once and become immutable), so steady state is one bounded
-    LIST plus a GET only when a new window appears.
+def r2_loop(history: int, period_s: float = 60.0):
+    """Refresh sealed windows on a bounded configured cadence.
+
+    Cached fetches download only new immutable windows. The validator health
+    snapshot supplies the exact archive index, so normal operation performs
+    neither a duplicate health request nor a bucket LIST.
 
     Also recomputes the EMA leaderboard when new windows arrive — this is the
     only place EMA gets recomputed, keeping the /api/ema endpoint at <1ms.
     """
+    import fleet as _fleet_mod
+
     global _windows, _ema_cache, _ema_window_count
+    failures = 0
     while True:
+        health_snapshot = (
+            dict(_vs.health_raw) if isinstance(_vs.health_raw, dict) else {}
+        )
+        if (
+            not health_snapshot
+            and not _fleet_mod.R2_ALLOW_LIST_FALLBACK
+        ):
+            # The health collector supplies the exact immutable archive index.
+            # Waiting here performs no network work and avoids a false
+            # "index unavailable" warning when the R2 thread wins startup.
+            time.sleep(_jittered_delay(min(5.0, period_s), ratio=0.1))
+            continue
         try:
-            new_windows = fetch_recent_windows(history)
+            new_windows = fetch_recent_windows(
+                history,
+                archive_health=health_snapshot,
+            )
         except Exception:
             new_windows = None
         if new_windows:
@@ -422,48 +561,156 @@ def r2_loop(history: int, period_s: int = 30):
                     _ema_window_count = len(new_windows)
             except Exception:
                 pass
-        time.sleep(period_s)
+        status = _r2_status_snapshot()
+        error = str(status.get("error", status.get("last_error", "")) or "")
+        hard_error = bool(error and "warming:" not in error)
+        if hard_error:
+            failures += 1
+            delay = _backoff_delay(period_s, failures)
+        else:
+            failures = 0
+            delay = _jittered_delay(period_s)
+        time.sleep(delay)
 
 
-def chain_loop(period_s: int = 300):
+def chain_loop(period_s: float = 300.0):
     """Pull metagraph stake / emission every 5 min."""
     global _chain_last
+    failures = 0
     while True:
         try:
             fetch_chain_state(_chain)
             _chain_last = time.time()
         except Exception as e:
             _chain.error = type(e).__name__
-        time.sleep(period_s)
+        if _chain.error:
+            failures += 1
+            delay = _backoff_delay(period_s, failures, cap_s=1800.0)
+        else:
+            failures = 0
+            delay = _jittered_delay(period_s)
+        time.sleep(delay)
 
 
-def rtt_loop(period_s: int = 60):
-    """Probe mac→validator and box→validator latency every minute.
+def rtt_loop(period_s: float = 60.0):
+    """Probe mac→validator and box→validator latency on a slow cadence.
 
     Uses fleet.VALIDATOR_URL (populated by settings) so the probe targets
     the operator-configured validator host instead of a hardcoded IP.
     """
     import fleet as _fleet_mod
     global _rtt_last
+    failures = 0
     while True:
-        if _boxes and _fleet_mod.VALIDATOR_URL:
+        succeeded = False
+        retry_after = _fleet_mod.validator_retry_after_remaining()
+        if retry_after <= 0 and _boxes and _fleet_mod.VALIDATOR_URL:
             try:
                 probe_rtt(_boxes, _fleet_mod.VALIDATOR_URL, _rtt)
                 _rtt_last = time.time()
+                succeeded = any(value >= 0 for value in _rtt.rtt_ms.values())
             except Exception:
                 pass
-        time.sleep(period_s)
+        if succeeded:
+            failures = 0
+            delay = _jittered_delay(period_s)
+        else:
+            failures += 1
+            delay = _backoff_delay(period_s, failures)
+        time.sleep(max(delay, retry_after))
 
 
-def baseline_loop(period_s: int = 60):
+def baseline_loop(period_s: float = 60.0):
     """Sample fleet ACPT/30m every minute, persist to disk for 6h baseline."""
     global _baseline_last
     while True:
-        time.sleep(period_s)
+        time.sleep(_jittered_delay(period_s, ratio=0.1))
         with _lock:
             total = sum(b.acpt_30m for b in _boxes)
         baseline_record(_baseline, total)
         _baseline_last = time.time()
+
+
+def _collector_specs(runtime_settings, refresh_s: float, history: int) -> list[tuple]:
+    """Build the one-process collector topology from validated settings."""
+    startup_jitter = float(runtime_settings.startup_jitter_seconds)
+    collectors: list[tuple] = [
+        (
+            "poller",
+            poller_loop,
+            (refresh_s, history),
+            min(5.0, startup_jitter),
+        ),
+        (
+            "chain",
+            chain_loop,
+            (runtime_settings.chain_refresh_seconds,),
+            startup_jitter,
+        ),
+        (
+            "rtt",
+            rtt_loop,
+            (runtime_settings.rtt_refresh_seconds,),
+            startup_jitter,
+        ),
+        ("baseline", baseline_loop, (60,), 0.0),
+        (
+            "r2",
+            r2_loop,
+            (history, runtime_settings.r2_refresh_seconds),
+            startup_jitter,
+        ),
+    ]
+    if runtime_settings.validator_ssh_host:
+        collectors.extend(
+            [
+                (
+                    "validator-tail",
+                    validator_tail_loop,
+                    (),
+                    startup_jitter,
+                ),
+                (
+                    "deployment",
+                    deployment_loop,
+                    (60,),
+                    startup_jitter,
+                ),
+            ]
+        )
+    return collectors
+
+
+def _request_budget(refresh_s: float) -> dict[str, float | int]:
+    """Conservative steady-state request envelope for one visible install."""
+    from settings import SETTINGS as runtime
+
+    watched = min(
+        len({hotkey for hotkey in OUR_SS58 if hotkey}),
+        int(runtime.max_verdict_hotkeys),
+    )
+    boxes = len(_boxes)
+    validator_per_minute = (
+        60.0 / float(runtime.validator_state_seconds)
+        + 60.0 / float(runtime.validator_health_seconds)
+        + watched * 60.0 / float(runtime.validator_verdict_seconds)
+        + (boxes + 1) * 60.0 / float(runtime.rtt_refresh_seconds)
+    )
+    browser_interval = max(5.0, float(refresh_s))
+    return {
+        "watched_verdict_hotkeys": watched,
+        "miner_boxes": boxes,
+        "validator_requests_per_minute_upper_bound": round(
+            validator_per_minute,
+            3,
+        ),
+        "browser_local_requests_per_minute": round(
+            60.0 / browser_interval,
+            3,
+        ),
+        "r2_cold_batch_objects": int(runtime.r2_fetch_batch_size),
+        "r2_cold_max_concurrency": int(runtime.r2_fetch_workers),
+    }
 
 
 # --- v2.3 reject-reason metadata -------------------------------------------
@@ -3822,6 +4069,16 @@ def render_fleet_summary_html() -> str:
             f"{sub_html}"
         )
 
+    verdict_watch_warning = str(getattr(vs, "verdicts_warning", "") or "")
+    verdict_watch_html = (
+        "<div class='yellow small' role='status' style='margin-top:7px'>"
+        + html.escape(verdict_watch_warning)
+        + "; fleet hotkeys are prioritized"
+        + "</div>"
+        if verdict_watch_warning
+        else ""
+    )
+
     return f"""
 <div class="panel overview-panel">
   <h2>Ops overview <span class="dim small">fleet + mission</span></h2>
@@ -3858,6 +4115,7 @@ def render_fleet_summary_html() -> str:
       </tr>
     </tbody>
   </table>
+  {verdict_watch_html}
 </div>
 """
 
@@ -4379,10 +4637,17 @@ def render_validator_events_html(limit: int = 60) -> str:
 
     rows = []
     if not events:
-        rows.append(
-            "<div class='dim'>(no validator events yet — tail subprocess warming, "
-            "or no pool accepts/rejects in last 60s)</div>"
-        )
+        if not VALIDATOR_SSH:
+            rows.append(
+                "<div class='dim'>Direct validator log tail is disabled in "
+                "HTTP-only mode. Exact per-hotkey verdicts and sealed-window "
+                "rewards remain available.</div>"
+            )
+        else:
+            rows.append(
+                "<div class='dim'>(no validator events yet — tail subprocess "
+                "warming, or no recent pool accepts/rejects)</div>"
+            )
     # Render the tail with late-drops EXCLUDED — at ~3000/h fleet-wide
     # they'd drown the panel and bury accepts/rejects. The KPI strip
     # above surfaces the count; per-hotkey detail lives in the rundown.
@@ -5376,7 +5641,7 @@ def compute_healthz(
     # Verdicts are gathered by the same generation before publication, so a
     # smaller limit would reintroduce readiness flapping partway through an
     # otherwise healthy long probe cycle.
-    verdict_limit = max(30.0, effective_refresh * 6.0, poll_limit)
+    verdict_limit = max(180.0, effective_refresh * 6.0, poll_limit)
     r2_limit = max(120.0, effective_refresh * 12.0)
     with _lock:
         boxes = list(_boxes)
@@ -5564,6 +5829,7 @@ def compute_healthz(
         "status": "ok" if ok else "degraded",
         "checks": checks,
         "polls": poll_count,
+        "request_budget": _request_budget(effective_refresh),
         "thresholds_s": {
             "poll": poll_limit,
             "verdicts": verdict_limit,
@@ -5586,6 +5852,7 @@ def compute_healthz(
             "health_status": getattr(vs, "health_status", ""),
             "health_error": getattr(vs, "health_error", ""),
             "verdicts_error": getattr(vs, "verdicts_error", ""),
+            "verdicts_warning": getattr(vs, "verdicts_warning", ""),
             "model_identity": _validator_model_identity(vs),
             "liveness": validator_liveness,
         },
@@ -5610,6 +5877,8 @@ def compute_healthz(
 
 def render_export_json() -> dict:
     """JSON export of the full state for offline analysis or alerting."""
+    from settings import SETTINGS as runtime_settings
+
     with _lock:
         chain_hotkeys = {getattr(h, "hotkey", "") for h in _chain.hotkeys}
         chain_seen = bool(_chain.last_fetch_at)
@@ -5834,6 +6103,7 @@ def render_export_json() -> dict:
         }
     return {
         "ts": int(time.time()),
+        "request_budget": _request_budget(runtime_settings.refresh_seconds),
         "validator": {
             "window": _vs.window,
             "state": _vs.state,
@@ -5874,6 +6144,7 @@ def render_export_json() -> dict:
             "verdicts_by_hotkey": getattr(_vs, "verdicts_by_hotkey", {}),
             "verdicts_last_fetch_at": getattr(_vs, "verdicts_last_fetch_at", 0.0),
             "verdicts_error": getattr(_vs, "verdicts_error", ""),
+            "verdicts_warning": getattr(_vs, "verdicts_warning", ""),
             "error": _vs.error,
         },
         "targets": targets_data,
@@ -5921,6 +6192,9 @@ def render_logs_table_html(
     hotkey: str | None,
     ours_only: bool,
     limit: int,
+    *,
+    events: list | None = None,
+    buffer_total: int | None = None,
 ) -> str:
     """Render the /logs results table as an HTMX fragment.
 
@@ -5928,14 +6202,18 @@ def render_logs_table_html(
     raw `msg` text so an operator can copy-paste a line into a bug
     report or grep for a substring.
     """
-    events = validator_events_query(
-        kinds=kinds, reason_substr=reason or None,
-        hotkey_substr=hotkey or None, ours_only=ours_only,
-        limit=limit,
-    )
+    if events is None:
+        events = validator_events_query(
+            kinds=kinds, reason_substr=reason or None,
+            hotkey_substr=hotkey or None, ours_only=ours_only,
+            limit=limit,
+        )
     # Buffer-wide totals (independent of filter) for the header strip.
-    with _lock:
-        buf_total = len(validator_events_snapshot(10_000))
+    buf_total = (
+        len(validator_events_snapshot(10_000))
+        if buffer_total is None
+        else int(buffer_total)
+    )
     rows: list[str] = []
     if not events:
         rows.append(
@@ -6091,11 +6369,7 @@ LOGS_PAGE = """<!doctype html>
   </nav>
 </header>
 
-<form class="filter-bar" id="filter-bar"
-      hx-get="/api/logs"
-      hx-trigger="change, keyup changed delay:300ms from:input[type=text], every 2s[!isPaused()]"
-      hx-target="#log-out"
-      hx-swap="innerHTML">
+<form class="filter-bar" id="filter-bar">
   <fieldset class="kind-fieldset">
     <legend>kinds</legend>
     <span id="kind-pills">
@@ -6127,11 +6401,7 @@ LOGS_PAGE = """<!doctype html>
   <button type="button" class="pause-btn" id="pause-btn" data-paused="0" aria-pressed="false">● Live</button>
 </form>
 
-<div id="log-out"
-     hx-get="/api/logs"
-     hx-trigger="load"
-     hx-include="#filter-bar"
-     hx-swap="innerHTML">
+<div id="log-out" aria-busy="true">
   <div style="padding:24px;text-align:center;color:var(--stone)" role="status">Loading...</div>
 </div>
 
@@ -6155,7 +6425,7 @@ PAGE = """<!doctype html>
 <script src="/static/htmx.min.js" defer></script>
 <link rel="stylesheet" href="/static/dashboard.css?v={asset_version}">
 </head>
-<body data-demo="{demo_mode}">
+<body data-demo="{demo_mode}" data-refresh-seconds="{browser_refresh_s}">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
 <header class="app-header">
   <div class="brand-lockup">
@@ -6165,7 +6435,7 @@ PAGE = """<!doctype html>
     {demo_badge}
   </div>
   <div class="subtitle header-meta">
-    <span class="poll-status" title="Local dashboard refresh cadence"><span class="pulse"></span>{refresh_s}s</span>
+    <span class="poll-status" title="Local dashboard refresh cadence"><span class="pulse"></span>{browser_refresh_s}s</span>
     <nav aria-label="Dashboard tools">
       <a class="tool-button" href="/logs" title="Open event logs" aria-label="Open event logs">
         <span class="tool-icon" aria-hidden="true">↗</span><span class="tool-label">Logs</span>
@@ -6190,24 +6460,27 @@ PAGE = """<!doctype html>
       <section class="area-score dashboard-area"
            aria-busy="true"
            aria-label="Window score"
+           data-panel="score"
            hx-get="/api/scoreboard"
-           hx-trigger="load, every 3s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
         <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
       </section>
       <section class="area-windows dashboard-area"
            aria-busy="true"
            aria-label="Window history"
+           data-panel="windows"
            hx-get="/api/windows"
-           hx-trigger="load, every 6s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
         <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
       </section>
       <section class="area-ema dashboard-area"
            aria-busy="true"
            aria-label="EMA leaderboard"
+           data-panel="ema"
            hx-get="/api/ema?mode=top"
-           hx-trigger="load, every 30s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML"
            id="ema-area"
            data-mode="top">
@@ -6216,8 +6489,9 @@ PAGE = """<!doctype html>
       <section class="area-fleet dashboard-area"
            aria-busy="true"
            aria-label="Fleet health"
+           data-panel="fleet"
            hx-get="/api/fleet"
-           hx-trigger="load, every 3s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
         <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
       </section>
@@ -6227,32 +6501,36 @@ PAGE = """<!doctype html>
       <section class="area-summary dashboard-area"
        aria-busy="true"
        aria-label="Operations overview"
+       data-panel="summary"
        hx-get="/api/summary"
-       hx-trigger="load, every 3s"
+       hx-trigger="fleet:refresh"
        hx-swap="innerHTML">
         <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
       </section>
       <section class="area-forensics dashboard-area"
        aria-busy="true"
        aria-label="Window forensics"
+       data-panel="forensics"
        hx-get="/api/window_forensics"
-       hx-trigger="load, every 6s"
+       hx-trigger="fleet:refresh"
        hx-swap="innerHTML">
         <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
       </section>
       <section class="area-pipeline dashboard-area"
        aria-busy="true"
        aria-label="GPU and reference pipeline"
+       data-panel="pipeline"
        hx-get="/api/pipeline"
-       hx-trigger="load, every 3s"
+       hx-trigger="fleet:refresh"
        hx-swap="innerHTML">
         <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
       </section>
       <section class="area-frontier dashboard-area"
        aria-busy="true"
        aria-label="Frontier selection"
+       data-panel="frontier"
        hx-get="/api/frontier"
-       hx-trigger="load, every 5s"
+       hx-trigger="fleet:refresh"
        hx-swap="innerHTML">
         <div class="panel skeleton-panel" aria-hidden="true"><h2>Prompt frontier</h2><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
       </section>
@@ -6262,8 +6540,9 @@ PAGE = """<!doctype html>
   <section class="area-labs dashboard-area"
        aria-busy="true"
        aria-label="Submit-disabled accelerator labs"
+       data-panel="labs"
        hx-get="/api/labs"
-       hx-trigger="load, every 5s"
+       hx-trigger="fleet:refresh"
        hx-swap="innerHTML">
     <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
   </section>
@@ -6272,8 +6551,9 @@ PAGE = """<!doctype html>
     <section class="area-rundown dashboard-area"
        aria-busy="true"
        aria-label="Validator rundown"
+       data-panel="rundown"
        hx-get="/api/validator_rundown?tf=30m"
-       hx-trigger="load, every 5s"
+       hx-trigger="fleet:refresh"
        hx-swap="innerHTML"
        id="rundown-area"
        data-tf="30m">
@@ -6282,8 +6562,9 @@ PAGE = """<!doctype html>
     <section class="area-valevents dashboard-area"
        aria-busy="true"
        aria-label="Validator events"
+       data-panel="validator_events"
        hx-get="/api/validator_events"
-       hx-trigger="load, every 2s"
+       hx-trigger="fleet:refresh"
        hx-swap="innerHTML">
       <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
     </section>
@@ -6293,50 +6574,57 @@ PAGE = """<!doctype html>
     <div class="diag-column">
       <div class="area-chain"
            aria-label="Chain and metagraph"
+           data-panel="chain"
            hx-get="/api/chain"
-           hx-trigger="load, every 30s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
       </div>
       <div class="area-slotrank"
            aria-label="Canonical rank distribution"
+           data-panel="slotrank"
            hx-get="/api/slotrank"
-           hx-trigger="load, every 6s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
       </div>
     </div>
     <div class="diag-column">
       <div class="area-baseline"
            aria-label="Throughput baseline"
+           data-panel="baseline"
            hx-get="/api/baseline"
-           hx-trigger="load, every 10s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
       </div>
       <div class="area-competitors"
            aria-label="Top competing miners"
+           data-panel="competitors"
            hx-get="/api/competitors"
-           hx-trigger="load, every 6s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
       </div>
     </div>
     <div class="diag-column">
       <div class="area-rtt"
            aria-label="Network latency"
+           data-panel="rtt"
            hx-get="/api/rtt"
-           hx-trigger="load, every 15s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
       </div>
       <div class="area-quality"
            aria-label="Quality distribution"
+           data-panel="quality"
            hx-get="/api/quality"
-           hx-trigger="load, every 6s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
       </div>
     </div>
     <div class="diag-column">
       <div class="area-events"
            aria-label="Live miner event tail"
+           data-panel="events"
            hx-get="/api/events"
-           hx-trigger="load, every 3s"
+           hx-trigger="fleet:refresh"
            hx-swap="innerHTML">
       </div>
     </div>
@@ -6347,6 +6635,75 @@ PAGE = """<!doctype html>
 </body>
 </html>
 """
+
+
+_dashboard_snapshot_lock = threading.Lock()
+_dashboard_snapshot_cache: dict[
+    tuple[str, str], tuple[float, dict[str, object]]
+] = {}
+_DASHBOARD_SNAPSHOT_CACHE_SECONDS = 0.75
+
+
+def _invalidate_dashboard_snapshot_cache() -> None:
+    with _dashboard_snapshot_lock:
+        _dashboard_snapshot_cache.clear()
+
+
+def render_dashboard_snapshot(
+    *,
+    ema_mode: str = "top",
+    rundown_tf: str = "30m",
+) -> dict[str, object]:
+    """Render one failure-isolated payload for the complete local dashboard."""
+    normalized_ema = "active" if ema_mode == "active" else "top"
+    normalized_tf = rundown_tf if rundown_tf in RUNDOWN_TIMEFRAMES else "30m"
+    cache_key = (normalized_ema, normalized_tf)
+    now = time.time()
+    with _dashboard_snapshot_lock:
+        cached = _dashboard_snapshot_cache.get(cache_key)
+        if cached and now - cached[0] <= _DASHBOARD_SNAPSHOT_CACHE_SECONDS:
+            return dict(cached[1])
+
+        renderers = {
+            "score": render_scoreboard_html,
+            "windows": render_windows_html,
+            "ema": lambda: render_ema_leaderboard_html(
+                top_n=12,
+                mode=normalized_ema,
+            ),
+            "fleet": render_fleet_html,
+            "summary": render_fleet_summary_html,
+            "forensics": render_window_forensics_html,
+            "pipeline": render_pipeline_html,
+            "frontier": render_frontier_html,
+            "labs": render_labs_html,
+            "rundown": lambda: render_validator_rundown_html(
+                timeframe=normalized_tf
+            ),
+            "validator_events": render_validator_events_html,
+            "chain": render_chain_html,
+            "slotrank": render_slot_rank_html,
+            "baseline": render_baseline_html,
+            "competitors": render_competitors_html,
+            "rtt": render_rtt_html,
+            "quality": render_quality_html,
+            "events": render_events_html,
+        }
+        panels: dict[str, str] = {}
+        errors: dict[str, str] = {}
+        for name, renderer in renderers.items():
+            try:
+                panels[name] = renderer()
+            except Exception as exc:
+                errors[name] = type(exc).__name__
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "generated_at": now,
+            "panels": panels,
+            "errors": errors,
+        }
+        _dashboard_snapshot_cache[cache_key] = (now, payload)
+        return dict(payload)
 
 
 # --- FastAPI ---------------------------------------------------------------
@@ -6391,8 +6748,14 @@ def make_app(
 
     @app.get("/", response_class=HTMLResponse)
     def index():
+        browser_refresh_s = max(5.0, float(refresh_s))
+        browser_refresh_label = (
+            str(int(browser_refresh_s))
+            if browser_refresh_s.is_integer()
+            else f"{browser_refresh_s:.1f}"
+        )
         page = (
-            PAGE.replace("{refresh_s}", str(int(refresh_s)))
+            PAGE.replace("{browser_refresh_s}", browser_refresh_label)
             .replace("{asset_version}", __version__)
             .replace("{demo_mode}", "true" if demo_mode else "false")
             .replace(
@@ -6400,12 +6763,6 @@ def make_app(
                 '<span class="demo-badge">demo data</span>' if demo_mode else "",
             )
         )
-        if demo_mode:
-            page = re.sub(
-                r'hx-trigger="load,\s*every [^"]+"',
-                'hx-trigger="load"',
-                page,
-            )
         return page
 
     @app.get("/logs", response_class=HTMLResponse)
@@ -6416,6 +6773,7 @@ def make_app(
 
     @app.get("/api/logs", response_class=HTMLResponse)
     def api_logs(
+        request: Request,
         kinds: str = "accept,reject,late_drop,selected,reward,fail,worker_fail,window_timeout",
         reason: str = "",
         hotkey: str = "",
@@ -6438,12 +6796,50 @@ def make_app(
             limit_i = max(1, min(int(limit), 6000))
         except (TypeError, ValueError):
             limit_i = 500
-        return render_logs_table_html(
+        events = validator_events_query(
+            kinds=kind_set,
+            reason_substr=reason.strip() or None,
+            hotkey_substr=hotkey.strip() or None,
+            ours_only=bool(ours),
+            limit=limit_i,
+        )
+        buffer_total = len(validator_events_snapshot(10_000))
+        digest = hashlib.blake2s(digest_size=16)
+        digest.update(
+            (
+                f"{sorted(kind_set) if kind_set else '*'}\0{reason}\0{hotkey}\0"
+                f"{bool(ours)}\0{limit_i}\0{buffer_total}\0"
+            ).encode("utf-8")
+        )
+        for event in events:
+            digest.update(
+                (
+                    f"{event.ts_epoch}\0{event.kind}\0{event.reject_reason}\0"
+                    f"{event.hotkey12}\0{event.ours}\0{event.msg}\0"
+                ).encode("utf-8", errors="replace")
+            )
+        etag = f'"{digest.hexdigest()}"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        content = render_logs_table_html(
             kinds=kind_set,
             reason=reason.strip() or None,
             hotkey=hotkey.strip() or None,
             ours_only=bool(ours),
             limit=limit_i,
+            events=events,
+            buffer_total=buffer_total,
+        )
+        return HTMLResponse(content, headers={"ETag": etag})
+
+    @app.get("/api/dashboard-snapshot")
+    def api_dashboard_snapshot(
+        ema_mode: str = "top",
+        rundown_tf: str = "30m",
+    ):
+        return render_dashboard_snapshot(
+            ema_mode=ema_mode,
+            rundown_tf=rundown_tf,
         )
 
 
@@ -6578,6 +6974,7 @@ def make_app(
             our.setdefault(hk, hk[:10])
         _fleet_mod.OUR_SS58 = our
         sync_fleet_globals()
+        _invalidate_dashboard_snapshot_cache()
         return {
             "hotkey": hotkey,
             "starred": now_starred,
@@ -6817,17 +7214,11 @@ def main(argv: list[str] | None = None) -> int:
         log_level="warning",
     )
     server = uvicorn.Server(config)
-    collectors = [
-        ("poller", poller_loop, (args.refresh, args.history)),
-        ("chain", chain_loop, (300,)),
-        ("rtt", rtt_loop, (60,)),
-        ("baseline", baseline_loop, (60,)),
-        # The log tail complements the exact /verdicts feed; R2 remains
-        # authoritative for final selection and reward.
-        ("validator-tail", validator_tail_loop, ()),
-        ("deployment", deployment_loop, ()),
-        ("r2", r2_loop, (args.history, 30)),
-    ]
+    collectors = _collector_specs(
+        _settings.SETTINGS,
+        args.refresh,
+        args.history,
+    )
 
     def ready() -> None:
         print(
