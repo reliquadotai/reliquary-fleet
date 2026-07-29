@@ -45,7 +45,7 @@ dev = [
   "pip-audit>=2.7,<3",
   "pytest>=8,<10",
   "ruff>=0.9,<1",
-  "twine>=6,<7",
+  "twine>=6,<8",
 ]
 
 [project.scripts]
