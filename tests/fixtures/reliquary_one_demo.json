@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "collected_at": 1800000000.0,
+  "source_timestamps": {
+    "events": 1799999999.0,
+    "submissions": 1799999916.0,
+    "binding": 1799996400.0
+  },
+  "service": {
+    "unit": "reliquary-one.service",
+    "load_state": "loaded",
+    "active_state": "active",
+    "sub_state": "running",
+    "unit_file_state": "enabled",
+    "restarts": 0,
+    "pid": 4242,
+    "uptime_seconds": 7200.0
+  },
+  "gpu": [
+    {
+      "index": 0,
+      "name": "Demo accelerator",
+      "uuid": "GPU-11111111-2222-3333-4444-555555555555",
+      "utilization_pct": 82.0,
+      "memory_used_mib": 131072.0,
+      "memory_total_mib": 143771.0,
+      "power_draw_w": 575.0,
+      "power_limit_w": 700.0
+    }
+  ],
+  "binding": {
+    "checkpoint_number": 42,
+    "checkpoint_revision": "1111111111111111111111111111111111111111",
+    "activated_at": 1799996400.0,
+    "environment": "opencodeinstruct",
+    "strategy": "code",
+    "profile_id": "demo-code-profile",
+    "release_sha": "3333333333333333333333333333333333333333",
+    "generator_fingerprint": "generator-demo",
+    "proof_fingerprint": "proof-demo"
+  },
+  "checkpoints": {
+    "active": [
+      {
+        "revision": "1111111111111111111111111111111111111111",
+        "mtime": 1799996400.0
+      }
+    ],
+    "rollback": [
+      {
+        "revision": "2222222222222222222222222222222222222222",
+        "mtime": 1799996300.0
+      }
+    ],
+    "incoming": []
+  },
+  "events": [
+    {
+      "event": "checkpoint_activated",
+      "timestamp": 1799996400.0,
+      "window_n": 42001,
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "ok",
+      "metrics": {
+        "download_seconds": 30.0,
+        "previous_checkpoint_revision": "2222222222222222222222222222222222222222"
+      }
+    },
+    {
+      "event": "window_started",
+      "timestamp": 1799999850.0,
+      "window_n": 42001,
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "ok",
+      "metrics": {
+        "open_age_seconds": 0.5
+      }
+    },
+    {
+      "event": "live_submission",
+      "timestamp": 1799999909.0,
+      "window_n": 42001,
+      "attempt_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "ok",
+      "metrics": {
+        "generation_seconds": 48.25,
+        "open_age_at_start": 12.5,
+        "precommit_accepted": true,
+        "precommit_seconds": 0.08,
+        "proof_integrity_seconds": 0.004,
+        "proof_seconds": 8.5,
+        "reveal_accepted": true,
+        "reveal_seconds": 0.21,
+        "total_seconds": 58.75
+      }
+    },
+    {
+      "event": "live_submission",
+      "timestamp": 1799999916.0,
+      "window_n": 42001,
+      "attempt_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "ok",
+      "metrics": {
+        "generation_seconds": 4.25,
+        "open_age_at_start": 85.0,
+        "precommit_accepted": true,
+        "precommit_seconds": 0.05,
+        "proof_integrity_seconds": 0.001,
+        "proof_seconds": 0.75,
+        "reveal_accepted": true,
+        "reveal_seconds": 0.18,
+        "total_seconds": 5.75
+      }
+    },
+    {
+      "event": "window_completed",
+      "timestamp": 1799999917.0,
+      "window_n": 42001,
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "ok",
+      "metrics": {
+        "first_sent": true,
+        "second_attempted": true,
+        "second_sent": true
+      }
+    },
+    {
+      "event": "window_started",
+      "timestamp": 1799999960.0,
+      "window_n": 42002,
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "ok",
+      "metrics": {
+        "open_age_seconds": 0.4
+      }
+    },
+    {
+      "event": "window_attempt_failed",
+      "timestamp": 1799999980.0,
+      "window_n": 42002,
+      "attempt_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "runtime_other",
+      "metrics": {
+        "exception_file": "demo-runtime-failure.json"
+      }
+    },
+    {
+      "event": "window_completed",
+      "timestamp": 1799999981.0,
+      "window_n": 42002,
+      "checkpoint_revision": "1111111111111111111111111111111111111111",
+      "classification": "ok",
+      "metrics": {
+        "first_sent": false,
+        "second_attempted": false,
+        "second_sent": false
+      }
+    }
+  ],
+  "submissions": [
+    {
+      "window_n": 42001,
+      "merkle_root": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "window_n": 42001,
+      "merkle_root": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  ],
+  "event_diagnostics": {
+    "malformed": 0,
+    "oversized": 0,
+    "retained": 8
+  },
+  "errors": []
+}

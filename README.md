@@ -194,6 +194,45 @@ For one fixed named lane, configure that service directly as `unit`, provide
 its exact `env_file`, and omit `allowed_units`. Remove obsolete sibling rows:
 every configured row is a required live fleet member, not a historical lane.
 
+### Reliquary One structured telemetry
+
+Use the dedicated adapter for an all-in-one Reliquary One miner. Keep only the
+currently operated miner under `fleet:`; retired rows belong outside the active
+configuration because every fleet row participates in readiness.
+
+```yaml
+fleet:
+  - alias: "ops@code-miner.example"
+    hotkey: "5..."
+    label: "code-miner-one"
+    color: "green"
+    unit: "reliquary-one.service"
+    miner_kind: "reliquary_one"
+    state_root: "/var/lib/reliquary-one/code/state"
+```
+
+One bounded, read-only SSH probe runs per collector cycle. It reads only the
+last 500 schema-v1 rows from `events.jsonl`, `submissions.json`,
+`active-binding.json`, `systemctl show reliquary-one.service`, checkpoint tier
+names, and a bounded `nvidia-smi` query. The adapter does not read wallets,
+secret environment files, claimed or prepared request bodies, raw prompts,
+signatures, token streams, proofs, randomness, cooldown bodies, or exception
+trace contents. Export APIs expose the normalized projection, source
+timestamps, and stale ages rather than the source documents.
+
+The operator view deliberately keeps three outcomes separate:
+
+1. **Local transport** reports whether precommit and reveal exchanges were
+   accepted by the local transport path.
+2. **Validator admission** comes only from authenticated validator verdict or
+   sealed archive evidence and may still reject a locally accepted exchange.
+3. **Terminal auction** reports selected, rewarded, and canonical rank only
+   from authenticated sealed-window evidence.
+
+Unknown values stay pending or unavailable; they are never rendered as false
+zeroes. A local transport acceptance therefore never implies validator
+admission, selection, reward, or payment.
+
 ### Code auction readiness
 
 Reference `opencodeinstruct` lanes have an additional fail-closed readiness

@@ -43,8 +43,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from fleet import (  # type: ignore
-        FLEET, OUR_SS58, BoxState, LabState, ValidatorState,
-        collect_box_snapshot, collect_lab_snapshot,
+        FLEET, OUR_SS58, BoxState, LabState, ComponentState, ValidatorState,
+        collect_box_snapshot, collect_lab_snapshot, collect_component_snapshot,
         fetch_validator, fetch_recent_windows,
         recompute_validator_acpts,
         ChainState, RTTState, BaselineState,
@@ -58,6 +58,8 @@ try:
         current_window_accept_count, validator_events_in_window,
         validator_events_query,
         DeploymentState, fetch_deployment_state,
+        _canonical_physical_gpu_id,
+        verdict_rows_for_hotkey,
         B_BATCH,
     )
     from collections import Counter
@@ -77,6 +79,7 @@ except ImportError:
 _lock = threading.Lock()
 _boxes: list[BoxState] = []
 _labs: list[LabState] = []
+_components: list[ComponentState] = []
 _vs = ValidatorState()
 _windows: list = []
 _last_poll_at: float = 0.0
@@ -112,6 +115,15 @@ _STATIC_ASSETS = {
     name: _STATIC_ROOT.joinpath(name).read_bytes()
     for name in _STATIC_MEDIA_TYPES
 }
+_STATIC_ASSET_VERSION = (
+    f"{__version__}-"
+    + hashlib.sha256(
+        b"\0".join(
+            name.encode("utf-8") + b"\0" + _STATIC_ASSETS[name]
+            for name in sorted(_STATIC_ASSETS)
+        )
+    ).hexdigest()[:12]
+)
 _RNG = random.SystemRandom()
 
 
@@ -315,7 +327,7 @@ def init_state():
     AFTER this module's top-level `from fleet import FLEET` ran.
     """
     import fleet as _fleet_mod
-    global _boxes, _labs
+    global _boxes, _labs, _components
     _boxes = [
         BoxState(
             alias=a,
@@ -328,11 +340,64 @@ def init_state():
                 tuple(spec)
                 for spec in _fleet_mod.FLEET_UNIT_CANDIDATES.get(label, [])
             ),
+            unit_controller_config_paths=tuple(
+                (str(unit), str(path))
+                for unit, path in _fleet_mod.FLEET_CONTROLLER_CONFIG_PATHS.get(
+                    label, {}
+                ).items()
+            ),
             coordinated_units=tuple(
                 _fleet_mod.FLEET_COORDINATED_UNITS.get(label, [])
             ),
             host_unit_allowlist=tuple(
                 _fleet_mod.FLEET_HOST_UNIT_ALLOWLIST.get(label, [])
+            ),
+            standalone_telemetry_path=str(
+                _fleet_mod.FLEET_STANDALONE_TELEMETRY.get(
+                    label, {}
+                ).get("telemetry_path") or ""
+            ),
+            standalone_runtime_manifest_path=str(
+                _fleet_mod.FLEET_STANDALONE_TELEMETRY.get(
+                    label, {}
+                ).get("runtime_manifest_path") or ""
+            ),
+            active_unit_registry_path=str(
+                _fleet_mod.FLEET_STANDALONE_TELEMETRY.get(
+                    label, {}
+                ).get("active_unit_registry_path") or ""
+            ),
+            standalone_supervisor_status_path=str(
+                _fleet_mod.FLEET_STANDALONE_TELEMETRY.get(
+                    label, {}
+                ).get("supervisor_status_path") or ""
+            ),
+            standalone_telemetry_stale_seconds=float(
+                _fleet_mod.FLEET_RELIQUARY_ONE.get(label, {}).get(
+                    "stale_seconds"
+                )
+                or _fleet_mod.FLEET_STANDALONE_TELEMETRY.get(
+                    label, {}
+                ).get("stale_seconds")
+                or 90.0
+            ),
+            miner_kind=(
+                "reliquary_one"
+                if label in _fleet_mod.FLEET_RELIQUARY_ONE
+                else "legacy"
+            ),
+            reliquary_one_state_root=str(
+                _fleet_mod.FLEET_RELIQUARY_ONE.get(label, {}).get(
+                    "state_root"
+                ) or ""
+            ),
+            standalone_certification_config=dict(
+                _fleet_mod.FLEET_STANDALONE_CERTIFICATION.get(label, {})
+            ),
+            operator=str(
+                _fleet_mod.FLEET_STANDALONE_TELEMETRY.get(
+                    label, {}
+                ).get("operator") or ""
             ),
         )
         for a, hk, label, c, u in _fleet_mod.FLEET
@@ -358,10 +423,15 @@ def init_state():
         )
         in _fleet_mod.LABS
     ]
+    _components = [
+        ComponentState(**dict(component))
+        for component in _fleet_mod.FLEET_COMPONENTS
+    ]
 
 
 def _publish_box_snapshots(
     boxes: list[BoxState], *, labs: list[LabState] | None = None,
+    components: list[ComponentState] | None = None,
     polled_at: float | None = None,
 ) -> None:
     """Replace the owned box objects under the same lock readers snapshot.
@@ -371,14 +441,111 @@ def _publish_box_snapshots(
     Replacing the list here therefore prevents one response from combining
     fields from two different poll generations.
     """
-    global _boxes, _labs, _last_poll_at, _poll_count
+    global _boxes, _labs, _components, _last_poll_at, _poll_count
     with _lock:
         _boxes = list(boxes)
         if labs is not None:
             _labs = list(labs)
+        if components is not None:
+            _components = list(components)
         if polled_at is not None:
             _last_poll_at = float(polled_at)
             _poll_count += 1
+
+
+def _controller_component_expectation(
+    component: ComponentState,
+    boxes: list[BoxState],
+) -> dict[str, object] | None:
+    """Return one exact live controller-manifest component contract."""
+    controller = next(
+        (box for box in boxes if box.label == component.controller_label),
+        None,
+    )
+    if not (
+        controller is not None
+        and controller.proc_alive
+        and controller.standalone_fresh
+        and controller.runtime_parity_ok
+        and controller.standalone_controller_mode in {"canary", "mine"}
+    ):
+        return None
+    matches = [
+        row
+        for row in getattr(controller, "runtime_components", [])
+        if isinstance(row, dict) and row.get("role") == component.role
+    ]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    return {
+        "role": str(row.get("role") or ""),
+        "component_id": str(row.get("component_id") or ""),
+        "manifest_path": str(row.get("manifest_path") or ""),
+        "manifest_file_sha256": str(
+            row.get("manifest_file_sha256") or ""
+        ),
+        "runtime_payload_sha256": str(
+            row.get("runtime_payload_sha256") or ""
+        ),
+        "runtime_profile_sha256": str(
+            row.get("runtime_profile_sha256") or ""
+        ),
+        "miner_source_revision": str(
+            controller.miner_source_revision or ""
+        ),
+        "validator_source_revision": str(
+            controller.reliquary_source_revision or ""
+        ),
+        "checkpoint_revision": str(
+            controller.runtime_checkpoint_revision
+            or controller.provisioned_model_revision
+            or ""
+        ),
+        "controller_manifest_path": str(
+            controller.standalone_active_runtime_manifest_path or ""
+        ),
+    }
+
+
+def _apply_component_active_generation(
+    boxes: list[BoxState],
+    components: list[ComponentState],
+    validator: ValidatorState,
+) -> None:
+    """Project a fresh worker job onto its controller, never its funnel."""
+    for component in components:
+        controller = next(
+            (box for box in boxes if box.label == component.controller_label),
+            None,
+        )
+        if controller is None:
+            continue
+        binding = _component_controller_binding(component, controller)
+        if not (
+            binding.get("attached") is True
+            and component.resolution_source == "controller_manifest"
+            and component.generator_active_state == "active"
+            and component.generator_sub_state == "running"
+            and component.tunnel_active_state == "active"
+            and component.tunnel_sub_state == "running"
+            and component.identity_ok
+            and component.wallet_absent_attested
+            and component.submit_authority is False
+            and component.worker_state == "active"
+            and component.worker_progress_fresh
+            and component.active_job_id
+            and component.active_window_n > 0
+            and component.active_window_n == int(validator.window or 0)
+            and controller.proc_alive
+            and controller.standalone_fresh
+            and controller.runtime_parity_ok
+        ):
+            continue
+        controller.miner_state = "active_generation"
+        controller.miner_window = component.active_window_n
+        controller.miner_ready = 0
+        controller.miner_inflight = 1
 
 
 def poller_loop(refresh_s: float, history: int):
@@ -417,14 +584,36 @@ def poller_loop(refresh_s: float, history: int):
         with _lock:
             current_boxes = list(_boxes)
             current_labs = list(_labs)
+            current_components = list(_components)
         snapshots = list(current_boxes)
         lab_snapshots = list(current_labs)
+        component_snapshots = list(current_components)
 
-        def collect_snapshot(index: int, box: BoxState) -> None:
-            snapshots[index] = collect_box_snapshot(box)
+        def collect_snapshot(
+            index: int,
+            box: BoxState,
+            target: list[BoxState] = snapshots,
+        ) -> None:
+            target[index] = collect_box_snapshot(box)
 
-        def collect_lab(index: int, lab: LabState) -> None:
-            lab_snapshots[index] = collect_lab_snapshot(lab)
+        def collect_lab(
+            index: int,
+            lab: LabState,
+            target: list[LabState] = lab_snapshots,
+        ) -> None:
+            target[index] = collect_lab_snapshot(lab)
+
+        def collect_component(
+            index: int,
+            component: ComponentState,
+            target: list[ComponentState] = component_snapshots,
+        ) -> None:
+            expectation = _controller_component_expectation(
+                component, snapshots
+            )
+            target[index] = collect_component_snapshot(
+                component, expectation
+            )
 
         threads = [
             threading.Thread(target=collect_snapshot, args=(index, box))
@@ -433,6 +622,13 @@ def poller_loop(refresh_s: float, history: int):
         lab_threads = [
             threading.Thread(target=collect_lab, args=(index, lab))
             for index, lab in enumerate(current_labs)
+        ]
+        component_threads = [
+            threading.Thread(
+                target=collect_component,
+                args=(index, component),
+            )
+            for index, component in enumerate(current_components)
         ]
         now_mono = time.monotonic()
         retry_after = _fleet_mod.validator_retry_after_remaining()
@@ -468,6 +664,13 @@ def poller_loop(refresh_s: float, history: int):
         # publishing only complete generations prevents overlapping rounds and
         # keeps the previous generation stable for concurrent HTTP readers.
         for t in threads + lab_threads:
+            t.join()
+        # Component resolution is controller-manifest driven.  Collect it
+        # only after this poll's controller snapshots are complete so a
+        # checkpoint transition can never mix old and new identities.
+        for t in component_threads:
+            t.start()
+        for t in component_threads:
             t.join()
         if v_thread is not None:
             v_thread.join()
@@ -506,9 +709,13 @@ def poller_loop(refresh_s: float, history: int):
             recompute_validator_acpts(snapshots, _vs)
         except Exception:
             pass
+        _apply_component_active_generation(
+            snapshots, component_snapshots, _vs
+        )
         _publish_box_snapshots(
             snapshots,
             labs=lab_snapshots,
+            components=component_snapshots,
             polled_at=time.time(),
         )
         time.sleep(_jittered_delay(refresh_s, ratio=0.1))
@@ -620,13 +827,26 @@ def rtt_loop(period_s: float = 60.0):
         time.sleep(max(delay, retry_after))
 
 
+def _sum_available_counts(values) -> int | None:
+    """Sum counters only when every contributing scope is attributable."""
+
+    total = 0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 def baseline_loop(period_s: float = 60.0):
     """Sample fleet ACPT/30m every minute, persist to disk for 6h baseline."""
     global _baseline_last
     while True:
         time.sleep(_jittered_delay(period_s, ratio=0.1))
         with _lock:
-            total = sum(b.acpt_30m for b in _boxes)
+            total = _sum_available_counts(b.acpt_30m for b in _boxes)
+        if total is None:
+            continue
         baseline_record(_baseline, total)
         _baseline_last = time.time()
 
@@ -846,8 +1066,12 @@ def color_rej(n: int) -> str:
     return "var(--dim)"
 
 
-def fmt_age(seconds: int) -> str:
+def fmt_age(seconds: int | float) -> str:
     """Compact age string: '94min', '3h 12m', '2d', or '—' if unknown."""
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError, OverflowError):
+        return "—"
     if seconds < 0:
         return "—"
     if seconds >= 999_000:
@@ -892,6 +1116,631 @@ def sparkline(values, width: int = 18) -> str:
     return f"<span class='spark' style='color:{color}'>{''.join(out)}</span>"
 
 
+def _coordinated_unit_status_payload(box: BoxState) -> list[dict[str, object]]:
+    """Return the bounded systemd projection retained by the lane resolver."""
+    return [
+        {
+            "unit": str(row.get("unit") or ""),
+            "active_state": str(row.get("active_state") or ""),
+            "sub_state": str(row.get("sub_state") or ""),
+            "pid": int(row.get("pid") or 0),
+            "restarts": int(row.get("restarts") or 0),
+        }
+        for row in (
+            getattr(box, "coordinated_unit_statuses", []) or []
+        )
+        if isinstance(row, dict)
+    ]
+
+
+def _service_inventory_payload(box: BoxState) -> list[dict[str, object]]:
+    """Return bounded systemd/process attestations without promoting a unit."""
+
+    allowed_roles = {
+        "mining_controller",
+        "wallet_free_generator",
+        "certification",
+        "support",
+        "unknown",
+    }
+    result: list[dict[str, object]] = []
+    for row in getattr(box, "service_inventory", []) or []:
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or "")
+        if role not in allowed_roles:
+            continue
+        result.append({
+            "unit": str(row.get("unit") or ""),
+            "active_state": str(row.get("active_state") or ""),
+            "sub_state": str(row.get("sub_state") or ""),
+            "pid": int(row.get("pid") or 0),
+            "restarts": int(row.get("restarts") or 0),
+            "invocation_id": str(row.get("invocation_id") or ""),
+            "service_user": str(row.get("service_user") or ""),
+            "role": role,
+            "submit_disabled": row.get("submit_disabled") is True,
+            "exec_start_sha256": str(row.get("exec_start_sha256") or ""),
+            "fragment_sha256": str(row.get("fragment_sha256") or ""),
+        })
+    return result
+
+
+def _registry_active_entry(box: BoxState) -> dict[str, object]:
+    """Return only an active entry from a successfully verified registry."""
+
+    registry = getattr(box, "active_unit_registry", {}) or {}
+    if not (
+        isinstance(registry, dict)
+        and not registry.get("error")
+        and registry.get("schema_version") == 1
+    ):
+        return {}
+    active = registry.get("active")
+    return active if isinstance(active, dict) else {}
+
+
+def _registry_controller_authority(box: BoxState) -> dict[str, object]:
+    """Return the process-bound registry authority normalized by the probe."""
+
+    telemetry = getattr(box, "standalone_telemetry", {}) or {}
+    if not isinstance(telemetry, dict):
+        return {}
+    authority = telemetry.get("controller_authority")
+    if not isinstance(authority, dict):
+        return {}
+    mode = str(authority.get("mode") or "").lower()
+    unit = str(authority.get("unit") or "")
+    if (
+        authority.get("source") != "active_unit_registry"
+        or mode not in {"canary", "mine"}
+        or not unit
+        or unit != str(getattr(box, "active_unit", "") or "")
+    ):
+        return {}
+    return authority
+
+
+def _reliquary_one_expected_lane(box: BoxState) -> tuple[str, str]:
+    """Bind each configured miner service to its one admissible lane identity."""
+
+    unit = str(getattr(box, "unit", "") or "").lower()
+    if unit.endswith("@math.service"):
+        return "math", "openmathinstruct"
+    if unit.endswith("@code.service"):
+        return "code", "opencodeinstruct"
+    if unit == "reliquary-one.service":
+        state_root = str(
+            getattr(box, "reliquary_one_state_root", "") or ""
+        )
+        if state_root.endswith("/math/state"):
+            return "math", "openmathinstruct"
+        if state_root.endswith("/code/state"):
+            return "code", "opencodeinstruct"
+    return "", ""
+
+
+def _box_lane_status(
+    box: BoxState,
+    *,
+    validator_state: ValidatorState | None = None,
+) -> dict[str, object]:
+    """Project mining state without equating GPU work with submissions.
+
+    Service discovery is diagnostic only.  Only a configured active controller
+    plus fresh, process-bound standalone telemetry can be called ``CANARY`` or
+    ``MINING``.  A digest-bound registry mode distinguishes quota-one canary
+    from unrestricted mining when present; legacy lanes fall back to the unit
+    name.  A live canary must never be presented as unrestricted mining.
+    A wallet-free generator is useful capacity, but remains explicitly
+    unattached and contributes no submission/selection/reward counters.
+    """
+
+    if getattr(box, "miner_kind", "legacy") == "reliquary_one":
+        miner = getattr(box, "reliquary_one", {})
+        miner = miner if isinstance(miner, dict) else {}
+        funnel = miner.get("funnel")
+        funnel = funnel if isinstance(funnel, dict) else {}
+        issues = _box_readiness_issues(box, validator_state=validator_state)
+        if not issues:
+            status = "MINING"
+            reason = "configured V4 service and exact active binding are current"
+        elif any(issue.startswith("checkpoint_") for issue in issues):
+            status = "FENCED"
+            reason = "; ".join(issues)
+        elif "down" in issues:
+            status = "STOPPED"
+            reason = "; ".join(issues)
+        elif any("stale" in issue or "missing" in issue for issue in issues):
+            status = "STALE"
+            reason = "; ".join(issues)
+        else:
+            status = "BLOCKED"
+            reason = "; ".join(issues)
+        return {
+            "status": status,
+            "reason": reason,
+            "funnel_authoritative": not issues,
+            "funnel_scope": "redacted_v4_events" if not issues else "none",
+            "funnel": (
+                {
+                    name: int(funnel.get(name) or 0)
+                    for name in (
+                        "generated_groups",
+                        "protocol_valid_groups",
+                        "locally_eligible_groups",
+                        "signed_precommits",
+                        "validator_ranked_candidates",
+                        "selected_slots",
+                    )
+                }
+                if not issues
+                else {}
+            ),
+            "active_generator_units": [],
+            "discovered_controller_units": [],
+            "service_inventory": [],
+        }
+
+    inventory = _service_inventory_payload(box)
+    generators = [
+        row for row in inventory
+        if row["role"] == "wallet_free_generator"
+        and int(row["pid"] or 0) > 0
+        and row["active_state"] == "active"
+    ]
+    certifications = [
+        row for row in inventory
+        if row["role"] == "certification"
+        and int(row["pid"] or 0) > 0
+        and row["active_state"] in {"active", "activating"}
+    ]
+    dynamic_controllers = [
+        row for row in inventory
+        if row["role"] == "mining_controller"
+        and int(row["pid"] or 0) > 0
+    ]
+    telemetry = getattr(box, "standalone_telemetry", {}) or {}
+    active_unit = str(getattr(box, "active_unit", "") or "").lower()
+    funnel = telemetry.get("funnel") if isinstance(telemetry, dict) else None
+    authoritative_funnel = bool(
+        box.proc_alive
+        and getattr(box, "standalone_fresh", False)
+        and isinstance(funnel, dict)
+    )
+    safe_funnel = (
+        {
+            name: int(funnel.get(name, 0) or 0)
+            for name in (
+                "attempts",
+                "generation_complete",
+                "natural_complete_m8",
+                "local_eligible",
+                "precommit_accepted",
+                "reveal_accepted",
+                "pool_accepted",
+                "selected",
+                "rewarded",
+                "terminal_final",
+                "terminal_unresolved",
+            )
+        }
+        if authoritative_funnel
+        else {}
+    )
+
+    registry_active = _registry_active_entry(box)
+    registry_mode = str(registry_active.get("mode") or "").lower()
+    controller_authority = _registry_controller_authority(box)
+    if getattr(box, "active_unit_registry_path", "") and not registry_active:
+        return {
+            "status": "BLOCKED",
+            "reason": str(
+                getattr(box, "unit_resolution_error", "")
+                or "active_unit_registry_invalid"
+            ),
+            "funnel_authoritative": False,
+            "funnel_scope": "none",
+            "funnel": {},
+            "active_generator_units": [
+                str(row["unit"]) for row in generators
+            ],
+            "discovered_controller_units": [
+                str(row["unit"]) for row in dynamic_controllers
+            ],
+            "service_inventory": inventory,
+        }
+    expected_checkpoint = str(
+        _validator_model_identity(validator_state).get("revision") or ""
+    ).lower()
+    active_checkpoint = str(
+        registry_active.get("checkpoint_revision") or ""
+    ).lower()
+    if (
+        registry_mode in {"canary", "mine"}
+        and expected_checkpoint
+        and active_checkpoint != expected_checkpoint
+    ):
+        return {
+            "status": "FENCED",
+            "reason": (
+                "registry_checkpoint_mismatch:"
+                f"active={active_checkpoint[:12] or 'unknown'}:"
+                f"validator={expected_checkpoint[:12]}"
+            ),
+            "funnel_authoritative": False,
+            "funnel_scope": "none",
+            "funnel": {},
+            "active_generator_units": [
+                str(row["unit"]) for row in generators
+            ],
+            "discovered_controller_units": [
+                str(row["unit"]) for row in dynamic_controllers
+            ],
+            "service_inventory": inventory,
+        }
+    if registry_mode == "certifying":
+        if (
+            expected_checkpoint
+            and active_checkpoint != expected_checkpoint
+        ):
+            return {
+                "status": "FENCED",
+                "reason": (
+                    "certification_checkpoint_mismatch:"
+                    f"active={active_checkpoint[:12] or 'unknown'}:"
+                    f"validator={expected_checkpoint[:12]}"
+                ),
+                "funnel_authoritative": False,
+                "funnel_scope": "none",
+                "funnel": {},
+                "active_generator_units": [
+                    str(row["unit"]) for row in generators
+                ],
+                "discovered_controller_units": [
+                    str(row["unit"]) for row in dynamic_controllers
+                ],
+                "service_inventory": inventory,
+            }
+        if box.proc_alive or generators or certifications:
+            status = "CERTIFYING"
+            reason = (
+                "attested submit-disabled certification is active; "
+                "no mining authority"
+            )
+        else:
+            status = "STALLED"
+            reason = "attested certification has no active service"
+        return {
+            "status": status,
+            "reason": reason,
+            "funnel_authoritative": False,
+            "funnel_scope": "none",
+            "funnel": {},
+            "active_generator_units": [str(row["unit"]) for row in generators],
+            "discovered_controller_units": [
+                str(row["unit"]) for row in dynamic_controllers
+            ],
+            "service_inventory": inventory,
+        }
+    if registry_mode in {"canary", "mine"} and not box.proc_alive:
+        return {
+            "status": "STALLED",
+            "reason": f"attested {registry_mode} controller is not active",
+            "funnel_authoritative": False,
+            "funnel_scope": "none",
+            "funnel": {},
+            "active_generator_units": [
+                str(row["unit"]) for row in generators
+            ],
+            "discovered_controller_units": [
+                str(row["unit"]) for row in dynamic_controllers
+            ],
+            "service_inventory": inventory,
+        }
+
+    identity_drift: list[str] = []
+    if (
+        validator_state is not None
+        and box.proc_alive
+        and bool(getattr(box, "standalone_telemetry_path", ""))
+    ):
+        expected_model = _validator_model_identity(validator_state)
+        active_model = _active_model_identity(box)
+        if expected_model.get("known") and not (
+            active_model.get("valid")
+            and _same_validator_model_identity(active_model, expected_model)
+        ):
+            identity_drift.append(
+                "checkpoint_mismatch:"
+                f"active={str(active_model.get('revision') or 'unknown')[:12]}:"
+                f"validator={str(expected_model.get('revision') or 'unknown')[:12]}"
+            )
+        observed_image = str(
+            getattr(box, "observed_validator_image_revision", "")
+            or getattr(box, "reliquary_source_revision", "")
+            or ""
+        ).lower()
+        advertised_image = str(
+            getattr(validator_state, "image_revision", "") or ""
+        ).lower()
+        if advertised_image and observed_image != advertised_image:
+            identity_drift.append(
+                "validator_source_mismatch:"
+                f"active={observed_image[:12] or 'unknown'}:"
+                f"validator={advertised_image[:12]}"
+            )
+
+    if identity_drift:
+        return {
+            "status": "FENCED",
+            "reason": "; ".join(identity_drift),
+            "funnel_authoritative": False,
+            "funnel_scope": "none",
+            "funnel": {},
+            "active_generator_units": [str(row["unit"]) for row in generators],
+            "discovered_controller_units": [
+                str(row["unit"]) for row in dynamic_controllers
+            ],
+            "service_inventory": inventory,
+        }
+
+    certification = getattr(box, "standalone_certification", {}) or {}
+    if isinstance(certification, dict) and certification.get("active") is True:
+        status = "CERTIFYING"
+        reason = "submit-disabled certification is active; no mining authority"
+    elif registry_mode == "fenced":
+        active_checkpoint = str(
+            registry_active.get("checkpoint_revision") or "unknown"
+        )
+        expected_checkpoint = str(
+            _validator_model_identity(validator_state).get("revision")
+            or "unknown"
+        )
+        status = "FENCED"
+        reason = (
+            "attested submission fence is active"
+            f" (active checkpoint {active_checkpoint[:12]},"
+            f" validator checkpoint {expected_checkpoint[:12]})"
+        )
+    elif registry_mode == "stalled":
+        status = "STALLED"
+        reason = "attested controller is stalled and has no live submission authority"
+    elif registry_mode == "idle":
+        status = "IDLE"
+        reason = "attested lane is intentionally idle and has no mining authority"
+    elif (
+        getattr(box, "unit_resolution_error", "")
+        and not (
+            (generators or certifications)
+            and str(getattr(box, "unit_resolution_error", "")).startswith(
+                "no_allowed_unit_active"
+            )
+        )
+    ):
+        status = "BLOCKED"
+        reason = str(getattr(box, "unit_resolution_error", ""))
+    elif box.proc_alive:
+        if authoritative_funnel and getattr(box, "runtime_parity_ok", False):
+            lifecycle = telemetry.get("window_lifecycle")
+            lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+            lifecycle_status = str(lifecycle.get("status") or "").upper()
+            if lifecycle_status in {"RECOVERING", "STALLED"}:
+                status = lifecycle_status
+                latest_run = lifecycle.get("latest_run")
+                latest_run = latest_run if isinstance(latest_run, dict) else {}
+                failure = ":".join(
+                    part
+                    for part in (
+                        str(latest_run.get("failure_stage") or ""),
+                        str(latest_run.get("failure_type") or ""),
+                    )
+                    if part
+                )
+                reason = (
+                    f"current controller lifecycle is {lifecycle_status.lower()}"
+                    + (f" ({failure})" if failure else "")
+                )
+            elif str(controller_authority.get("mode") or "") == "canary":
+                status = "CANARY"
+                reason = (
+                    "registry-attested quota-one canary controller and "
+                    "process-bound telemetry are current"
+                )
+            elif str(controller_authority.get("mode") or "") == "mine":
+                status = "MINING"
+                reason = (
+                    "registry-attested mining controller and process-bound "
+                    "telemetry are current"
+                )
+            elif "canary" in active_unit:
+                status = "CANARY"
+                reason = (
+                    "quota-one canary controller and process-bound telemetry "
+                    "are current"
+                )
+            else:
+                status = "MINING"
+                reason = "configured controller and process-bound telemetry are current"
+        elif getattr(box, "standalone_telemetry_path", ""):
+            status = "STALE"
+            reason = str(getattr(box, "standalone_error", "") or "telemetry unavailable")
+        else:
+            status = "CONTROLLER_ACTIVE_UNATTESTED"
+            reason = "controller PID is active without current standalone attestation"
+    elif dynamic_controllers:
+        status = "BLOCKED"
+        reason = "unconfigured mining-capable controller discovered"
+    elif generators:
+        status = "READY_UNATTACHED"
+        reason = "wallet-free generator active; no controller or submission authority"
+    elif certifications:
+        status = "CERTIFYING"
+        reason = "submit-disabled certification service active"
+    else:
+        status = "STOPPED"
+        reason = "no active mining controller or generator"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "funnel_authoritative": authoritative_funnel,
+        "funnel_scope": (
+            str(telemetry.get("metrics_posture") or "active_profile")
+            if authoritative_funnel
+            else "none"
+        ),
+        "funnel": safe_funnel,
+        "active_generator_units": [str(row["unit"]) for row in generators],
+        "discovered_controller_units": [
+            str(row["unit"]) for row in dynamic_controllers
+        ],
+        "service_inventory": inventory,
+    }
+
+
+def _box_restart_count_semantics(box: BoxState) -> str:
+    """Name the backwards-compatible restart scalar's exact denominator."""
+    if getattr(box, "coordinated_units", ()) or (
+        getattr(box, "coordinated_unit_statuses", []) or []
+    ):
+        return "sum_systemd_nrestarts_across_coordinated_units"
+    return "active_unit_systemd_nrestarts"
+
+
+def _active_standalone_certification(
+    box: BoxState,
+) -> dict[str, object]:
+    """Return only a fresh exact submit-disabled certification process.
+
+    Certification is observability for real GPU work, never mining liveness.
+    Keeping this accessor separate from ``proc_alive`` and standalone mining
+    telemetry makes it difficult for renderers to accidentally turn a proof
+    certification worker into attempts, admissions, selected slots, or reward.
+    """
+    raw = getattr(box, "standalone_certification", {})
+    if not isinstance(raw, dict):
+        return {}
+    if not (
+        raw.get("active") is True
+        and raw.get("fresh") is True
+        and raw.get("exact") is True
+        and raw.get("submit_disabled_attested") is True
+    ):
+        return {}
+    gpu = raw.get("gpu")
+    if not isinstance(gpu, dict):
+        return {}
+    return raw
+
+
+def _box_rolling_pregen(
+    box: BoxState,
+) -> tuple[int | None, int | None, str]:
+    """Return only an authoritative rolling generation counter.
+
+    Historical miners publish ``ACCEPTED-PREGEN`` journal lines, which are
+    counted over exact 30/60 minute journal slices.  Standalone miners publish
+    an atomic, profile-scoped funnel, but that snapshot does not currently
+    expose an exact rolling 30/60 minute generation contract.  Treating its
+    checkpoint/lifetime natural-M8 total as a rolling value would be false, so
+    the old column is explicitly unavailable until the producer adds one.
+    """
+
+    if getattr(box, "miner_kind", "") == "reliquary_one":
+        details = _box_v5_host_telemetry(box)
+        events = details.get("fleet_events", {})
+        events = events if isinstance(events, dict) else {}
+        generation_30m = events.get("generation_30m")
+        generation_60m = events.get("generation_60m")
+        if isinstance(generation_30m, int) and not isinstance(
+            generation_30m, bool
+        ):
+            return (
+                generation_30m,
+                (
+                    generation_60m
+                    if isinstance(generation_60m, int)
+                    and not isinstance(generation_60m, bool)
+                    else None
+                ),
+                "v5_fleet_events_generation",
+            )
+        return None, None, "v5_fleet_events_generation_unavailable"
+    if getattr(box, "standalone_telemetry_path", ""):
+        return None, None, "standalone_rolling_generation_unavailable"
+    return (
+        int(getattr(box, "pregen_30m", 0) or 0),
+        int(getattr(box, "pregen_60m", 0) or 0),
+        "legacy_journal_accepted_pregen",
+    )
+
+
+def _box_v5_host_telemetry(box: BoxState) -> dict[str, object]:
+    """Return the redacted V5 per-host sidecar projection, if configured."""
+
+    if getattr(box, "miner_kind", "") != "reliquary_one":
+        return {"applicable": False}
+    miner = getattr(box, "reliquary_one", {})
+    miner = miner if isinstance(miner, dict) else {}
+    telemetry = miner.get("v5_telemetry")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    fleet_events = telemetry.get("fleet_events")
+    fleet_events = fleet_events if isinstance(fleet_events, dict) else {}
+    economic_ledger = telemetry.get("economic_ledger")
+    economic_ledger = (
+        economic_ledger if isinstance(economic_ledger, dict) else {}
+    )
+    return {
+        "applicable": True,
+        "fleet_events": fleet_events,
+        "economic_ledger": economic_ledger,
+    }
+
+
+def _standalone_auction_funnel_display(
+    box: BoxState,
+    validator_state: ValidatorState | None,
+) -> dict[str, object]:
+    """Render the normalized standalone funnel for either auction environment.
+
+    Code has additional prescreen and grader readiness checks, but Math still
+    publishes the same authoritative generated-to-rewarded funnel.  Keeping
+    this fallback environment-neutral prevents a healthy Math controller from
+    being rendered as ``non-Code`` with its real work hidden.
+    """
+
+    if not (
+        getattr(box, "proc_alive", False)
+        and getattr(box, "standalone_telemetry_path", "")
+    ):
+        return {"applicable": False}
+    environment = str(
+        getattr(box, "active_environment", "")
+        or getattr(box, "miner_environment", "")
+        or ""
+    ).strip().lower()
+    if environment not in {"openmathinstruct", "opencodeinstruct"}:
+        return {"applicable": False}
+    telemetry = getattr(box, "standalone_telemetry", {})
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    funnel = telemetry.get("funnel")
+    if not isinstance(funnel, dict):
+        return {"applicable": False}
+    issues = _standalone_readiness_issues(box, validator_state=validator_state)
+    controller_mode = str(
+        getattr(box, "standalone_controller_mode", "") or "unknown"
+    )
+    return {
+        "applicable": True,
+        "ok": not issues,
+        "issues": issues,
+        "environment": environment,
+        "controller_mode": controller_mode,
+        "funnel": funnel,
+    }
+
+
 def render_fleet_html() -> str:
     with _lock:
         boxes = list(_boxes)
@@ -900,11 +1749,82 @@ def render_fleet_html() -> str:
     age = (time.time() - last) if last else 0
     rows = []
     for b in boxes:
-        pct = b.gpu_mem_mb * 100 // max(b.gpu_total_mb, 1)
+        v5_host_telemetry = _box_v5_host_telemetry(b)
+        pregen_30m, _pregen_60m, pregen_source = _box_rolling_pregen(b)
+        pregen_30m_text = "—" if pregen_30m is None else str(pregen_30m)
+        pregen_title = (
+            "Exact rolling generation from this V5 host's fleet-events sidecar; "
+            "this is not the shared-hotkey validator verdict total"
+            if pregen_source == "v5_fleet_events_generation"
+            else "V5 fleet-events does not cover a complete rolling generation "
+            "window yet; no zero is inferred"
+            if pregen_source == "v5_fleet_events_generation_unavailable"
+            else
+            "Exact rolling generation is unavailable for this standalone "
+            "miner; use the profile-scoped natural-M8 generation funnel"
+            if pregen_30m is None
+            else "Miner-side pregen rate (queue activity, not validator accepts)"
+        )
+        advertised_protocol = int(
+            getattr(validator_state, "protocol_version", 0) or 0
+        )
+        advertised_profile_id = str(
+            getattr(validator_state, "generation_profile_id", "")
+            or "unknown"
+        )
+        profile_status = (
+            f"advertised v{advertised_protocol} {advertised_profile_id}"
+            if advertised_protocol
+            else "advertised profile unknown"
+        )
+        posture_sub = ""
+        certification = _active_standalone_certification(b)
+        certification_identity = certification.get("identity", {})
+        certification_identity = (
+            certification_identity
+            if isinstance(certification_identity, dict)
+            else {}
+        )
+        certification_gpu = certification.get("gpu", {})
+        certification_gpu = (
+            certification_gpu
+            if isinstance(certification_gpu, dict)
+            else {}
+        )
+        display_gpu_mem_mb = (
+            int(certification_gpu.get("memory_used_mb") or 0)
+            if certification
+            else b.gpu_mem_mb
+        )
+        display_gpu_total_mb = (
+            int(certification_gpu.get("memory_total_mb") or 1)
+            if certification
+            else b.gpu_total_mb
+        )
+        display_gpu_util = (
+            int(certification_gpu.get("utilization_pct") or 0)
+            if certification
+            else b.gpu_util
+        )
+        display_uptime_s = (
+            int(float(certification.get("elapsed_s") or 0.0))
+            if certification
+            else b.proc_uptime_s
+        )
+        pct = (
+            display_gpu_mem_mb
+            * 100
+            // max(display_gpu_total_mb, 1)
+        )
         mem_color = color_for_pct(pct)
         alive = "●" if b.proc_alive else "○"
         alive_color = "var(--green)" if b.proc_alive else "var(--red)"
-        acpt_color = color_acpt(b.acpt_30m)
+        acpt_value = getattr(b, "acpt_30m", None)
+        acpt_color = (
+            color_acpt(int(acpt_value))
+            if isinstance(acpt_value, int) and not isinstance(acpt_value, bool)
+            else "var(--dim)"
+        )
         hk = _short_hotkey(b.hotkey)
         # Reject breakdown in last reject column
         rej_breakdown = []
@@ -924,6 +1844,93 @@ def render_fleet_html() -> str:
             posture_title = (
                 f"{getattr(b, 'quarantine_reason', '') or 'durable quarantine active'} · "
                 f"{getattr(b, 'quarantine_path', '')}"
+            )
+        elif certification:
+            posture = "CERTIFYING"
+            posture_color = "var(--yellow)"
+            posture_sub = (
+                f"cert c{int(certification_identity.get('checkpoint_n') or 0)} · "
+                f"source {str(certification_identity.get('miner_source_revision') or '')[:10]} · "
+                f"{profile_status} · current attempts/selected/rewarded 0/0/0"
+            )
+            posture_title = (
+                (
+                    "exact wallet-free generation worker · non-mining · "
+                    if certification.get("service_unit")
+                    else "exact standalone certification · submit-disabled · "
+                )
+                +
+                f"phase={certification.get('phase') or 'transition'} · "
+                f"runner pid={int(certification.get('runner_pid') or 0)} · "
+                f"worker pid={int(certification.get('worker_pid') or 0)} · "
+                f"GPU-bound={bool(certification.get('gpu_process_bound'))}"
+            )
+        elif getattr(b, "standalone_telemetry_path", ""):
+            if not b.proc_alive:
+                supervisor = getattr(b, "standalone_supervisor", {})
+                supervisor = supervisor if isinstance(supervisor, dict) else {}
+                phase = str(
+                    supervisor.get("phase")
+                    or supervisor.get("state")
+                    or ""
+                )
+                posture = "FENCED" + (f" · {phase}" if phase else "")
+                posture_color = "var(--yellow)"
+                posture_sub = (
+                    f"{profile_status} · active none · "
+                    "current attempts/selected/rewarded 0/0/0"
+                )
+            elif getattr(b, "standalone_fresh", False):
+                posture = "standalone live"
+                posture_color = "var(--green)"
+            else:
+                posture = "TELEMETRY STALE"
+                posture_color = "var(--red)"
+            posture_title = (
+                f"atomic={getattr(b, 'standalone_telemetry_path', '')} · "
+                f"age={getattr(b, 'standalone_age_s', -1.0):.1f}s · "
+                f"{getattr(b, 'standalone_error', '') or 'fresh'}"
+            )
+        elif v5_host_telemetry.get("applicable"):
+            v5_events = v5_host_telemetry.get("fleet_events", {})
+            v5_events = v5_events if isinstance(v5_events, dict) else {}
+            v5_ledger = v5_host_telemetry.get("economic_ledger", {})
+            v5_ledger = v5_ledger if isinstance(v5_ledger, dict) else {}
+            if getattr(b, "reference_ready", False) and v5_events.get(
+                "available"
+            ) is True:
+                posture = "V5 host telemetry"
+                posture_color = "var(--green)"
+            elif getattr(b, "reference_ready", False):
+                posture = "V5 sidecars unavailable"
+                posture_color = "var(--yellow)"
+            else:
+                posture = "V5 telemetry stale"
+                posture_color = "var(--red)"
+            posture_sub = (
+                "fleet-events="
+                + (
+                    "current"
+                    if v5_events.get("complete_30m") is True
+                    else "partial"
+                    if v5_events.get("available") is True
+                    else "missing"
+                )
+                + " · economic-ledger="
+                + (
+                    "tail linked"
+                    if v5_ledger.get("tail_chain_linked") is True
+                    else "observed"
+                    if v5_ledger.get("available") is True
+                    else "missing"
+                )
+            )
+            posture_title = (
+                "Per-host V5 state-root telemetry. Host-local "
+                "accepted=True events are observed admissions, not a complete "
+                "acceptance rate; rejected outcomes remain unavailable. "
+                "Shared-hotkey validator verdicts are never allocated to this "
+                "host without a local fleet-events window."
             )
         elif getattr(b, "reference_ready", False):
             posture = "reference ready"
@@ -985,9 +1992,119 @@ def render_fleet_html() -> str:
             model_sub = "manifest missing" if not model["complete"] else "manifest invalid"
             model_color = "var(--yellow)"
             model_title = model_sub
-        posture_title += f" · {model_title}"
+        if (
+            getattr(b, "standalone_telemetry_path", "")
+            and not b.proc_alive
+            and model["valid"]
+        ):
+            model_label = f"historical {model_label}"
+            model_sub = (
+                f"historical v2 · {model_sub} · "
+                f"{profile_status} n{int(getattr(validator_state, 'checkpoint_n', 0) or 0)}"
+            )
+            model_color = "var(--yellow)"
+        if certification:
+            posture_title += (
+                " · exact cert "
+                f"c{int(certification_identity.get('checkpoint_n') or 0)} "
+                f"{certification_identity.get('model_repo') or 'unknown'}@"
+                f"{certification_identity.get('checkpoint_revision') or 'unknown'} · "
+                f"miner source {certification_identity.get('miner_source_revision') or 'unknown'} · "
+                f"validator source {certification_identity.get('validator_source_revision') or 'unknown'}"
+            )
+        else:
+            posture_title += f" · {model_title}"
         code_auction = _box_code_auction_details(b, validator_state)
-        if code_auction["applicable"]:
+        if certification:
+            cert_environment = str(
+                certification_identity.get("environment") or "unknown"
+            )
+            auction_label = (
+                "Code certifying"
+                if cert_environment == "opencodeinstruct"
+                else "Math certifying"
+                if cert_environment == "openmathinstruct"
+                else "certifying"
+            )
+            auction_sub = (
+                f"non-mining · {cert_environment} · "
+                f"c{int(certification_identity.get('checkpoint_n') or 0)}"
+            )
+            auction_generation_sub = ""
+            auction_terminal_sub = ""
+            auction_color = "var(--yellow)"
+            auction_title = (
+                "Certification identity only; no auction readiness, "
+                "submission, selection, or reward is implied"
+            )
+        elif v5_host_telemetry.get("applicable"):
+            v5_events = v5_host_telemetry.get("fleet_events", {})
+            v5_events = v5_events if isinstance(v5_events, dict) else {}
+            v5_ledger = v5_host_telemetry.get("economic_ledger", {})
+            v5_ledger = v5_ledger if isinstance(v5_ledger, dict) else {}
+            generation_30m = v5_events.get("generation_30m")
+            generation_60m = v5_events.get("generation_60m")
+            accepted_30m = v5_events.get("verdict_accepted_30m")
+            if v5_events.get("complete_30m") is True:
+                auction_label = "V5 host telemetry"
+                auction_color = "var(--green)"
+            elif v5_events.get("available") is True:
+                auction_label = "V5 telemetry partial"
+                auction_color = "var(--yellow)"
+            else:
+                auction_label = "V5 telemetry unavailable"
+                auction_color = "var(--yellow)"
+            auction_sub = (
+                "fleet-events="
+                + (
+                    "30m event coverage"
+                    if v5_events.get("complete_30m") is True
+                    else "insufficient coverage"
+                )
+                + " · economic-ledger="
+                + (
+                    "tail linked"
+                    if v5_ledger.get("tail_chain_linked") is True
+                    else "observed"
+                    if v5_ledger.get("available") is True
+                    else "unavailable"
+                )
+            )
+            if isinstance(generation_30m, int) and not isinstance(
+                generation_30m, bool
+            ):
+                generation_60m_text = (
+                    str(generation_60m)
+                    if isinstance(generation_60m, int)
+                    and not isinstance(generation_60m, bool)
+                    else "—"
+                )
+                auction_generation_sub = (
+                    "host-local generation: 30m="
+                    f"{generation_30m} · 60m={generation_60m_text}"
+                )
+            else:
+                auction_generation_sub = (
+                    "host-local generation: unavailable until fleet-events "
+                    "covers the complete rolling window"
+                )
+            accepted_30m_text = (
+                str(accepted_30m)
+                if isinstance(accepted_30m, int)
+                and not isinstance(accepted_30m, bool)
+                else "—"
+            )
+            auction_terminal_sub = (
+                "observed host-local admissions: 30m accepted/rejected="
+                f"{accepted_30m_text}/—"
+            )
+            auction_title = (
+                "V5 fleet-events and economic-ledger telemetry are host "
+                "scoped. This is not legacy Code-auction readiness, and it "
+                "does not claim a complete acceptance rate, rejected-outcome "
+                "count, canonical selection, or reward."
+            )
+        elif code_auction["applicable"]:
             auction_ok = bool(code_auction["ok"])
             auction_label = "auction ready" if auction_ok else "auction blocked"
             auction_color = "var(--green)" if auction_ok else "var(--red)"
@@ -1027,23 +2144,35 @@ def render_fleet_html() -> str:
                 f"grader={'ready' if isinstance(grader_details, dict) and grader_details.get('metrics_ok') else 'blocked'}"
             )
             if isinstance(generation_current, dict):
-                natural_rate = generation_current.get(
-                    "natural_eos_before_bound_rate"
-                )
-                natural_rate_text = (
-                    f"{float(natural_rate) * 100.0:.1f}%"
-                    if isinstance(natural_rate, (float, int))
-                    else "—"
-                )
-                auction_generation_sub = (
-                    "completed="
-                    f"{int(generation_current.get('natural_eos_complete', 0) or 0)}"
-                    " · local_token_limit="
-                    f"{int(generation_current.get('local_token_limit', 0) or 0)}"
-                    " · safe_deadline="
-                    f"{int(generation_current.get('safe_deadline', 0) or 0)}"
-                    f" · natural-EOS/decisive={natural_rate_text}"
-                )
+                if generation_details.get("source") == "standalone_atomic":
+                    auction_generation_sub = (
+                        "generation: attempts="
+                        f"{int(generation_current.get('attempts', 0) or 0)}"
+                        " · complete="
+                        f"{int(generation_current.get('generation_complete', 0) or 0)}"
+                        " · natural M8="
+                        f"{int(generation_current.get('natural_complete_m8', 0) or 0)}"
+                        " · local eligible="
+                        f"{int(generation_current.get('local_eligible', 0) or 0)}"
+                    )
+                else:
+                    natural_rate = generation_current.get(
+                        "natural_eos_before_bound_rate"
+                    )
+                    natural_rate_text = (
+                        f"{float(natural_rate) * 100.0:.1f}%"
+                        if isinstance(natural_rate, (float, int))
+                        else "—"
+                    )
+                    auction_generation_sub = (
+                        "generation: completed="
+                        f"{int(generation_current.get('natural_eos_complete', 0) or 0)}"
+                        " · local_token_limit="
+                        f"{int(generation_current.get('local_token_limit', 0) or 0)}"
+                        " · safe_deadline="
+                        f"{int(generation_current.get('safe_deadline', 0) or 0)}"
+                        f" · natural-EOS/decisive={natural_rate_text}"
+                    )
             elif generation_details.get("error"):
                 auction_generation_sub = "generation outcomes: extension unavailable"
             elif generation_details.get("schema_ok"):
@@ -1055,21 +2184,47 @@ def render_fleet_html() -> str:
             else:
                 auction_generation_sub = "generation outcomes: legacy ledger"
             if isinstance(terminal_current, dict):
-                auction_terminal_sub = (
-                    "terminal v2: attempts="
-                    f"{int(terminal_current.get('attempts', 0) or 0)}"
-                    " · HTTP provisional="
-                    f"{int(terminal_current.get('http_provisional', 0) or 0)}"
-                    " · pool accepted="
-                    f"{int(terminal_current.get('pool_accepted', 0) or 0)}"
-                    " · selected="
-                    f"{int(terminal_current.get('selected', 0) or 0)}"
-                    " · rewarded="
-                    f"{int(terminal_current.get('rewarded', 0) or 0)}"
-                )
+                if terminal_details.get("source") == "standalone_atomic":
+                    auction_terminal_sub = (
+                        "terminal funnel: attempts="
+                        f"{int(terminal_current.get('attempts', 0) or 0)}"
+                        " · terminal="
+                        f"{int(terminal_current.get('terminal_final', 0) or 0)}"
+                        " · unresolved="
+                        f"{int(terminal_current.get('terminal_unresolved', 0) or 0)}"
+                        " · precommit/reveal="
+                        f"{int(terminal_current.get('precommit_accepted', 0) or 0)}/"
+                        f"{int(terminal_current.get('reveal_accepted', 0) or 0)}"
+                        " · pool="
+                        f"{int(terminal_current.get('pool_accepted', 0) or 0)}"
+                        " · selected/rewarded="
+                        f"{int(terminal_current.get('selected', 0) or 0)}/"
+                        f"{int(terminal_current.get('rewarded', 0) or 0)}"
+                    )
+                else:
+                    terminal_schema = int(
+                        terminal_details.get("api_version", 0) or 0
+                    )
+                    schema_label = (
+                        f" (schema v{terminal_schema})"
+                        if terminal_schema
+                        else ""
+                    )
+                    auction_terminal_sub = (
+                        f"terminal funnel{schema_label}: attempts="
+                        f"{int(terminal_current.get('attempts', 0) or 0)}"
+                        " · HTTP provisional="
+                        f"{int(terminal_current.get('http_provisional', 0) or 0)}"
+                        " · pool accepted="
+                        f"{int(terminal_current.get('pool_accepted', 0) or 0)}"
+                        " · selected="
+                        f"{int(terminal_current.get('selected', 0) or 0)}"
+                        " · rewarded="
+                        f"{int(terminal_current.get('rewarded', 0) or 0)}"
+                    )
             elif terminal_details.get("extension_table_present"):
                 auction_terminal_sub = (
-                    "terminal v2: awaiting compatible exact-current partition"
+                    "terminal funnel: awaiting compatible exact-current partition"
                 )
             else:
                 auction_terminal_sub = (
@@ -1084,22 +2239,106 @@ def render_fleet_html() -> str:
                 "natural-EOS decisive denominator"
             )
         else:
-            auction_label = "—"
-            auction_sub = "non-Code"
-            auction_generation_sub = ""
-            auction_terminal_sub = ""
-            auction_color = "var(--dim)"
-            auction_title = "Code auction readiness does not apply to this lane"
+            standalone_auction = _standalone_auction_funnel_display(
+                b, validator_state
+            )
+            if standalone_auction.get("applicable"):
+                auction_ok = bool(standalone_auction.get("ok"))
+                funnel = standalone_auction.get("funnel", {})
+                funnel = funnel if isinstance(funnel, dict) else {}
+                environment = str(standalone_auction.get("environment") or "")
+                controller_mode = str(
+                    standalone_auction.get("controller_mode") or "unknown"
+                )
+                auction_label = (
+                    "auction ready" if auction_ok else "auction blocked"
+                )
+                auction_color = "var(--green)" if auction_ok else "var(--red)"
+                auction_sub = (
+                    f"env={environment} · controller={controller_mode} · "
+                    "telemetry=standalone_atomic"
+                )
+                auction_generation_sub = (
+                    "generation: attempts="
+                    f"{int(funnel.get('attempts', 0) or 0)}"
+                    " · complete="
+                    f"{int(funnel.get('generation_complete', 0) or 0)}"
+                    " · natural M8="
+                    f"{int(funnel.get('natural_complete_m8', 0) or 0)}"
+                    " · local eligible="
+                    f"{int(funnel.get('local_eligible', 0) or 0)}"
+                )
+                auction_terminal_sub = (
+                    "terminal funnel: attempts="
+                    f"{int(funnel.get('attempts', 0) or 0)}"
+                    " · terminal="
+                    f"{int(funnel.get('terminal_final', 0) or 0)}"
+                    " · unresolved="
+                    f"{int(funnel.get('terminal_unresolved', 0) or 0)}"
+                    " · precommit/reveal="
+                    f"{int(funnel.get('precommit_accepted', 0) or 0)}/"
+                    f"{int(funnel.get('reveal_accepted', 0) or 0)}"
+                    " · pool="
+                    f"{int(funnel.get('pool_accepted', 0) or 0)}"
+                    " · selected/rewarded="
+                    f"{int(funnel.get('selected', 0) or 0)}/"
+                    f"{int(funnel.get('rewarded', 0) or 0)}"
+                )
+                auction_title = " · ".join(
+                    _readiness_issue_label(str(issue))
+                    for issue in standalone_auction.get("issues", [])
+                ) or "exact profile-bound standalone auction funnel is current"
+            else:
+                auction_label = "—"
+                auction_sub = "non-Code"
+                auction_generation_sub = ""
+                auction_terminal_sub = ""
+                auction_color = "var(--dim)"
+                auction_title = "No exact standalone auction funnel is available"
         auction_generation_html = "".join(
             "<div class='dim small'>" + html.escape(detail) + "</div>"
             for detail in (auction_generation_sub, auction_terminal_sub)
             if detail
         )
         acceptance_source = getattr(b, "acceptance_source", "events") or "events"
-        final_accept = int(getattr(b, "final_accept_30m", b.acpt_30m) or 0)
-        final_reject = int(getattr(b, "final_reject_30m", b.rej_30m) or 0)
+        acceptance_scope = getattr(b, "acceptance_scope", "per_hotkey") or "per_hotkey"
+        final_accept_value = getattr(b, "final_accept_30m", b.acpt_30m)
+        final_reject_value = getattr(b, "final_reject_30m", b.rej_30m)
+        final_accept = (
+            int(final_accept_value)
+            if isinstance(final_accept_value, int)
+            and not isinstance(final_accept_value, bool)
+            else None
+        )
+        final_reject = (
+            int(final_reject_value)
+            if isinstance(final_reject_value, int)
+            and not isinstance(final_reject_value, bool)
+            else None
+        )
+        final_accept_text = "—" if final_accept is None else str(final_accept)
+        final_reject_text = "—" if final_reject is None else str(final_reject)
+        acceptance_source_label = {
+            "v5_fleet_events_admissions_observed": "V5 host admissions observed",
+            "shared_hotkey_aggregate_unattributable": "shared aggregate · unallocated",
+            "duplicate-hotkey": "shared aggregate · duplicate",
+        }.get(acceptance_source, acceptance_source)
+        shared_hotkey_verdicts = getattr(b, "shared_hotkey_verdicts", {})
+        shared_hotkey_verdicts = (
+            shared_hotkey_verdicts
+            if isinstance(shared_hotkey_verdicts, dict)
+            else {}
+        )
+        shared_aggregate_detail = ""
+        if acceptance_scope == "shared_hotkey_aggregate":
+            shared_aggregate_detail = (
+                " · shared validator total "
+                f"{shared_hotkey_verdicts.get('accepted_30m', '—')}/"
+                f"{shared_hotkey_verdicts.get('rejected_30m', '—')}"
+            )
         final_reason = getattr(b, "last_final_reason", "") or "—"
         unit_error = str(getattr(b, "unit_resolution_error", "") or "")
+        lane_status = _box_lane_status(b, validator_state=validator_state)
         active_unit = str(getattr(b, "active_unit", "") or "")
         active_lane = str(getattr(b, "active_lane", "") or "")
         active_units = list(getattr(b, "active_units", []) or [])
@@ -1108,8 +2347,30 @@ def render_fleet_html() -> str:
         configured_units = [
             str(spec[0]) for spec in getattr(b, "unit_candidates", ())
         ] or ([str(b.unit)] if b.unit else [])
+        coordinated_statuses = _coordinated_unit_status_payload(b)
+        restart_semantics = _box_restart_count_semantics(b)
+        restart_marker = "rΣ" if coordinated_statuses else "r"
         unexpected_units = list(getattr(b, "unexpected_active_units", []) or [])
-        if unit_error:
+        if certification:
+            lane_label = "certifying (non-mining)"
+            lane_color = "var(--yellow)"
+            lane_sub = (
+                f"{certification.get('phase') or 'transition'} · "
+                f"worker pid {int(certification.get('worker_pid') or 0)}"
+            )
+        elif lane_status["status"] == "READY_UNATTACHED":
+            lane_label = "generator ready"
+            lane_color = "var(--yellow)"
+            lane_sub = str(lane_status["reason"])
+        elif lane_status["status"] in {"RECOVERING", "STALLED", "FENCED"}:
+            lane_label = str(lane_status["status"]).lower()
+            lane_color = (
+                "var(--yellow)"
+                if lane_status["status"] == "RECOVERING"
+                else "var(--red)"
+            )
+            lane_sub = str(lane_status["reason"])
+        elif unit_error:
             lane_label = "blocked"
             lane_color = "var(--red)"
             lane_sub = unit_error
@@ -1120,33 +2381,48 @@ def render_fleet_html() -> str:
             if len(active_lanes) > 1:
                 lane_sub += f" · {len(active_lanes)} coordinated lanes"
         lane_title = (
+            f"status={lane_status['status']} reason={lane_status['reason']}; "
             f"active={active_unit or 'none'} pid={int(getattr(b, 'active_pid', 0) or 0)} "
-            f"restarts={int(getattr(b, 'restart_count', 0) or 0)}; "
+            f"restarts={int(getattr(b, 'restart_count', 0) or 0)} "
+            f"({restart_semantics}); "
             f"allowed={','.join(configured_units) or 'unmanaged'}"
         )
         if active_units:
             lane_title += f"; active_set={','.join(active_units)}"
+        if coordinated_statuses:
+            lane_title += "; unit_statuses=" + ",".join(
+                f"{row['unit']}[{row['active_state']}/{row['sub_state']},"
+                f"pid={row['pid']},r={row['restarts']}]"
+                for row in coordinated_statuses
+            )
         if unexpected_units:
             lane_title += f"; unexpected={','.join(unexpected_units)}"
+        if certification:
+            lane_title += (
+                "; exact submit-disabled certification only; "
+                f"runner_pid={int(certification.get('runner_pid') or 0)}; "
+                f"worker_pid={int(certification.get('worker_pid') or 0)}; "
+                "no active mining unit"
+            )
         rows.append(f"""
 <tr>
   <td><button class="fleet-detail-button" type="button" data-box-label="{html.escape(b.label)}" aria-label="Open details for {html.escape(b.label)}"><span class="lbl" style="color:{b.color}">{html.escape(b.label)}</span></button></td>
   <td class="mono" title="{html.escape(b.hotkey)}">{html.escape(hk)}</td>
   <td style="color:{alive_color};text-align:center;font-size:1.4em">{alive}</td>
-  <td class="mono" style="color:{lane_color}" title="{html.escape(lane_title)}">{html.escape(lane_label)}<div class="dim small">{html.escape(lane_sub)} · pid {int(getattr(b, 'active_pid', 0) or 0)} · r{int(getattr(b, 'restart_count', 0) or 0)}</div></td>
-  <td class="mono dim">{fmt_age(b.proc_uptime_s)}</td>
-  <td class="mono" style="color:{posture_color}" title="{html.escape(posture_title)}">{html.escape(posture)}</td>
+  <td class="mono" style="color:{lane_color}" title="{html.escape(lane_title)}">{html.escape(lane_label)}<div class="dim small">{html.escape(lane_sub)} · pid {int(getattr(b, 'active_pid', 0) or 0)} · {restart_marker}{int(getattr(b, 'restart_count', 0) or 0)}</div></td>
+  <td class="mono dim">{fmt_age(display_uptime_s)}</td>
+  <td class="mono" style="color:{posture_color}" title="{html.escape(posture_title)}">{html.escape(posture)}<div class="dim small">{html.escape(posture_sub)}</div></td>
   <td class="mono" style="color:{auction_color}" title="{html.escape(auction_title)}">{html.escape(auction_label)}<div class="dim small">{html.escape(auction_sub)}</div>{auction_generation_html}</td>
   <td class="mono" style="color:{model_color}" title="{html.escape(model_title)}">{html.escape(model_label)}<div class="dim small">{html.escape(model_sub)}</div></td>
   <td>
-    <span style="color:{mem_color}">{b.gpu_mem_mb//1024}/{b.gpu_total_mb//1024}&nbsp;GB</span>
+    <span style="color:{mem_color}">{display_gpu_mem_mb//1024}/{display_gpu_total_mb//1024}&nbsp;GB</span>
     <span class="dim">({pct}%)</span>
   </td>
-  <td class="num">{b.gpu_util}%</td>
-  <td class="num" style="color:{acpt_color};font-weight:700">{b.acpt_30m}</td>
-  <td class="num dim">{b.acpt_60m}</td>
-  <td class="mono" title="Last pool/proof verdict reason: {html.escape(final_reason)}"><b style="color:{color_acpt(final_accept)}">{final_accept}</b><span class="dim">/{final_reject} · {html.escape(acceptance_source)}</span></td>
-  <td class="num dim" title="Miner-side pregen rate (queue activity, not validator accepts)">{b.pregen_30m}</td>
+  <td class="num">{display_gpu_util}%</td>
+  <td class="num" style="color:{acpt_color};font-weight:700">{'—' if b.acpt_30m is None else b.acpt_30m}</td>
+  <td class="num dim">{'—' if b.acpt_60m is None else b.acpt_60m}</td>
+  <td class="mono" title="Last pool/proof verdict reason: {html.escape(final_reason)}{html.escape(shared_aggregate_detail)}"><b style="color:{color_acpt(final_accept or 0) if final_accept is not None else 'var(--dim)'}">{final_accept_text}</b><span class="dim">/{final_reject_text} · {html.escape(acceptance_source_label)}{html.escape(shared_aggregate_detail)}</span></td>
+  <td class="num dim" data-pregen-source="{html.escape(pregen_source)}" title="{html.escape(pregen_title)}">{html.escape(pregen_30m_text)}</td>
   <td class="num" style="color:{'var(--red)' if b.late_drops_30m > 0 else 'var(--dim)'}" title="Late drops — submissions lost to FIFO race before validation">{b.late_drops_30m}</td>
   <td class="num">{sparkline(b.acpt_trend, width=14)}</td>
   <td class="num dim">{b.mean_accept_t_s:.0f}s</td>
@@ -1167,12 +2443,12 @@ def render_fleet_html() -> str:
   <table class="grid">
     <thead>
       <tr>
-        <th>box</th><th>hotkey</th><th>alive</th><th title="Exactly one configured legacy or named systemd lane may be active">lane / env</th><th>uptime</th><th title="Reference-miner readiness and durable quarantine state">posture</th><th title="Process-bound exact Code pre-screen, deadline policy, ledger, grader, and source readiness">Code auction</th><th title="Exact model identity recorded by the atomic source manifest and compared with live validator state">model</th>
+        <th>box</th><th>hotkey</th><th>alive</th><th title="Exactly one configured legacy or named systemd lane may be active">lane / env</th><th>uptime</th><th title="Reference-miner readiness and durable quarantine state">posture</th><th title="Profile-bound generated-to-rewarded funnel; Code additionally includes prescreen, grader, and source readiness">auction funnel</th><th title="Exact model identity recorded by the atomic source manifest and compared with live validator state">model</th>
         <th>GPU mem</th><th>util</th>
-        <th title="Pool/proof admissions in the last 30 min. Sourced from exact /verdicts when fresh, with the structured validator event tail as fallback; this is not R2 selection or reward.">pool/30m</th>
-        <th title="Pool/proof admissions in the last 60 min (/verdicts authoritative); not R2 selection or reward">pool/60m</th>
-        <th title="Authoritative /verdicts pool/proof accept/reject counts in 30m and their data source">pool a/r</th>
-        <th title="Miner-side pregen rate — ACCEPTED-PREGEN lines from the miner's journal in last 30 min. Tells you the box is producing rollouts; does NOT mean the validator admitted them. Typically 20-30x higher than pool/30m when the submission queue is healthy.">pregen/30m</th>
+        <th title="Pool/proof admissions in the last 30 min. A shared-hotkey V5 row uses observed host-local admitted events when its fleet-events tail covers the window; otherwise the value is unavailable rather than assigned from /verdicts.">pool/30m</th>
+        <th title="Pool/proof admissions in the last 60 min. V5 values are observed host-local admissions, not a complete acceptance rate; this is not R2 selection or reward.">pool/60m</th>
+        <th title="Pool/proof accept/reject counts and attribution scope. V5 shows observed host-local admissions as accepted/— because fleet-events does not provide a complete rejected-outcome source. Shared-hotkey validator totals are displayed only as explicitly unallocated aggregates.">pool a/r</th>
+        <th title="Exact rolling miner-side generation when available. V5 lanes use host-local fleet-events; legacy lanes use ACCEPTED-PREGEN journal lines. This is never validator admission.">pregen/30m</th>
         <th title="Validator-side late drops in last 30 min — submissions that reached the validator HTTP but the batcher window had already advanced before the worker could pick them up. Non-zero means this box is losing the FIFO race; rollouts never reach GRAIL verify.">late/30m</th>
         <th title="Sparkline of validator pool/30m across the last ~20 polls">trend</th>
         <th title="Mean response time of pool/proof admissions — lower = earlier FIFO arrival; this is not a selected slot">mean rt</th>
@@ -1223,7 +2499,36 @@ def _lab_isolation_status(lab: LabState) -> tuple[str, str, str]:
     )
 
 
-def _lab_status(lab: LabState) -> tuple[str, str, str]:
+def _lab_artifact_lifecycle(
+    lab: LabState,
+    *,
+    validator_window: int | None,
+) -> dict[str, object]:
+    """Compare an immutable artifact cutoff with an observed validator window."""
+    try:
+        observed_window = int(validator_window or 0)
+        expires_after = int(lab.artifact_expires_after_window or 0)
+    except (TypeError, ValueError, OverflowError):
+        observed_window = 0
+        expires_after = 0
+    comparable = bool(
+        lab.artifact_manifest_ok
+        and observed_window > 0
+        and expires_after > 0
+    )
+    expired = observed_window > expires_after if comparable else None
+    return {
+        "artifact_current": (not expired) if comparable else None,
+        "expired": expired,
+        "validator_window": observed_window or None,
+    }
+
+
+def _lab_status(
+    lab: LabState,
+    *,
+    validator_window: int | None = None,
+) -> tuple[str, str, str]:
     if lab.selector_artifact_manifest:
         if not lab.artifact_manifest_ok:
             return (
@@ -1232,6 +2537,18 @@ def _lab_status(lab: LabState) -> tuple[str, str, str]:
                 lab.artifact_error or "selector artifact unavailable",
             )
         if lab.artifact_status == "shadow_only":
+            lifecycle = _lab_artifact_lifecycle(
+                lab,
+                validator_window=validator_window,
+            )
+            if lifecycle["expired"] is True:
+                return (
+                    "SELECTOR EXPIRED",
+                    "var(--red)",
+                    "immutable shadow artifact expired after "
+                    f"w{lab.artifact_expires_after_window}; validator "
+                    f"w{lifecycle['validator_window']}",
+                )
             return (
                 "SELECTOR SHADOW",
                 "var(--yellow)",
@@ -1262,12 +2579,29 @@ def _lab_status(lab: LabState) -> tuple[str, str, str]:
     return "OFFLINE INACTIVE", "var(--dim)", lab.unit_sub_state or "inactive"
 
 
-def _lab_payload(lab: LabState, *, now: float | None = None) -> dict:
+def _lab_payload(
+    lab: LabState,
+    *,
+    now: float | None = None,
+    validator_window: int | None = None,
+) -> dict:
     """Public lab telemetry with no live-miner/accounting dimensions."""
     now = time.time() if now is None else float(now)
-    status, _color, status_detail = _lab_status(lab)
+    status, _color, status_detail = _lab_status(
+        lab,
+        validator_window=validator_window,
+    )
     isolation_status, _isolation_color, isolation_detail = _lab_isolation_status(lab)
     age_s = max(0.0, now - lab.last_poll_s) if lab.last_poll_s else None
+    artifact_lifecycle = _lab_artifact_lifecycle(
+        lab,
+        validator_window=validator_window,
+    )
+    exploration_rate = (
+        lab.artifact_exploration_bps / 10_000
+        if lab.artifact_exploration_bps is not None
+        else None
+    )
     return {
         "label": lab.label,
         "host": _display_ssh_alias(lab.alias),
@@ -1342,6 +2676,7 @@ def _lab_payload(lab: LabState, *, now: float | None = None) -> dict:
             "digest": lab.artifact_digest,
             "file_sha256": lab.artifact_file_sha256,
             "data_digest": lab.artifact_data_digest,
+            **artifact_lifecycle,
             "identity": {
                 "source_revision": lab.artifact_source_revision,
                 "checkpoint_repo_id": lab.artifact_checkpoint_repo_id,
@@ -1362,6 +2697,15 @@ def _lab_payload(lab: LabState, *, now: float | None = None) -> dict:
             "policy": {
                 "payout_profile": lab.artifact_payout_profile,
                 "economic_target": lab.artifact_economic_target,
+                "online_activation_allowed": (
+                    lab.artifact_online_activation_allowed
+                ),
+                "expires_after_window": (
+                    lab.artifact_expires_after_window
+                ),
+                "objective": lab.artifact_objective,
+                "exploration_bps": lab.artifact_exploration_bps,
+                "exploration_rate": exploration_rate,
             },
             "validation": {
                 "activation_gate_passed": (
@@ -1413,20 +2757,414 @@ def _lab_payload(lab: LabState, *, now: float | None = None) -> dict:
     }
 
 
+def _component_controller_binding(
+    component: ComponentState,
+    controller: BoxState | None,
+) -> dict[str, object]:
+    """Match a component only through the controller's immutable manifest."""
+    if controller is None:
+        return {"attached": False, "reason": "controller_missing"}
+    bindings = getattr(controller, "runtime_components", [])
+    if not isinstance(bindings, list) or not bindings:
+        return {"attached": False, "reason": "controller_manifest_unbound"}
+    matches = [
+        row
+        for row in bindings
+        if isinstance(row, dict)
+        and row.get("role") == component.role
+        and row.get("manifest_file_sha256") == component.manifest_sha256
+        and row.get("runtime_profile_sha256")
+        == component.runtime_profile_sha256
+    ]
+    if len(matches) != 1:
+        return {
+            "attached": False,
+            "reason": (
+                "component_binding_missing"
+                if not matches
+                else "component_binding_ambiguous"
+            ),
+        }
+    return {
+        "attached": True,
+        "reason": "exact_controller_manifest_binding",
+        "component_id": str(matches[0].get("component_id") or ""),
+    }
+
+
+def _component_payload(
+    component: ComponentState,
+    *,
+    boxes: list[BoxState],
+    chain_entries: dict[str, object],
+    now: float | None = None,
+) -> dict[str, object]:
+    """Return component truth without inventing a second mining funnel."""
+    now = time.time() if now is None else float(now)
+    controller = next(
+        (
+            box
+            for box in boxes
+            if box.label == component.controller_label
+        ),
+        None,
+    )
+    binding = _component_controller_binding(component, controller)
+    generator_ok = bool(
+        component.generator_active_state == "active"
+        and component.generator_sub_state == "running"
+        and component.generator_pid > 0
+    )
+    tunnel_ok = bool(
+        component.tunnel_active_state == "active"
+        and component.tunnel_sub_state == "running"
+        and component.tunnel_pid > 0
+    )
+    poll_age = (
+        max(0.0, now - component.last_poll_s)
+        if component.last_poll_s
+        else None
+    )
+    fresh = bool(
+        poll_age is not None
+        and poll_age <= component.telemetry_stale_seconds
+    )
+    services_ok = generator_ok and tunnel_ok and fresh
+    isolation_ok = bool(
+        component.wallet_absent_attested
+        and component.submit_authority is False
+    )
+    evidence_complete = (
+        component.evidence_valid_windows
+        >= component.evidence_target_windows
+    )
+    evidence_ok = bool(
+        component.evidence_source_ok and component.evidence_fresh
+    )
+    attached = bool(binding["attached"])
+    controller_mode = str(
+        getattr(controller, "standalone_controller_mode", "") or ""
+    )
+    generation: dict[str, object] | None = None
+    if attached and controller is not None:
+        try:
+            component_gpu = _canonical_physical_gpu_id(
+                component.gpu_uuid
+            )
+            bound_gpu = _canonical_physical_gpu_id(
+                binding.get("component_id")
+            )
+        except ValueError:
+            component_gpu = ""
+            bound_gpu = ""
+        per_gpu = getattr(controller, "standalone_telemetry", {}).get(
+            "per_gpu", {}
+        )
+        if (
+            component_gpu
+            and component_gpu == bound_gpu
+            and isinstance(per_gpu, dict)
+            and isinstance(per_gpu.get(component_gpu), dict)
+        ):
+            generation = dict(per_gpu[component_gpu])
+    if (
+        not services_ok
+        or not component.identity_ok
+        or not isolation_ok
+        or not evidence_ok
+    ):
+        status = "component_failed"
+    elif attached:
+        status = (
+            f"attached_{controller_mode}"
+            if controller_mode in {"canary", "mine"}
+            else "live_attached"
+        )
+    elif evidence_complete:
+        status = "ready_unattached"
+    else:
+        status = "certifying"
+    controller_hotkey = controller.hotkey if controller is not None else ""
+    chain_entry = chain_entries.get(controller_hotkey)
+    uid = (
+        int(getattr(chain_entry, "uid", -1))
+        if chain_entry is not None
+        else None
+    )
+    evidence_age = (
+        max(0.0, now - component.evidence_latest_at)
+        if component.evidence_latest_at
+        else None
+    )
+    return {
+        "label": component.label,
+        "host": _display_ssh_alias(component.alias),
+        "role": f"wallet-free-{component.role}-component",
+        "status": status,
+        "ok": (
+            services_ok
+            and component.identity_ok
+            and isolation_ok
+            and evidence_ok
+        ),
+        "fresh": fresh,
+        "age_s": poll_age,
+        "services": {
+            "generator": {
+                "name": component.generator_unit,
+                "active_state": component.generator_active_state,
+                "sub_state": component.generator_sub_state,
+                "enablement": component.generator_enablement,
+                "pid": component.generator_pid,
+                "restarts": component.generator_restarts,
+                "ok": generator_ok,
+            },
+            "tunnel": {
+                "name": component.tunnel_unit,
+                "active_state": component.tunnel_active_state,
+                "sub_state": component.tunnel_sub_state,
+                "enablement": component.tunnel_enablement,
+                "pid": component.tunnel_pid,
+                "restarts": component.tunnel_restarts,
+                "ok": tunnel_ok,
+            },
+        },
+        "authority": {
+            "wallet_absent_attested": component.wallet_absent_attested,
+            "submit_authority": component.submit_authority,
+            "owns_hotkey": False,
+        },
+        "gpu": {
+            "uuid": component.gpu_uuid,
+            "name": component.gpu_name,
+            "compute_capability": component.compute_capability,
+            "memory_used_mb": component.gpu_mem_mb,
+            "memory_total_mb": component.gpu_total_mb,
+            "utilization_pct": component.gpu_util,
+            "power_w": component.gpu_power_w,
+            "power_limit_w": component.gpu_power_limit_w,
+        },
+        "identity": {
+            "ok": component.identity_ok,
+            "component_role": component.component_role,
+            "manifest_schema_version": component.manifest_schema_version,
+            "manifest_sha256": component.manifest_sha256,
+            "manifest_profile_sha256": component.manifest_profile_sha256,
+            "miner_source_revision": component.miner_source_revision,
+            "validator_source_revision": component.validator_source_revision,
+            "checkpoint_n": component.checkpoint_n,
+            "checkpoint_revision": component.checkpoint_revision,
+            "model_repo": component.model_repo,
+            "environment": component.environment,
+            "runtime_profile_sha256": component.runtime_profile_sha256,
+            "runtime_regime": component.runtime_regime,
+            "profile_file_sha256": component.profile_file_sha256,
+            "profile_source_revision": component.profile_source_revision,
+            "profile_checkpoint_revision": (
+                component.profile_checkpoint_revision
+            ),
+            "profile_gpu_uuid": component.profile_gpu_uuid,
+        },
+        "evidence": {
+            "host": _display_ssh_alias(component.evidence_alias),
+            "directory": component.evidence_dir,
+            "source_ok": component.evidence_source_ok,
+            "certificate_bound": component.evidence_certificate_bound,
+            "fresh": component.evidence_fresh,
+            "stale_after_seconds": component.evidence_stale_seconds,
+            "manifest_sha256": component.evidence_manifest_sha256,
+            "profile_sha256": component.evidence_profile_sha256,
+            "valid_windows": component.evidence_valid_windows,
+            "target_windows": component.evidence_target_windows,
+            "complete_groups": component.evidence_complete_groups,
+            "first_window": component.evidence_first_window,
+            "last_window": component.evidence_last_window,
+            "latest_at": component.evidence_latest_at,
+            "age_s": evidence_age,
+            "complete": evidence_complete,
+            "error": component.evidence_error,
+        },
+        "controller_binding": binding,
+        "worker": {
+            "resolution_source": component.resolution_source,
+            "state": component.worker_state,
+            "progress_fresh": component.worker_progress_fresh,
+            "progress_age_s": component.worker_progress_age_s,
+            "boot_id": component.worker_boot_id,
+            "engine_epoch": component.worker_engine_epoch,
+            "recovery_count": component.worker_recovery_count,
+            "active_job_id": component.active_job_id,
+            "active_window_n": component.active_window_n,
+            "active_started_at": component.active_started_at,
+            "active_deadline_at": component.active_deadline_at,
+            "last_completed_job_id": component.last_completed_job_id,
+            "last_completed_window_n": component.last_completed_window_n,
+            "last_completed_at": component.last_completed_at,
+        },
+        "generation": generation,
+        # There is deliberately no component attempt/reward funnel. Every
+        # rollout leaving this worker is deduplicated, signed and submitted by
+        # the one controller below, whose standalone row is authoritative.
+        "accounting": {
+            "controller_label": component.controller_label,
+            "hotkey": controller_hotkey,
+            "uid": uid,
+            "shared_controller_funnel": True,
+            "component_attempts": None,
+            "component_selected_slots": None,
+            "component_rewarded_slots": None,
+            "component_slots_per_gpu_hour": None,
+            "generated_attempts": (
+                int(generation["attempts"]) if generation else None
+            ),
+            "natural_complete_m8": (
+                int(generation["natural_complete_m8"])
+                if generation
+                else None
+            ),
+            "generated_windows": (
+                int(generation["generated_windows"])
+                if generation
+                else None
+            ),
+            "natural_complete_windows": (
+                int(generation["natural_complete_windows"])
+                if generation
+                else None
+            ),
+            "physical_gpu_hours": (
+                float(generation["physical_gpu_hours"])
+                if generation
+                else None
+            ),
+        },
+        "probe_error": component.error,
+    }
+
+
+def render_components_html() -> str:
+    with _lock:
+        components = list(_components)
+        boxes = list(_boxes)
+        chain_entries = {
+            str(getattr(entry, "hotkey", "") or ""): entry
+            for entry in _chain.hotkeys
+        }
+    if not components:
+        return ""
+    rows: list[str] = []
+    now = time.time()
+    for component in components:
+        payload = _component_payload(
+            component,
+            boxes=boxes,
+            chain_entries=chain_entries,
+            now=now,
+        )
+        status = str(payload["status"]).replace("_", " ").upper()
+        tone = (
+            "var(--green)"
+            if payload["status"] in {
+                "live_attached",
+                "attached_canary",
+                "attached_mine",
+            }
+            else (
+                "var(--yellow)"
+                if payload["status"] in {"certifying", "ready_unattached"}
+                else "var(--red)"
+            )
+        )
+        services = payload["services"]
+        generator = services["generator"]
+        tunnel = services["tunnel"]
+        gpu = payload["gpu"]
+        identity = payload["identity"]
+        evidence = payload["evidence"]
+        binding = payload["controller_binding"]
+        accounting = payload["accounting"]
+        generated = (
+            f'{int(accounting["natural_complete_m8"])} natural M=8 / '
+            f'{int(accounting["generated_attempts"])} generated · '
+            f'{int(accounting["natural_complete_windows"])} windows · '
+            f'{float(accounting["physical_gpu_hours"]):.3f} GPUh'
+            if accounting["generated_attempts"] is not None
+            else "component generation ledger unavailable"
+        )
+        pct = int(gpu["memory_used_mb"]) * 100 // max(
+            int(gpu["memory_total_mb"]), 1
+        )
+        rows.append(f"""
+<tr>
+  <td><span class="lbl" style="color:{html.escape(component.color)}">{html.escape(component.label)}</span>
+    <div class="dim small">{html.escape(str(payload["host"]))}</div>
+  </td>
+  <td class="mono" style="color:{tone}"><b>{html.escape(status)}</b>
+    <div class="dim small">poll {float(payload["age_s"] or 0.0):.1f}s</div>
+  </td>
+  <td class="mono">{html.escape(str(generator["active_state"]))}/{html.escape(str(generator["sub_state"]))}
+    <div class="dim small">pid {int(generator["pid"])} · r{int(generator["restarts"])} · {html.escape(str(generator["enablement"]))}</div>
+  </td>
+  <td class="mono">{html.escape(str(tunnel["active_state"]))}/{html.escape(str(tunnel["sub_state"]))}
+    <div class="dim small">pid {int(tunnel["pid"])} · r{int(tunnel["restarts"])} · {html.escape(str(tunnel["enablement"]))}</div>
+  </td>
+  <td style="color:{'var(--green)' if payload["authority"]["wallet_absent_attested"] and not payload["authority"]["submit_authority"] else 'var(--red)'}">NO WALLET · NO SUBMIT
+    <div class="dim small">controller owns signing + transport</div>
+  </td>
+  <td title="{html.escape(str(gpu["uuid"]))}"><span style="color:{color_for_pct(pct)}">{html.escape(str(gpu["name"]) or "GPU unavailable")}</span>
+    <div class="dim small">CC {html.escape(str(gpu["compute_capability"]) or "—")} · {int(gpu["memory_used_mb"]) // 1024}/{int(gpu["memory_total_mb"]) // 1024} GB · {int(gpu["utilization_pct"])}% · {float(gpu["power_w"]):.0f}/{float(gpu["power_limit_w"]):.0f} W</div>
+  </td>
+  <td class="mono" title="manifest {html.escape(str(identity["manifest_sha256"]))} · profile {html.escape(str(identity["runtime_profile_sha256"]))}">miner {html.escape(str(identity["miner_source_revision"])[:10] or "—")}
+    <div class="dim small">validator {html.escape(str(identity["validator_source_revision"])[:10] or "—")} · manifest v{int(identity["manifest_schema_version"])} · {html.escape(str(identity["component_role"]) or "—")}</div>
+  </td>
+  <td class="mono">c{int(identity["checkpoint_n"])} · {html.escape(str(identity["checkpoint_revision"])[:10] or "—")}
+    <div class="dim small">{html.escape(str(identity["model_repo"]) or "—")} · profile {html.escape(str(identity["runtime_profile_sha256"])[:10] or "—")}</div>
+  </td>
+  <td class="mono" title="{html.escape(str(evidence["directory"]))} · manifest {html.escape(str(evidence["manifest_sha256"]))} · profile {html.escape(str(evidence["profile_sha256"]))}">{int(evidence["valid_windows"])}/{int(evidence["target_windows"])} windows · {int(evidence["complete_groups"])} groups
+    <div class="dim small">w{int(evidence["first_window"])}–w{int(evidence["last_window"])} · completed {float(evidence["age_s"] or 0.0):.0f}s ago · {'fresh' if evidence["fresh"] else 'STALE'}</div>
+    <div class="dim small">{html.escape(str(evidence["host"]))}</div>
+  </td>
+  <td class="mono" style="color:{'var(--green)' if binding["attached"] else 'var(--yellow)'}">{html.escape(str(binding["reason"]).replace("_", " "))}
+    <div class="dim small">{html.escape(str(accounting["controller_label"]))} · UID {accounting["uid"] if accounting["uid"] is not None else "—"} · {html.escape(str(accounting["hotkey"])[:12] or "—")}…</div>
+    <div class="dim small">{html.escape(generated)}</div>
+    <div class="dim small">attempts / selected / rewards counted once on controller row</div>
+  </td>
+</tr>""")
+    return f"""
+<div class="panel">
+  <h2>Live accelerator components <span class="dim small">wallet-free workers · controller-attributed accounting</span></h2>
+  <table class="grid compact">
+    <thead><tr>
+      <th>component / host</th><th>stage</th><th>generator</th><th>tunnel</th>
+      <th>authority</th><th>GPU</th><th>component / validator source</th>
+      <th>checkpoint / profile</th><th>evidence progress</th>
+      <th>controller binding / accounting</th>
+    </tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+"""
+
+
 def render_labs_html() -> str:
     with _lock:
         labs = list(_labs)
         last = _last_poll_at
         poll_count = _poll_count
+        validator_window = int(getattr(_vs, "window", 0) or 0)
     if not labs:
-        return (
-            "<div class='panel'><h2>Accelerator labs</h2>"
-            "<span class='dim'>no submit-disabled labs configured</span></div>"
-        )
+        return render_components_html()
     rows = []
     now = time.time()
     for lab in labs:
-        status, status_color, status_detail = _lab_status(lab)
+        status, status_color, status_detail = _lab_status(
+            lab,
+            validator_window=validator_window,
+        )
+        artifact_lifecycle = _lab_artifact_lifecycle(
+            lab,
+            validator_window=validator_window,
+        )
         isolation_text, isolation_color, isolation_sub = _lab_isolation_status(lab)
         pct = lab.gpu_mem_mb * 100 // max(lab.gpu_total_mb, 1)
         gpu_label = lab.gpu_name or "GPU unavailable"
@@ -1447,7 +3185,11 @@ def render_labs_html() -> str:
         release_sub = "source —"
         evidence_extra = ""
         if lab.selector_artifact_manifest:
-            role_sub = "SHADOW-ONLY · NOT ACTIVATION ELIGIBLE"
+            role_sub = (
+                "EXPIRED SHADOW · NOT ACTIVATION ELIGIBLE"
+                if artifact_lifecycle["expired"] is True
+                else "SHADOW-ONLY · NOT ACTIVATION ELIGIBLE"
+            )
             identity_prefix = "artifact"
             release = lab.artifact_model_version[:18] or "—"
             source = lab.artifact_source_revision[:10] or "—"
@@ -1615,6 +3357,10 @@ def render_labs_html() -> str:
             window_sub = (
                 f"w{lab.artifact_window_start}–w{lab.artifact_window_end}"
             )
+            if lab.artifact_expires_after_window is not None:
+                window_sub += (
+                    f" · expires after w{lab.artifact_expires_after_window}"
+                )
             age_detail = f"digest {lab.artifact_digest[:10] or '—'}"
         elif lab.selector_artifact_manifest:
             evidence_color = "var(--red)"
@@ -1678,7 +3424,7 @@ def render_labs_html() -> str:
 </tr>
 """)
     age = int(max(0.0, now - last)) if last else 0
-    return f"""
+    return render_components_html() + f"""
 <div class="panel">
   <h2>Accelerator labs — submit-disabled <span class="dim">polled {age}s ago · #{poll_count}</span></h2>
   <div class="small" style="margin-bottom:6px;color:var(--yellow)">OFFLINE ONLY · NO WALLET · EXCLUDED FROM LIVE MINER ACCOUNTING</div>
@@ -2324,9 +4070,81 @@ def _box_code_auction_details(
     health_stale_s: float | None = None,
 ) -> dict[str, object]:
     """Derive fail-closed Code readiness from one atomic, non-secret probe."""
+    if getattr(box, "miner_kind", "") == "reliquary_one":
+        # V5 exposes a separate host-local event/ledger contract.  Running
+        # the retired reference Code readiness gates against that service
+        # would turn an unsupported probe into a false "auction blocked".
+        return {
+            "applicable": False,
+            "ok": None,
+            "issues": [],
+            "v5_host_telemetry": _box_v5_host_telemetry(box),
+        }
     applicable = _box_code_auction_applicable(box)
     if not applicable:
         return {"applicable": False, "ok": None, "issues": []}
+    if getattr(box, "standalone_telemetry_path", ""):
+        issues = _standalone_readiness_issues(
+            box, validator_state=validator_state
+        )
+        telemetry = getattr(box, "standalone_telemetry", {})
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
+        funnel = telemetry.get("funnel")
+        funnel = funnel if isinstance(funnel, dict) else {}
+        manifest_profile = telemetry.get("manifest_profile")
+        manifest_profile = (
+            manifest_profile if isinstance(manifest_profile, dict) else {}
+        )
+        return {
+            "applicable": True,
+            "ok": not issues,
+            "issues": issues,
+            "prescreen_enabled": True,
+            "auction_policy": "standalone_atomic",
+            "protocol_version": manifest_profile.get("protocol_version"),
+            "ledger": {
+                "current_partition": bool(funnel),
+                "generation_outcomes": {
+                    "source": "standalone_atomic",
+                    "current": {
+                        "attempts": int(funnel.get("attempts") or 0),
+                        "generation_complete": int(
+                            funnel.get("generation_complete") or 0
+                        ),
+                        "natural_complete_m8": int(
+                            funnel.get("natural_complete_m8") or 0
+                        ),
+                        "local_eligible": int(
+                            funnel.get("local_eligible") or 0
+                        ),
+                    },
+                },
+                "terminal_funnel": {
+                    "source": "standalone_atomic",
+                    "current": {
+                        "attempts": int(funnel.get("attempts") or 0),
+                        "precommit_accepted": int(
+                            funnel.get("precommit_accepted") or 0
+                        ),
+                        "reveal_accepted": int(
+                            funnel.get("reveal_accepted") or 0
+                        ),
+                        "pool_accepted": int(
+                            funnel.get("pool_accepted") or 0
+                        ),
+                        "terminal_final": int(
+                            funnel.get("terminal_final") or 0
+                        ),
+                        "terminal_unresolved": int(
+                            funnel.get("terminal_unresolved") or 0
+                        ),
+                        "selected": int(funnel.get("selected") or 0),
+                        "rewarded": int(funnel.get("rewarded") or 0),
+                    }
+                },
+            },
+            "grader": {"metrics_ok": True, "authority": "atomic_snapshot"},
+        }
 
     issues: list[str] = []
     probe = getattr(box, "code_auction_probe", {})
@@ -2821,6 +4639,571 @@ def _box_code_auction_details(
     }
 
 
+def _box_code_selector_crossover_details(
+    box: BoxState,
+    validator_state: ValidatorState | None,
+    *,
+    now: float | None = None,
+    stale_after_s: float | None = None,
+) -> dict[str, object]:
+    """Project one validated persisted arm without relabeling stale history."""
+    raw = getattr(box, "code_selector_crossover_probe", {})
+    raw = raw if isinstance(raw, dict) else {}
+    configured = bool(raw.get("configured"))
+    latest: dict[str, object] | None = None
+    state = raw.get("state")
+    state = state if isinstance(state, dict) else {}
+    latest_raw = state.get("latest_decision")
+    if isinstance(latest_raw, dict):
+        latest = dict(latest_raw)
+    result: dict[str, object] = {
+        "configured": configured,
+        "ok": True if not configured else False,
+        "issues": [],
+        "process_unit": "",
+        "process_pid": 0,
+        "lane": "",
+        "contract": {},
+        "score_index": {},
+        "latest_persisted": latest,
+        "current": None,
+        "current_status": "disabled" if not configured else "invalid",
+    }
+    if not configured:
+        return result
+
+    issues: list[str] = []
+    if int(raw.get("schema_version", 0) or 0) != 1:
+        issues.append("probe_missing")
+    if raw.get("valid") is not True:
+        issues.append(
+            "artifact_invalid:"
+            + str(raw.get("error") or "validation_failed")[:128]
+        )
+    if raw.get("settings_process_bound") is not True:
+        issues.append("settings_not_process_bound")
+    process_unit = str(raw.get("process_unit") or "")
+    process_pid = int(raw.get("process_pid", 0) or 0)
+    lane = str(raw.get("lane") or "")
+    active_units = set(getattr(box, "active_units", []) or [])
+    if not active_units and getattr(box, "active_unit", ""):
+        active_units.add(str(getattr(box, "active_unit")))
+    if process_pid <= 0 or process_unit not in active_units:
+        issues.append("process_identity_mismatch")
+
+    contract = raw.get("contract")
+    contract = contract if isinstance(contract, dict) else {}
+    score_index = raw.get("score_index")
+    score_index = score_index if isinstance(score_index, dict) else {}
+    if raw.get("valid") is True:
+        active_model = _active_model_identity(box)
+        identity_pairs = (
+            (
+                str(contract.get("public_source_revision") or ""),
+                str(getattr(box, "reliquary_source_revision", "") or ""),
+                "source_mismatch",
+            ),
+            (
+                str(contract.get("miner_release_revision") or ""),
+                str(getattr(box, "miner_source_revision", "") or ""),
+                "miner_release_mismatch",
+            ),
+            (
+                str(contract.get("runtime_profile_sha256") or ""),
+                str(getattr(box, "runtime_profile_hash", "") or ""),
+                "runtime_profile_mismatch",
+            ),
+            (
+                str(contract.get("checkpoint_repository") or "").casefold(),
+                str(active_model.get("repo") or "").casefold(),
+                "checkpoint_repository_mismatch",
+            ),
+            (
+                str(contract.get("checkpoint_revision") or ""),
+                str(active_model.get("revision") or ""),
+                "checkpoint_revision_mismatch",
+            ),
+        )
+        for observed, expected, issue in identity_pairs:
+            if not observed or not expected or observed != expected:
+                issues.append(issue)
+        try:
+            contract_checkpoint_n = int(contract.get("checkpoint_n"))
+            active_checkpoint_n = int(active_model.get("checkpoint_n"))
+        except (TypeError, ValueError):
+            issues.append("checkpoint_n_mismatch")
+        else:
+            if (
+                not bool(active_model.get("valid"))
+                or contract_checkpoint_n != active_checkpoint_n
+            ):
+                issues.append("checkpoint_n_mismatch")
+
+    result.update(
+        {
+            "ok": not issues,
+            "issues": issues,
+            "process_unit": process_unit,
+            "process_pid": process_pid,
+            "lane": lane,
+            "contract": dict(contract),
+            "score_index": dict(score_index),
+            "current_status": "pending",
+        }
+    )
+    if issues:
+        result["current_status"] = "invalid"
+        return result
+
+    current_time = time.time() if now is None else float(now)
+    if stale_after_s is None:
+        try:
+            from settings import SETTINGS as runtime_settings
+
+            configured_limit = float(
+                getattr(
+                    runtime_settings,
+                    "health_poll_stale_seconds",
+                    0.0,
+                ) or 0.0
+            )
+            refresh = float(
+                getattr(runtime_settings, "refresh_seconds", 5.0) or 5.0
+            )
+        except (ImportError, TypeError, ValueError):
+            configured_limit = 0.0
+            refresh = 5.0
+        stale_after_s = max(15.0, refresh * 3.0, configured_limit)
+    try:
+        state_age = max(
+            0.0,
+            current_time
+            - float(getattr(validator_state, "last_fetch_at", 0.0) or 0.0),
+        )
+        box_age = max(
+            0.0,
+            current_time - float(getattr(box, "last_poll_s", 0.0) or 0.0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        result["current_status"] = "validator_stale"
+        return result
+    direct_raw = (
+        getattr(validator_state, "state_raw", {})
+        if validator_state is not None
+        else {}
+    )
+    direct_raw = direct_raw if isinstance(direct_raw, dict) else {}
+    try:
+        direct_window = int(
+            direct_raw.get("window_n")
+            or direct_raw.get("current_round")
+            or 0
+        )
+        validator_window = int(
+            getattr(validator_state, "window", 0) or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        direct_window = validator_window = 0
+    direct_state = str(direct_raw.get("state") or "").lower()
+    observed_state = str(
+        getattr(validator_state, "state", "") or ""
+    ).lower()
+    direct_fresh = bool(
+        validator_state is not None
+        and state_age <= float(stale_after_s)
+        and box_age <= float(stale_after_s)
+        and getattr(validator_state, "error", "") in {"", "ssh-state"}
+        and direct_state == "open"
+        and observed_state == "open"
+        and direct_window > 0
+        and direct_window == validator_window
+    )
+    if not direct_fresh:
+        result["current_status"] = (
+            "validator_not_open"
+            if state_age <= float(stale_after_s)
+            and box_age <= float(stale_after_s)
+            and direct_state != "open"
+            else "validator_stale"
+        )
+        return result
+    try:
+        start_window = int(contract.get("start_window"))
+        end_window = int(contract.get("end_window"))
+    except (TypeError, ValueError):
+        result["current_status"] = "invalid"
+        return result
+    if not start_window <= validator_window <= end_window:
+        result["current_status"] = "outside_contract"
+        return result
+    if (
+        latest is None
+        or int(latest.get("window_n", 0) or 0) != validator_window
+    ):
+        result["current_status"] = "decision_pending"
+        return result
+    result["current"] = {
+        **latest,
+        "validator_window": validator_window,
+        "validator_state": "open",
+    }
+    result["current_status"] = "current"
+    return result
+
+
+def _box_code_overlap_abba_details(
+    box: BoxState,
+    validator_state: ValidatorState | None,
+    *,
+    now: float | None = None,
+    stale_after_s: float | None = None,
+) -> dict[str, object]:
+    """Project the process-bound two-lane AB/BA contract and current arms."""
+    raw = getattr(box, "code_overlap_abba_probe", {})
+    raw = raw if isinstance(raw, dict) else {}
+    configured = bool(raw.get("configured"))
+    result: dict[str, object] = {
+        "configured": configured,
+        "ok": True if not configured else False,
+        "issues": [],
+        "contract": {},
+        "lanes": [],
+        "current": None,
+        "current_status": "disabled" if not configured else "invalid",
+    }
+    if not configured:
+        return result
+
+    issues: list[str] = []
+    if int(raw.get("schema_version", 0) or 0) != 1:
+        issues.append("probe_missing")
+    if raw.get("valid") is not True:
+        issues.append(
+            "artifact_invalid:"
+            + str(raw.get("error") or "validation_failed")[:128]
+        )
+    if raw.get("settings_process_bound") is not True:
+        issues.append("settings_not_process_bound")
+    contract = raw.get("contract")
+    contract = contract if isinstance(contract, dict) else {}
+    lanes_raw = raw.get("lanes")
+    lanes = [
+        dict(lane)
+        for lane in (lanes_raw if isinstance(lanes_raw, list) else [])
+        if isinstance(lane, dict)
+    ]
+
+    status_by_unit = {
+        str(row.get("unit") or ""): row
+        for row in _coordinated_unit_status_payload(box)
+    }
+    active_units = set(getattr(box, "active_units", []) or [])
+    for lane in lanes:
+        unit = str(lane.get("process_unit") or "")
+        pid = int(lane.get("process_pid", 0) or 0)
+        status = status_by_unit.get(unit)
+        if (
+            unit not in active_units
+            or status is None
+            or str(status.get("active_state") or "") != "active"
+            or int(status.get("pid", 0) or 0) != pid
+        ):
+            issues.append(
+                "process_identity_mismatch:"
+                + str(lane.get("shard_slot", "?"))
+            )
+
+    if raw.get("valid") is True:
+        active_model = _active_model_identity(box)
+        identity_pairs = (
+            (
+                str(contract.get("public_source_revision") or ""),
+                str(getattr(box, "reliquary_source_revision", "") or ""),
+                "source_mismatch",
+            ),
+            (
+                str(contract.get("miner_release_revision") or ""),
+                str(getattr(box, "miner_source_revision", "") or ""),
+                "miner_release_mismatch",
+            ),
+            (
+                str(contract.get("runtime_profile_sha256") or ""),
+                str(getattr(box, "runtime_profile_hash", "") or ""),
+                "runtime_profile_mismatch",
+            ),
+            (
+                str(contract.get("checkpoint_repository") or "").casefold(),
+                str(active_model.get("repo") or "").casefold(),
+                "checkpoint_repository_mismatch",
+            ),
+            (
+                str(contract.get("checkpoint_revision") or ""),
+                str(active_model.get("revision") or ""),
+                "checkpoint_revision_mismatch",
+            ),
+        )
+        for observed, expected, issue in identity_pairs:
+            if not observed or not expected or observed != expected:
+                issues.append(issue)
+        try:
+            checkpoint_n = int(contract.get("checkpoint_n"))
+            active_checkpoint_n = int(active_model.get("checkpoint_n"))
+        except (TypeError, ValueError):
+            issues.append("checkpoint_n_mismatch")
+        else:
+            if (
+                not bool(active_model.get("valid"))
+                or checkpoint_n != active_checkpoint_n
+            ):
+                issues.append("checkpoint_n_mismatch")
+
+    result.update(
+        {
+            "ok": not issues,
+            "issues": issues,
+            "contract": dict(contract),
+            "lanes": lanes,
+            "current_status": "pending",
+        }
+    )
+    if issues:
+        result["current_status"] = "invalid"
+        return result
+
+    current_time = time.time() if now is None else float(now)
+    if stale_after_s is None:
+        try:
+            from settings import SETTINGS as runtime_settings
+
+            configured_limit = float(
+                getattr(
+                    runtime_settings,
+                    "health_poll_stale_seconds",
+                    0.0,
+                ) or 0.0
+            )
+            refresh = float(
+                getattr(runtime_settings, "refresh_seconds", 5.0) or 5.0
+            )
+        except (ImportError, TypeError, ValueError):
+            configured_limit = 0.0
+            refresh = 5.0
+        stale_after_s = max(15.0, refresh * 3.0, configured_limit)
+    try:
+        state_age = max(
+            0.0,
+            current_time
+            - float(getattr(validator_state, "last_fetch_at", 0.0) or 0.0),
+        )
+        box_age = max(
+            0.0,
+            current_time - float(getattr(box, "last_poll_s", 0.0) or 0.0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        result["current_status"] = "validator_stale"
+        return result
+    direct_raw = (
+        getattr(validator_state, "state_raw", {})
+        if validator_state is not None
+        else {}
+    )
+    direct_raw = direct_raw if isinstance(direct_raw, dict) else {}
+    try:
+        direct_window = int(
+            direct_raw.get("window_n")
+            or direct_raw.get("current_round")
+            or 0
+        )
+        validator_window = int(
+            getattr(validator_state, "window", 0) or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        direct_window = validator_window = 0
+    direct_state = str(direct_raw.get("state") or "").lower()
+    observed_state = str(
+        getattr(validator_state, "state", "") or ""
+    ).lower()
+    fresh_open = bool(
+        validator_state is not None
+        and state_age <= float(stale_after_s)
+        and box_age <= float(stale_after_s)
+        and getattr(validator_state, "error", "") in {"", "ssh-state"}
+        and direct_state == "open"
+        and observed_state == "open"
+        and direct_window > 0
+        and direct_window == validator_window
+    )
+    if not fresh_open:
+        result["current_status"] = (
+            "validator_not_open"
+            if state_age <= float(stale_after_s)
+            and box_age <= float(stale_after_s)
+            and direct_state != "open"
+            else "validator_stale"
+        )
+        return result
+    try:
+        start_window = int(contract.get("start_window"))
+        end_window = int(contract.get("end_window"))
+    except (TypeError, ValueError):
+        result["current_status"] = "invalid"
+        return result
+    if not start_window <= validator_window <= end_window:
+        result["current_status"] = "outside_contract"
+        return result
+    if any(
+        not isinstance(lane.get("latest_window"), dict)
+        or int(lane["latest_window"].get("window_n", 0) or 0)
+        != validator_window
+        for lane in lanes
+    ):
+        result["current_status"] = "assignment_pending"
+        return result
+    result["current"] = [
+        {
+            "lane": str(lane.get("lane") or ""),
+            "process_pid": int(lane.get("process_pid", 0) or 0),
+            "process_unit": str(lane.get("process_unit") or ""),
+            "shard_slot": int(lane.get("shard_slot", 0) or 0),
+            "activation_count": int(
+                lane["latest_window"].get("activation_count", 0) or 0
+            ),
+            "attempt_count": int(
+                lane["latest_window"].get("attempt_count", 0) or 0
+            ),
+            "fallback_counts": dict(
+                lane["latest_window"].get("fallback_counts") or {}
+            ),
+            "latest_attempt": dict(
+                lane["latest_window"].get("latest_attempt") or {}
+            ),
+            "selected_overlap_count": int(
+                lane["latest_window"].get(
+                    "selected_overlap_count", 0
+                ) or 0
+            ),
+            "window_n": int(
+                lane["latest_window"].get("window_n", 0) or 0
+            ),
+        }
+        for lane in lanes
+    ]
+    result["current_status"] = "current"
+    return result
+
+
+def _standalone_readiness_issues(
+    box: BoxState,
+    *,
+    validator_state: ValidatorState | None,
+) -> list[str]:
+    if not getattr(box, "standalone_telemetry_path", ""):
+        return []
+    issues: list[str] = []
+    error = str(getattr(box, "standalone_error", "") or "")
+    if error:
+        issues.append(f"standalone_telemetry:{error}")
+    if not bool(getattr(box, "standalone_fresh", False)):
+        issues.append("standalone_telemetry_stale")
+    telemetry = getattr(box, "standalone_telemetry", {})
+    if not isinstance(telemetry, dict) or not telemetry:
+        issues.append("standalone_telemetry_missing")
+    else:
+        lifecycle = telemetry.get("window_lifecycle")
+        if isinstance(lifecycle, dict):
+            lifecycle_status = str(lifecycle.get("status") or "").upper()
+            if lifecycle_status in {"RECOVERING", "STALLED"}:
+                issues.append(
+                    f"standalone_window_lifecycle:{lifecycle_status.lower()}"
+                )
+    if not bool(getattr(box, "runtime_parity_ok", False)):
+        issues.append("standalone_runtime_identity_invalid")
+    if not str(getattr(box, "operator", "") or ""):
+        issues.append("standalone_operator_missing")
+
+    if validator_state is not None:
+        # Public source closure and the deployed validator image are separate
+        # identities.  A private deployment commit must not make an otherwise
+        # exact runtime look incompatible with its public protocol closure.
+        # New standalone manifests attest the observed image explicitly;
+        # retain the public-source fallback for older producers.
+        observed_validator_image = str(
+            getattr(box, "observed_validator_image_revision", "")
+            or getattr(box, "reliquary_source_revision", "")
+            or ""
+        ).lower()
+        validator_source = str(
+            getattr(validator_state, "image_revision", "") or ""
+        ).lower()
+        if (
+            validator_source
+            and observed_validator_image != validator_source
+        ):
+            issues.append("standalone_validator_source_mismatch")
+        expected = _validator_model_identity(validator_state)
+        if expected.get("known"):
+            if (
+                int(getattr(box, "runtime_checkpoint_n", 0) or 0)
+                != int(expected.get("checkpoint_n") or 0)
+                or str(
+                    getattr(box, "runtime_checkpoint_revision", "") or ""
+                ).lower()
+                != str(expected.get("revision") or "").lower()
+                or str(
+                    getattr(box, "runtime_checkpoint_repo", "") or ""
+                )
+                != str(expected.get("repo") or "")
+            ):
+                issues.append("standalone_checkpoint_mismatch")
+        validator_window = int(
+            getattr(validator_state, "window", 0) or 0
+        )
+        per_gpu = (
+            telemetry.get("per_gpu")
+            if isinstance(telemetry, dict)
+            else None
+        )
+        if (
+            bool(getattr(box, "standalone_fresh", False))
+            and validator_window > 0
+            and isinstance(per_gpu, dict)
+        ):
+            configured_generation_gpus: set[str] = set()
+            for component in getattr(box, "runtime_components", []):
+                if (
+                    not isinstance(component, dict)
+                    or component.get("role") != "generation"
+                ):
+                    continue
+                try:
+                    configured_generation_gpus.add(
+                        _canonical_physical_gpu_id(
+                            component.get("component_id")
+                        )
+                    )
+                except ValueError:
+                    continue
+            for gpu in sorted(configured_generation_gpus):
+                row = per_gpu.get(gpu)
+                if not isinstance(row, dict):
+                    # No process-bound generation record means there is no
+                    # truthful natural-window frontier to compare yet.
+                    continue
+                last_natural = row.get("last_natural_window")
+                if (
+                    isinstance(last_natural, int)
+                    and not isinstance(last_natural, bool)
+                    and last_natural > 0
+                    and validator_window - last_natural > 1
+                ):
+                    issues.append(
+                        "standalone_gpu_generation_lag:"
+                        f"{gpu}:last={last_natural}:"
+                        f"validator={validator_window}"
+                    )
+    return list(dict.fromkeys(issues))
+
+
 def _box_readiness_issues(
     box: BoxState,
     *,
@@ -2837,9 +5220,66 @@ def _box_readiness_issues(
         if box_age is None or box_age > poll_limit:
             issues.append("stale")
 
+    if getattr(box, "miner_kind", "legacy") == "reliquary_one":
+        miner = getattr(box, "reliquary_one", {})
+        miner = miner if isinstance(miner, dict) else {}
+        if not miner:
+            issues.append("reliquary_one_missing")
+        if not bool(miner.get("fresh")):
+            issues.append("reliquary_one_stale")
+        collector_error = str(
+            getattr(box, "reliquary_one_error", "")
+            or miner.get("collector_error")
+            or ""
+        )
+        if collector_error:
+            issues.append(f"reliquary_one:{collector_error}")
+        service = miner.get("service") if isinstance(miner, dict) else None
+        service = service if isinstance(service, dict) else {}
+        if not service.get("active"):
+            issues.append("down")
+        if not service.get("enabled"):
+            issues.append("service_not_enabled")
+        binding = miner.get("binding") if isinstance(miner, dict) else None
+        binding = binding if isinstance(binding, dict) else {}
+        expected_strategy, expected_environment = _reliquary_one_expected_lane(box)
+        if not expected_strategy or not expected_environment:
+            issues.append("configured_lane_unknown")
+        if str(binding.get("environment") or "") != expected_environment:
+            issues.append("environment_mismatch")
+        if str(binding.get("strategy") or "") != expected_strategy:
+            issues.append("strategy_mismatch")
+        if not str(binding.get("checkpoint_revision") or ""):
+            issues.append("checkpoint_binding_missing")
+        gpus = miner.get("gpu") if isinstance(miner, dict) else None
+        if not isinstance(gpus, list) or not gpus:
+            issues.append("gpu_missing")
+        if validator_state is not None:
+            expected_n = int(
+                getattr(validator_state, "checkpoint_n", 0) or 0
+            )
+            expected_revision = str(
+                getattr(validator_state, "checkpoint_revision", "") or ""
+            ).lower()
+            observed_n = int(binding.get("checkpoint_number") or 0)
+            observed_revision = str(
+                binding.get("checkpoint_revision") or ""
+            ).lower()
+            if expected_n and observed_n != expected_n:
+                issues.append("checkpoint_number_mismatch")
+            if expected_revision and observed_revision != expected_revision:
+                issues.append("checkpoint_revision_mismatch")
+        if getattr(box, "quarantine_active", False):
+            issues.append("quarantined")
+        return list(dict.fromkeys(issues))
+
     unit_error = str(getattr(box, "unit_resolution_error", "") or "")
     if unit_error:
         issues.append(f"unit_resolution:{unit_error}")
+    if _active_standalone_certification(box):
+        # This is useful live GPU work but deliberately cannot satisfy miner
+        # readiness: it has no active canary/mine unit or submission funnel.
+        issues.append("certifying_non_mining")
     if not box.proc_alive:
         issues.append("down")
     if box.error and not unit_error:
@@ -2887,12 +5327,40 @@ def _box_readiness_issues(
             ):
                 issues.append("checkpoint_frontier_mismatch")
 
+    issues.extend(
+        _standalone_readiness_issues(
+            box, validator_state=validator_state
+        )
+    )
+
     issues.extend(_box_code_auction_details(
         box,
         validator_state,
         now=now,
         health_stale_s=poll_limit,
     )["issues"])
+    crossover = _box_code_selector_crossover_details(
+        box,
+        validator_state,
+        now=now,
+        stale_after_s=poll_limit,
+    )
+    if crossover["configured"] and not crossover["ok"]:
+        issues.extend(
+            f"code_selector_crossover:{issue}"
+            for issue in crossover["issues"]
+        )
+    overlap_abba = _box_code_overlap_abba_details(
+        box,
+        validator_state,
+        now=now,
+        stale_after_s=poll_limit,
+    )
+    if overlap_abba["configured"] and not overlap_abba["ok"]:
+        issues.extend(
+            f"code_overlap_abba:{issue}"
+            for issue in overlap_abba["issues"]
+        )
 
     if getattr(box, "quarantine_active", False):
         issues.append("quarantined")
@@ -2902,6 +5370,32 @@ def _box_readiness_issues(
 def _readiness_issue_label(issue: str) -> str:
     """Turn a machine-readable readiness issue into compact operator text."""
     key, _, detail = issue.partition(":")
+    if key == "standalone_gpu_generation_lag":
+        parts = detail.split(":")
+        gpu = parts[0] if parts else "GPU"
+        fields = dict(
+            part.split("=", 1)
+            for part in parts[1:]
+            if "=" in part
+        )
+        short_gpu = (
+            f"{gpu[:12]}…{gpu[-8:]}"
+            if len(gpu) > 22
+            else gpu
+        )
+        return (
+            f"{short_gpu} natural generation stale "
+            f"(w{fields.get('last', '?')} vs "
+            f"w{fields.get('validator', '?')})"
+        )
+    if key == "code_selector_crossover":
+        return "Code selector crossover " + (detail or "invalid").replace(
+            "_", " "
+        )
+    if key == "code_overlap_abba":
+        return "Code overlap AB/BA " + (detail or "invalid").replace(
+            "_", " "
+        )
     if key == "code_auction":
         code_labels = {
             "probe_missing": "Code readiness probe missing",
@@ -3304,6 +5798,865 @@ def _share_legend_html() -> str:
     )
 
 
+def _reliquary_one_context() -> tuple[
+    BoxState | None,
+    dict[str, object],
+    ValidatorState,
+    list[object],
+]:
+    """Return one reconciled view of the configured all-in-one miner."""
+
+    from reliquary_one import reconcile_attempts
+
+    with _lock:
+        candidates = [
+            item
+            for item in _boxes
+            if getattr(item, "miner_kind", "legacy") == "reliquary_one"
+        ]
+        box = next((item for item in candidates if item.proc_alive), None)
+        if box is None:
+            box = candidates[0] if candidates else None
+        validator = _vs
+        windows = list(_windows)
+        local = dict(getattr(box, "reliquary_one", {}) or {}) if box else {}
+    if box is None or not local:
+        return box, local, validator, windows
+    reconciled = reconcile_attempts(
+        local,
+        windows=windows,
+        hotkey=box.hotkey,
+        verdict_rows=verdict_rows_for_hotkey(box.hotkey),
+    )
+    return box, reconciled, validator, windows
+
+
+def _reliquary_one_contexts() -> list[tuple[BoxState, dict[str, object]]]:
+    """Return every configured live-lane row with authenticated outcomes."""
+
+    from reliquary_one import reconcile_attempts
+
+    with _lock:
+        windows = list(_windows)
+        rows = [
+            (box, dict(getattr(box, "reliquary_one", {}) or {}))
+            for box in _boxes
+            if getattr(box, "miner_kind", "legacy") == "reliquary_one"
+        ]
+    contexts: list[tuple[BoxState, dict[str, object]]] = []
+    for box, local in rows:
+        if local:
+            local = reconcile_attempts(
+                local,
+                windows=windows,
+                hotkey=box.hotkey,
+                verdict_rows=verdict_rows_for_hotkey(box.hotkey),
+            )
+        contexts.append((box, local))
+    return contexts
+
+
+def _reliquary_one_public_projection(
+    box: BoxState,
+    windows: list[object],
+) -> dict[str, object]:
+    from reliquary_one import public_projection, reconcile_attempts
+
+    local = dict(getattr(box, "reliquary_one", {}) or {})
+    if not local:
+        return {}
+    return public_projection(
+        reconcile_attempts(
+            local,
+            windows=windows,
+            hotkey=box.hotkey,
+            verdict_rows=verdict_rows_for_hotkey(box.hotkey),
+        )
+    )
+
+
+def _one_age(value: object, *, now: float | None = None) -> str:
+    current = time.time() if now is None else now
+    try:
+        timestamp = float(value or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
+    return fmt_age(max(0.0, current - timestamp)) if timestamp else "unknown"
+
+
+def _one_number(value: object, *, digits: int = 2, suffix: str = "s") -> str:
+    if value is None or isinstance(value, bool):
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+    if not math.isfinite(number):
+        return "—"
+    return f"{number:.{digits}f}{suffix}"
+
+
+def _one_badge(label: str, tone: str = "neutral") -> str:
+    safe_tone = tone if tone in {"good", "pending", "bad", "neutral"} else "neutral"
+    return (
+        f"<span class='one-badge one-badge-{safe_tone}'>"
+        f"{html.escape(label)}</span>"
+    )
+
+
+def _one_bool_badge(value: object, true_label: str, false_label: str) -> str:
+    if value is True:
+        return _one_badge(true_label, "good")
+    if value is False:
+        return _one_badge(false_label, "bad")
+    return _one_badge("pending", "pending")
+
+
+def _one_empty_panel(title: str, detail: str) -> str:
+    return (
+        "<div class='panel one-panel'>"
+        f"<h2>{html.escape(title)}</h2>"
+        f"<div class='one-empty'>{html.escape(detail)}</div></div>"
+    )
+
+
+def _batch_occupancy_html(miner: dict[str, object]) -> str:
+    """Render the six aggregate batch-occupancy values without row data."""
+
+    observability = miner.get("observability")
+    observability = observability if isinstance(observability, dict) else {}
+    occupancy = observability.get("batch_occupancy")
+    occupancy = occupancy if isinstance(occupancy, dict) else {}
+    required = (
+        "apply_steps",
+        "rows_at_capacity_steps",
+        "rows_at_capacity_fraction",
+        "minimum_rows",
+        "mean_rows",
+        "capacity_rows",
+    )
+    if not occupancy or any(key not in occupancy for key in required):
+        return ""
+    try:
+        apply_steps = int(occupancy["apply_steps"])
+        capacity_steps = int(occupancy["rows_at_capacity_steps"])
+        fraction = float(occupancy["rows_at_capacity_fraction"])
+        minimum_rows = int(occupancy["minimum_rows"])
+        mean_rows = float(occupancy["mean_rows"])
+        capacity_rows = int(occupancy["capacity_rows"])
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if (
+        apply_steps < 0
+        or capacity_steps < 0
+        or capacity_steps > apply_steps
+        or minimum_rows < 0
+        or capacity_rows < 0
+        or minimum_rows > mean_rows
+        or mean_rows > capacity_rows
+        or not 0.0 <= fraction <= 1.0
+        or not math.isfinite(fraction)
+        or not math.isfinite(mean_rows)
+    ):
+        return ""
+    title = (
+        "Aggregate miner dashboard batch occupancy only: apply steps at row "
+        "capacity, plus minimum, mean, and configured capacity rows."
+    )
+    return (
+        f"<span title='{html.escape(title)}'><b>{fraction:.1%} at capacity</b>"
+        "<div class='dim small'>"
+        f"{capacity_steps}/{apply_steps} apply steps · "
+        f"μ{mean_rows:.1f} rows · min {minimum_rows} / cap {capacity_rows}"
+        "</div></span>"
+    )
+
+
+def _v4_lane_funnel_html() -> str:
+    contexts = _reliquary_one_contexts()
+    occupancy_by_lane = [
+        _batch_occupancy_html(miner) for _box, miner in contexts
+    ]
+    show_batch_occupancy = any(occupancy_by_lane)
+    rows = []
+    for (box, miner), occupancy_html in zip(
+        contexts, occupancy_by_lane, strict=True
+    ):
+        funnel = miner.get("funnel") if isinstance(miner, dict) else None
+        funnel = funnel if isinstance(funnel, dict) else {}
+        binding = miner.get("binding") if isinstance(miner, dict) else None
+        binding = binding if isinstance(binding, dict) else {}
+        service = miner.get("service") if isinstance(miner, dict) else None
+        service = service if isinstance(service, dict) else {}
+        lane = str(binding.get("strategy") or box.active_lane or "unknown")
+        environment = str(binding.get("environment") or "unknown")
+        status = "active · fresh" if service.get("active") and miner.get("fresh") else (
+            "active · stale" if service.get("active") else "inactive"
+        )
+        tone = "good" if status == "active · fresh" else "bad"
+        lane_detail = f"{html.escape(lane)} · {html.escape(environment)}"
+        ranked = int(funnel.get("validator_ranked_candidates") or 0)
+        rows.append(
+            "<tr>"
+            f"<td><b>{html.escape(box.label)}</b>"
+            f"<div class='dim small'>{lane_detail}</div></td>"
+            f"<td>{_one_badge(status, tone)}</td>"
+            f"<td class='num'>{int(funnel.get('generated_groups') or 0)}</td>"
+            f"<td class='num'>{int(funnel.get('protocol_valid_groups') or 0)}</td>"
+            f"<td class='num'>{int(funnel.get('locally_eligible_groups') or 0)}</td>"
+            f"<td class='num'>{int(funnel.get('signed_precommits') or 0)}</td>"
+            f"<td class='num'>{ranked}</td>"
+            f"<td class='num'>{int(funnel.get('selected_slots') or 0)}</td>"
+            + (
+                f"<td class='mono'>{occupancy_html or '—'}</td>"
+                if show_batch_occupancy
+                else ""
+            )
+            + "</tr>"
+        )
+    return f"""
+  <div class='one-table-scroll' tabindex='0'>
+    <table class='grid compact' aria-label='V4 production funnel by live lane'>
+      <thead><tr>
+        <th>live lane</th><th>health</th>
+        <th class='num'>generated groups</th>
+        <th class='num'>protocol-valid groups</th>
+        <th class='num'>locally eligible groups</th>
+        <th class='num'>signed precommits</th>
+        <th class='num'>validator-ranked candidates</th>
+        <th class='num'>selected slots</th>
+        {"<th title='Aggregate miner dashboard batch occupancy: fraction of apply steps at configured row capacity, with minimum and mean rows.'>batch occupancy</th>" if show_batch_occupancy else ""}
+      </tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+  </div>
+  <div class='one-panel-note'>Counters are distinct stages: generated is a
+  complete-group lower bound from per-attempt terminal events; protocol-valid
+  requires demonstrated local BF16 proof/preflight; rank and selected slot
+  require authenticated validator/R2 evidence.{" Batch occupancy is a separate, aggregate-only local apply-step summary; it contains no row IDs or payloads." if show_batch_occupancy else ""}</div>
+"""
+
+
+def render_our_miner_now_html() -> str:
+    box, miner, validator, _windows = _reliquary_one_context()
+    if box is None:
+        return _one_empty_panel(
+            "Our miner now",
+            "No reliquary_one miner is configured.",
+        )
+    service = miner.get("service") if isinstance(miner, dict) else None
+    service = service if isinstance(service, dict) else {}
+    binding = miner.get("binding") if isinstance(miner, dict) else None
+    binding = binding if isinstance(binding, dict) else {}
+    pipeline = miner.get("current_pipeline") if isinstance(miner, dict) else None
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    gpus = miner.get("gpu") if isinstance(miner, dict) else None
+    gpu = gpus[0] if isinstance(gpus, list) and gpus else {}
+    attempts = miner.get("attempts") if isinstance(miner, dict) else None
+    attempts = attempts if isinstance(attempts, list) else []
+    revision = str(binding.get("checkpoint_revision") or "")
+    expected_revision = str(
+        getattr(validator, "checkpoint_revision", "") or ""
+    )
+    expected_n = int(getattr(validator, "checkpoint_n", 0) or 0)
+    observed_n = int(binding.get("checkpoint_number") or 0)
+    checkpoint_equal = bool(
+        revision
+        and expected_revision
+        and revision.lower() == expected_revision.lower()
+        and (not expected_n or observed_n == expected_n)
+    )
+    latest_transport = next(
+        (
+            row
+            for row in attempts
+            if isinstance(row, dict)
+            and row.get("transport", {}).get("status") != "not_sent"
+        ),
+        None,
+    )
+    latest_admission = next(
+        (
+            row
+            for row in attempts
+            if isinstance(row, dict)
+            and row.get("admission", {}).get("status")
+            not in {None, "pending", "not_applicable"}
+        ),
+        None,
+    )
+    latest_terminal = next(
+        (
+            row
+            for row in attempts
+            if isinstance(row, dict)
+            and (
+                row.get("auction", {}).get("selected") is not None
+                or row.get("auction", {}).get("rewarded") is not None
+            )
+        ),
+        None,
+    )
+    service_badge = _one_badge(
+        "active" if service.get("active") else "down",
+        "good" if service.get("active") else "bad",
+    )
+    fresh_badge = _one_badge(
+        "fresh" if miner.get("fresh") else "stale",
+        "good" if miner.get("fresh") else "bad",
+    )
+    checkpoint_badge = _one_badge(
+        "validator match" if checkpoint_equal else "match pending",
+        "good" if checkpoint_equal else "pending",
+    )
+    hbm_used = float(gpu.get("memory_used_mib") or 0.0) / 1024.0
+    hbm_total = float(gpu.get("memory_total_mib") or 0.0) / 1024.0
+    transport_status = (
+        str(latest_transport.get("transport", {}).get("status") or "unknown")
+        if latest_transport
+        else "unknown"
+    )
+    transport_window = int(latest_transport.get("window_n") or 0) if latest_transport else 0
+    transport_badge = _one_badge(
+        f"local {transport_status}" + (f" · w{transport_window}" if transport_window else ""),
+        "good" if transport_status == "accepted" else "neutral",
+    )
+    admission = (
+        latest_admission.get("admission", {}) if latest_admission else {}
+    )
+    admission_status = str(admission.get("status") or "pending")
+    admission_window = int(latest_admission.get("window_n") or 0) if latest_admission else 0
+    admission_badge = _one_badge(
+        f"validator {admission_status}" + (f" · w{admission_window}" if admission_window else ""),
+        "good" if admission_status == "accepted" else
+        "bad" if admission_status == "rejected" else "pending",
+    )
+    terminal = latest_terminal.get("auction", {}) if latest_terminal else {}
+    terminal_window = int(latest_terminal.get("window_n") or 0) if latest_terminal else 0
+    pipeline_window = (
+        f"w{int(pipeline.get('window_n'))}"
+        if isinstance(pipeline.get("window_n"), int)
+        else "unscoped event"
+    )
+    validator_health = str(getattr(validator, "health_status", "") or "unknown")
+    validator_health_class = "" if validator_health == "ok" else " class='red'"
+    lane = str(binding.get("strategy") or box.active_lane or "unknown")
+    environment = html.escape(str(binding.get("environment") or "unknown"))
+    accelerator = html.escape(str(gpu.get("name") or "accelerator"))
+    kicker = f"{accelerator} · {html.escape(lane)} · {environment}"
+    return f"""
+<div class='panel one-panel one-now-panel'>
+  <h2>Our miner now <span class='one-source-age'>events {_one_age(miner.get('last_heartbeat_at'))} ago</span></h2>
+  <div class='one-now-head'>
+    <div>
+      <div class='one-kicker'>{kicker}</div>
+      <div class='one-primary-status'>{service_badge}{fresh_badge}</div>
+    </div>
+    <div class='one-now-window'>
+      <span>validator</span><b>w{int(getattr(validator, 'window', 0) or 0) or '—'}</b>
+      <small{validator_health_class}>{html.escape(str(getattr(validator, 'state', '') or 'unknown'))} · health {html.escape(validator_health)}</small>
+    </div>
+  </div>
+  <div class='one-kpi-grid'>
+    <div class='one-kpi'><span>service uptime</span><b>{fmt_age(float(service.get('uptime_seconds') or 0.0))}</b><small>{int(service.get('restarts') or 0)} restarts · {'enabled' if service.get('enabled') else 'not enabled'}</small></div>
+    <div class='one-kpi'><span>checkpoint</span><b>cp{observed_n or '—'}</b><small class='mono'>{html.escape(revision[:12] or 'unknown')} · {checkpoint_badge}</small></div>
+    <div class='one-kpi'><span>pipeline now</span><b>{html.escape(str(pipeline.get('stage') or 'unknown').upper())}</b><small>{html.escape(pipeline_window)} · {_one_number(pipeline.get('stage_elapsed_s'), digits=1)} elapsed</small></div>
+    <div class='one-kpi'><span>GPU</span><b>{_one_number(gpu.get('utilization_pct'), digits=0, suffix='%')}</b><small>{hbm_used:.1f}/{hbm_total:.1f} GiB · {_one_number(gpu.get('power_draw_w'), digits=0, suffix='W')}</small></div>
+  </div>
+  <div class='one-truth-strip' aria-label='Latest outcome truth layers'>
+    <div><span>A · local transport</span>{transport_badge}</div>
+    <div><span>B · validator admission</span>{admission_badge}<small>{html.escape(str(admission.get('reason') or ''))}</small></div>
+    <div><span>C · terminal auction{' · w' + str(terminal_window) if terminal_window else ''}</span>{_one_bool_badge(terminal.get('selected'), 'selected', 'not selected')}{_one_bool_badge(terminal.get('rewarded'), 'rewarded', 'not rewarded')}</div>
+  </div>
+  {_v4_lane_funnel_html()}
+</div>
+"""
+
+
+def _one_pipeline_rows(miner: dict[str, object]) -> list[dict[str, object]]:
+    pipeline = miner.get("current_pipeline")
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    attempts = miner.get("attempts")
+    attempts = attempts if isinstance(attempts, list) else []
+    window_n = pipeline.get("window_n")
+    current = next(
+        (
+            row
+            for row in attempts
+            if isinstance(row, dict) and row.get("window_n") == window_n
+        ),
+        None,
+    )
+    current = current if isinstance(current, dict) else {}
+    failure = current.get("failure") if isinstance(current, dict) else None
+    transport = current.get("transport") if isinstance(current, dict) else None
+    transport = transport if isinstance(transport, dict) else {}
+    admission = current.get("admission") if isinstance(current, dict) else None
+    admission = admission if isinstance(admission, dict) else {}
+    auction = current.get("auction") if isinstance(current, dict) else None
+    auction = auction if isinstance(auction, dict) else {}
+    running_stage = str(pipeline.get("stage") or "")
+
+    def row(name: str, duration: object, completed: bool) -> dict[str, object]:
+        status = "completed" if completed else "pending"
+        if running_stage == name.lower().replace("sign/spool", "sign_spool"):
+            status = "running"
+        if failure and name in {"GENERATE", "PROOF", "SIGN/SPOOL"}:
+            status = "failed"
+        return {"name": name, "duration": duration, "status": status}
+
+    transport_seen = transport.get("status") in {"accepted", "rejected", "ambiguous"}
+    rows = [
+        row("OBSERVE", current.get("open_age_at_start_s"), window_n is not None),
+        row("CLAIM", None, bool(current)),
+        row("GENERATE", current.get("generation_s"), current.get("generation_s") is not None),
+        row("PROOF", current.get("proof_s"), current.get("proof_s") is not None),
+        row("SIGN/SPOOL", None, transport_seen),
+        row("PRECOMMIT", current.get("precommit_s"), transport.get("precommit") in {"accepted", "rejected"}),
+        row("REVEAL", current.get("reveal_s"), transport.get("reveal") in {"accepted", "rejected"}),
+        row(
+            "OUTCOME",
+            None,
+            admission.get("status") not in {None, "pending"}
+            or auction.get("selected") is not None,
+        ),
+    ]
+    if running_stage == "generate" and not current:
+        rows[2]["status"] = "running"
+    if running_stage == "failed":
+        rows[2]["status"] = "failed"
+    if rows[-1]["status"] == "pending" and transport_seen:
+        rows[-1]["status"] = "running"
+    return rows
+
+
+def render_current_miner_pipeline_html() -> str:
+    box, miner, _validator, _windows = _reliquary_one_context()
+    if box is None or not miner:
+        return _one_empty_panel("Current window pipeline", "Structured events are warming.")
+    pipeline = miner.get("current_pipeline")
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    pipeline_window = (
+        f"w{int(pipeline.get('window_n'))}"
+        if isinstance(pipeline.get("window_n"), int)
+        else "unscoped event"
+    )
+    rows = _one_pipeline_rows(miner)
+    cells = []
+    for item in rows:
+        status = str(item["status"])
+        tone = {
+            "completed": "good",
+            "running": "pending",
+            "failed": "bad",
+        }.get(status, "neutral")
+        cells.append(
+            "<li class='one-stage one-stage-" + html.escape(status) + "'>"
+            f"<span class='one-stage-dot' aria-hidden='true'></span>"
+            f"<b>{html.escape(str(item['name']))}</b>"
+            f"<small>{_one_number(item.get('duration'), digits=4)}</small>"
+            f"{_one_badge(status, tone)}</li>"
+        )
+    return f"""
+<div class='panel one-panel'>
+  <h2>Current window pipeline <span class='one-source-age'>{html.escape(pipeline_window)} · stage {_one_number(pipeline.get('stage_elapsed_s'), digits=1)}</span></h2>
+  <ol class='one-stage-list'>{''.join(cells)}</ol>
+  <div class='one-panel-note'>Unknown durations remain —. Local transport acceptance is not validator admission.</div>
+</div>
+"""
+
+
+def _attempt_outcome_html(attempt: dict[str, object]) -> str:
+    admission = attempt.get("admission")
+    admission = admission if isinstance(admission, dict) else {}
+    auction = attempt.get("auction")
+    auction = auction if isinstance(auction, dict) else {}
+    status = str(admission.get("status") or "pending")
+    reason = str(admission.get("reason") or "")
+    admission_html = _one_badge(
+        status + (f" · {reason}" if reason else ""),
+        "good" if status == "accepted" else
+        "bad" if status == "rejected" else
+        "neutral" if status == "not_applicable" else "pending",
+    )
+    selected_html = _one_bool_badge(
+        auction.get("selected"), "selected", "not selected"
+    )
+    rewarded_html = _one_bool_badge(
+        auction.get("rewarded"), "rewarded", "not rewarded"
+    )
+    return (
+        "<div class='one-truth-line'><span>validator</span>"
+        f"{admission_html}</div>"
+        "<div class='one-truth-line'><span>auction</span>"
+        f"{selected_html}{rewarded_html}</div>"
+    )
+
+
+def _attempt_filter_state(attempt: dict[str, object]) -> str:
+    failure = attempt.get("failure")
+    if isinstance(failure, dict) and failure:
+        return "failed"
+    admission = attempt.get("admission")
+    admission = admission if isinstance(admission, dict) else {}
+    admission_status = str(admission.get("status") or "pending")
+    if admission_status == "accepted":
+        return "admitted"
+    if admission_status == "rejected":
+        return "rejected"
+    if admission_status == "pending":
+        return "pending"
+    return "other"
+
+
+def render_recent_miner_attempts_html() -> str:
+    box, miner, _validator, _windows = _reliquary_one_context()
+    if box is None or not miner:
+        return _one_empty_panel("Our recent attempts", "No structured attempts yet.")
+    attempts = miner.get("attempts")
+    attempts = attempts if isinstance(attempts, list) else []
+    retained = [attempt for attempt in attempts[:14] if isinstance(attempt, dict)]
+    state_counts = {
+        state: sum(_attempt_filter_state(attempt) == state for attempt in retained)
+        for state in ("pending", "admitted", "rejected", "failed")
+    }
+    rows = []
+    for attempt in retained:
+        if not isinstance(attempt, dict):
+            continue
+        transport = attempt.get("transport")
+        transport = transport if isinstance(transport, dict) else {}
+        transport_status = str(transport.get("status") or "unknown")
+        transport_tone = (
+            "good" if transport_status == "accepted" else
+            "bad" if transport_status == "rejected" else "neutral"
+        )
+        failure = attempt.get("failure")
+        failure = failure if isinstance(failure, dict) else {}
+        attempt_state = _attempt_filter_state(attempt)
+        failure_text = ""
+        if failure:
+            failure_text = (
+                f"<div class='one-failure'>{html.escape(str(failure.get('classification') or 'failed'))}"
+                f" · {html.escape(str(failure.get('exception_file') or ''))}</div>"
+            )
+        rows.append(
+            f"<tr class='one-attempt-row one-attempt-state-{html.escape(attempt_state)}' "
+            f"data-attempt-row data-attempt-state='{html.escape(attempt_state)}' "
+            f"data-window='{int(attempt.get('window_n') or 0)}'>"
+            f"<td class='one-attempt-identity' data-label='Attempt'><div class='one-attempt-id'><b class='window-id'>w{int(attempt.get('window_n') or 0)}</b><span>#{int(attempt.get('ordinal') or 0)}</span></div>{failure_text}</td>"
+            f"<td class='num one-attempt-start' data-label='OPEN+'>{_one_number(attempt.get('open_age_at_start_s'), digits=4)}</td>"
+            f"<td class='num one-attempt-generation' data-label='Generate'>{_one_number(attempt.get('generation_s'), digits=4)}</td>"
+            f"<td class='num one-attempt-proof' data-label='Proof'>{_one_number(attempt.get('proof_s'), digits=4)}<div class='dim small'>integrity {_one_number(attempt.get('proof_integrity_s'), digits=4)}</div></td>"
+            f"<td class='num one-attempt-submit' data-label='Submit'><div><span>PC</span> {_one_number(attempt.get('precommit_s'), digits=4)}</div><div><span>R</span> {_one_number(attempt.get('reveal_s'), digits=4)}</div><small>{html.escape(str(transport.get('precommit') or 'unknown'))} · {html.escape(str(transport.get('reveal') or 'unknown'))}</small></td>"
+            f"<td class='num one-attempt-total' data-label='Total'><b>{_one_number(attempt.get('total_s'), digits=4)}</b></td>"
+            f"<td class='one-attempt-truth' data-label='Truth'><div class='one-truth-cell'><div class='one-truth-line'><span>transport</span>{_one_badge('local ' + transport_status, transport_tone)}</div>{_attempt_outcome_html(attempt)}</div></td>"
+            "</tr>"
+        )
+    body = "".join(rows) or "<tr><td colspan='7' class='one-empty'>No attempts retained.</td></tr>"
+    filter_labels = {
+        "pending": "Pending",
+        "admitted": "Admitted",
+        "rejected": "Rejected",
+        "failed": "Failed",
+    }
+    filters = [
+        "<button type='button' class='one-attempt-filter is-active' "
+        "data-one-attempt-filter='all' aria-pressed='true'>"
+        f"All <span>{len(retained)}</span></button>"
+    ]
+    for state, label in filter_labels.items():
+        count = state_counts[state]
+        if not count:
+            continue
+        filters.append(
+            "<button type='button' class='one-attempt-filter' "
+            f"data-one-attempt-filter='{state}' aria-pressed='false'>"
+            f"{label} <span>{count}</span></button>"
+        )
+    return f"""
+<div class='panel one-panel'>
+  <h2>Our recent attempts <span class='one-source-age'>events {_one_age(miner.get('last_heartbeat_at'))} ago</span></h2>
+  <div class='one-attempt-toolbar'>
+    <div class='one-attempt-filters' role='group' aria-label='Filter recent attempts'>{''.join(filters)}</div>
+    <span class='one-attempt-visible' data-one-attempt-visible aria-live='polite'>{len(retained)} shown</span>
+  </div>
+  <div class='one-table-scroll' tabindex='0'>
+    <table class='grid compact one-attempt-table' aria-label='Recent reliquary-one attempts'>
+      <thead><tr><th>attempt</th><th class='num'>OPEN+</th><th class='num'>generate</th><th class='num'>proof</th><th class='num'>submit</th><th class='num'>total</th><th>local / validator / auction</th></tr></thead>
+      <tbody>{body}</tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
+def _auction_display_value(row: dict[str, object], names: tuple[str, ...]) -> str:
+    for name in names:
+        value = row.get(name)
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, float):
+            return f"{value:.4f}"
+        return html.escape(str(value))
+    return "—"
+
+
+def render_last_sealed_auction_html() -> str:
+    box, miner, _validator, windows = _reliquary_one_context()
+    if box is None:
+        return _one_empty_panel("Last sealed auction", "No active miner configured.")
+    attempt_windows = {
+        int(row.get("window_n") or 0)
+        for row in miner.get("attempts", [])
+        if isinstance(row, dict)
+    }
+    sealed = next(
+        (
+            window
+            for window in windows
+            if int(getattr(window, "n", 0) or 0) in attempt_windows
+            and bool(getattr(window, "terminal_data_present", False))
+        ),
+        None,
+    )
+    if sealed is None:
+        return _one_empty_panel(
+            "Last sealed auction",
+            "Authenticated terminal R2 evidence is pending.",
+        )
+    environment = "opencodeinstruct"
+    public_rows = []
+    for collection_name in ("batch", "runners_up", "rejected"):
+        collection = getattr(sealed, collection_name, [])
+        if not isinstance(collection, list):
+            continue
+        for raw in collection:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("env_name") or "") != environment:
+                continue
+            row = dict(raw)
+            row["_collection"] = collection_name
+            public_rows.append(row)
+    public_rows.sort(
+        key=lambda row: (
+            int(row.get("canonical_rank") or 10_000),
+            float(row.get("arrival_ts") or 0.0),
+        )
+    )
+    environment_counts = getattr(sealed, "environment_counts", {})
+    environment_counts = (
+        environment_counts if isinstance(environment_counts, dict) else {}
+    )
+    counts = environment_counts.get(environment, {})
+    counts = counts if isinstance(counts, dict) else {}
+    candidate_count = sum(
+        int(counts.get(name) or 0)
+        for name in ("selected", "runners_up", "rejected")
+    ) or len(public_rows)
+    our_count = sum(
+        1 for row in public_rows if str(row.get("hotkey") or "") == box.hotkey
+    )
+    rows_html = []
+    selected_seen = 0
+    for row in public_rows[:32]:
+        selected = row.get("selected_for_batch") is True or row.get("_collection") == "batch"
+        if selected:
+            selected_seen += 1
+        boundary = " slot-boundary" if selected and selected_seen == 8 else ""
+        ours = str(row.get("hotkey") or "") == box.hotkey
+        candidate = "OUR MINER" if ours else _short_hotkey(str(row.get("hotkey") or ""))
+        reason = str(row.get("reject_reason") or row.get("reason") or "")
+        outcome = (
+            "rewarded" if row.get("rewarded") is True else
+            "selected" if selected else
+            reason or "not selected"
+        )
+        outcome_tone = "good" if selected else "bad" if reason else "neutral"
+        rows_html.append(
+            f"<tr class='{'our-candidate' if ours else ''}{boundary}'>"
+            f"<td class='num'>{_auction_display_value(row, ('canonical_rank',))}</td>"
+            f"<td><b>{html.escape(candidate)}</b></td>"
+            f"<td class='num'>{_auction_display_value(row, ('response_time', 'drand_delta'))}</td>"
+            f"<td class='num'>{_auction_display_value(row, ('value', 'score', 'sigma'))}</td>"
+            f"<td class='num'>{_auction_display_value(row, ('k', 'k_correct'))}</td>"
+            f"<td class='num'>{_auction_display_value(row, ('median_completion_tokens', 'completion_tokens_median'))}</td>"
+            f"<td>{_one_badge(outcome, outcome_tone)}</td></tr>"
+        )
+    randomness = getattr(sealed, "randomness", {})
+    randomness = randomness if isinstance(randomness, dict) else {}
+    drand = _auction_display_value(
+        randomness,
+        ("round", "drand_round", "seal_trigger_round"),
+    )
+    return f"""
+<div class='panel one-panel'>
+  <h2>Last sealed auction <span class='one-source-age'>R2 · w{int(getattr(sealed, 'n', 0) or 0)}</span></h2>
+  <div class='one-auction-meta'>
+    <span>Code candidates <b>{candidate_count}</b></span>
+    <span>ours <b>{our_count}</b></span>
+    <span>slot boundary <b>top 8</b></span>
+    <span>drand <b>{drand}</b></span>
+  </div>
+  <div class='one-table-scroll one-auction-scroll' tabindex='0'>
+    <table class='grid compact one-auction-table' aria-label='Last sealed Code auction'>
+      <thead><tr><th class='num'>rank</th><th>candidate</th><th class='num'>arrival</th><th class='num'>value/score</th><th class='num'>k</th><th class='num'>median tokens</th><th>outcome</th></tr></thead>
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
+def render_checkpoint_runtime_html() -> str:
+    box, miner, validator, _windows = _reliquary_one_context()
+    if box is None or not miner:
+        return _one_empty_panel("Checkpoint / runtime", "Binding is warming.")
+    binding = miner.get("binding")
+    binding = binding if isinstance(binding, dict) else {}
+    checkpoints = miner.get("checkpoints")
+    checkpoints = checkpoints if isinstance(checkpoints, dict) else {}
+    revision = str(binding.get("checkpoint_revision") or "")
+    expected_revision = str(getattr(validator, "checkpoint_revision", "") or "")
+    exact = bool(revision and expected_revision and revision.lower() == expected_revision.lower())
+    current_n = int(binding.get("checkpoint_number") or 0)
+    tier_cards = []
+    for tier in ("active", "rollback", "incoming"):
+        rows = checkpoints.get(tier)
+        rows = rows if isinstance(rows, list) else []
+        first = rows[0] if rows and isinstance(rows[0], dict) else {}
+        tier_revision = str(first.get("revision") or "")
+        checkpoint_label = (
+            f"cp{current_n}" if tier == "active" and current_n else
+            f"cp{current_n - 1}" if tier == "rollback" and current_n > 0 and tier_revision else
+            "empty" if not tier_revision else "checkpoint"
+        )
+        tier_cards.append(
+            f"<div class='one-tier'><span>{tier}</span><b>{checkpoint_label}</b>"
+            f"<small class='mono'>{html.escape(tier_revision[:12] or '—')}</small></div>"
+        )
+    rotations = []
+    for event in reversed(miner.get("events", [])):
+        if not isinstance(event, dict) or event.get("event") != "checkpoint_activated":
+            continue
+        metrics = event.get("metrics")
+        metrics = metrics if isinstance(metrics, dict) else {}
+        rotations.append(
+            f"<tr><td>{_one_age(event.get('timestamp'))} ago</td>"
+            f"<td class='mono'>{html.escape(str(event.get('checkpoint_revision') or '')[:12])}</td>"
+            f"<td class='mono dim'>{html.escape(str(metrics.get('previous_checkpoint_revision') or '')[:12] or '—')}</td>"
+            f"<td class='num'>{_one_number(metrics.get('download_seconds'), digits=2)}</td></tr>"
+        )
+        if len(rotations) >= 6:
+            break
+    return f"""
+<div class='panel one-panel'>
+  <h2>Checkpoint / runtime <span class='one-source-age'>binding {_one_age(miner.get('source_timestamps', {}).get('binding'))} old</span></h2>
+  <div class='one-runtime-head'>
+    <div><span>active binding</span><b>cp{current_n or '—'} · {html.escape(revision[:12] or 'unknown')}</b></div>
+    <div>{_one_badge('exact validator revision' if exact else 'validator revision pending', 'good' if exact else 'pending')}</div>
+    <div class='mono small'>release {html.escape(str(binding.get('release_sha') or '')[:12] or '—')} · generator {html.escape(str(binding.get('generator_fingerprint') or '')[:12] or '—')} · proof runtime {html.escape(str(binding.get('proof_fingerprint') or '')[:12] or '—')}</div>
+  </div>
+  <div class='one-tier-grid'>{''.join(tier_cards)}</div>
+  <div class='one-table-scroll' tabindex='0'>
+    <table class='grid compact one-rotation-table' aria-label='Checkpoint rotation history'>
+      <thead><tr><th>activated</th><th>revision</th><th>previous</th><th class='num'>download</th></tr></thead>
+      <tbody>{''.join(rotations) or "<tr><td colspan='4' class='dim'>No rotation events retained.</td></tr>"}</tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
+def _structured_event_summary(event: dict[str, object]) -> str:
+    name = str(event.get("event") or "unknown")
+    metrics = event.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    if name == "checkpoint_activated":
+        return (
+            f"checkpoint {str(event.get('checkpoint_revision') or '')[:12]} activated"
+            f" · download {_one_number(metrics.get('download_seconds'), digits=2)}"
+        )
+    if name == "window_started":
+        return f"OPEN observed at +{_one_number(metrics.get('open_age_seconds'), digits=3)}"
+    if name == "live_submission":
+        return (
+            f"local precommit {'accepted' if metrics.get('precommit_accepted') is True else 'not accepted'}"
+            f" · reveal {'accepted' if metrics.get('reveal_accepted') is True else 'not accepted'}"
+            f" · total {_one_number(metrics.get('total_seconds'), digits=4)}"
+        )
+    if name == "window_completed":
+        sent = int(metrics.get("first_sent") is True) + int(metrics.get("second_sent") is True)
+        return f"window completed · {sent}/2 local exchanges sent"
+    if name in {"window_attempt_failed", "daemon_iteration_failed"}:
+        return (
+            f"{str(event.get('classification') or 'failed')} · "
+            f"{str(metrics.get('exception_file') or 'exception file unavailable')}"
+        )
+    return str(event.get("classification") or name)
+
+
+def render_structured_miner_log_html() -> str:
+    box, miner, _validator, _windows = _reliquary_one_context()
+    if box is None or not miner:
+        return _one_empty_panel("Structured live log", "Events are warming.")
+    events = [row for row in miner.get("events", []) if isinstance(row, dict)]
+    windows = sorted(
+        {
+            int(row["window_n"])
+            for row in events
+            if isinstance(row.get("window_n"), int)
+        },
+        reverse=True,
+    )
+    event_names = sorted({str(row.get("event") or "") for row in events})
+    classifications = sorted(
+        {str(row.get("classification") or "") for row in events if row.get("classification")}
+    )
+    options_window = "".join(
+        f"<option value='{value}'>w{value}</option>" for value in windows[:24]
+    )
+    options_event = "".join(
+        f"<option value='{html.escape(value)}'>{html.escape(value)}</option>"
+        for value in event_names
+    )
+    options_classification = "".join(
+        f"<option value='{html.escape(value)}'>{html.escape(value)}</option>"
+        for value in classifications
+    )
+    rows = []
+    for event in reversed(events[-80:]):
+        classification = str(event.get("classification") or "")
+        name = str(event.get("event") or "")
+        window = event.get("window_n")
+        tone = "bad" if "failed" in name else "good" if name in {"live_submission", "checkpoint_activated"} else "neutral"
+        rows.append(
+            f"<tr data-one-log-row data-window='{window if isinstance(window, int) else ''}' data-event='{html.escape(name)}' data-classification='{html.escape(classification)}'>"
+            f"<td>{_one_age(event.get('timestamp'))} ago</td>"
+            f"<td><b class='window-id'>{'w' + str(window) if isinstance(window, int) else '—'}</b></td>"
+            f"<td>{_one_badge(name, tone)}</td>"
+            f"<td>{html.escape(classification or '—')}</td>"
+            f"<td>{html.escape(_structured_event_summary(event))}</td></tr>"
+        )
+    return f"""
+<div class='panel one-panel'>
+  <h2>Structured live log <span class='one-source-age'>last 500 max · {_one_age(miner.get('last_heartbeat_at'))} ago</span></h2>
+  <div class='one-log-filters' aria-label='Structured log filters'>
+    <label>window<select data-one-log-filter='window'><option value=''>all</option>{options_window}</select></label>
+    <label>event<select data-one-log-filter='event'><option value=''>all</option>{options_event}</select></label>
+    <label>classification<select data-one-log-filter='classification'><option value=''>all</option>{options_classification}</select></label>
+  </div>
+  <div class='one-table-scroll one-log-scroll' tabindex='0'>
+    <table class='grid compact one-log-table' aria-label='Redacted reliquary-one structured events'>
+      <thead><tr><th>age</th><th>window</th><th>event</th><th>classification</th><th>summary</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
 def render_scoreboard_html() -> str:
     """Top-of-dashboard score strip: window outcome + EMA in one glance."""
     with _lock:
@@ -3675,6 +7028,472 @@ def render_frontier_html() -> str:
 """
 
 
+def render_standalone_mining_truth_html() -> str:
+    """Render the authoritative standalone miner funnel and identity."""
+    with _lock:
+        boxes = [
+            box
+            for box in _boxes
+            if getattr(box, "standalone_telemetry_path", "")
+        ]
+        chain_entries = {
+            str(getattr(entry, "hotkey", "") or ""): entry
+            for entry in _chain.hotkeys
+        }
+        validator = _vs
+    if not boxes:
+        return ""
+
+    def cell(value: object) -> str:
+        return "—" if value is None else str(value)
+
+    rows: list[str] = []
+    comparison_rows: list[str] = []
+    for box in boxes:
+        certification = _active_standalone_certification(box)
+        certification_gpu = certification.get("gpu", {})
+        certification_gpu = (
+            certification_gpu
+            if isinstance(certification_gpu, dict)
+            else {}
+        )
+        certification_identity = certification.get("identity", {})
+        certification_identity = (
+            certification_identity
+            if isinstance(certification_identity, dict)
+            else {}
+        )
+        telemetry = getattr(box, "standalone_telemetry", {})
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
+        if certification:
+            # A certification process cannot inherit a previous miner funnel,
+            # even if a caller constructed an inconsistent cached object.
+            telemetry = {}
+        funnel = telemetry.get("funnel")
+        funnel = funnel if isinstance(funnel, dict) else {}
+        supervisor = getattr(box, "standalone_supervisor", {})
+        supervisor = supervisor if isinstance(supervisor, dict) else {}
+        manifest_profile = telemetry.get("manifest_profile")
+        manifest_profile = (
+            manifest_profile if isinstance(manifest_profile, dict) else {}
+        )
+        controller_authority = _registry_controller_authority(box)
+        active_profile = supervisor.get("active")
+        active_profile = (
+            active_profile if isinstance(active_profile, dict) else None
+        )
+        if controller_authority and box.proc_alive:
+            # The digest-bound registry names the controller that actually
+            # owns submission authority.  A transition supervisor is useful
+            # history, but its previous checkpoint must not override this
+            # process-bound manifest after a completed cutover.
+            active_profile = manifest_profile
+        elif active_profile is None and box.proc_alive:
+            active_profile = manifest_profile
+        advertised_profile = {
+            "protocol_version": getattr(validator, "protocol_version", 0),
+            "generation_profile_id": getattr(
+                validator, "generation_profile_id", ""
+            ),
+            "generation_contract_sha256": getattr(
+                validator, "generation_contract_sha256", ""
+            ),
+            "checkpoint_repo_id": getattr(
+                validator, "checkpoint_repo_id", ""
+            ),
+            "checkpoint_revision": getattr(
+                validator, "checkpoint_revision", ""
+            ),
+            "checkpoint_profile_sha256": getattr(
+                validator, "checkpoint_profile_sha256", ""
+            ),
+            "validator_image_revision": getattr(
+                validator, "image_revision", ""
+            ),
+            "window_n": getattr(validator, "window", 0),
+        }
+        chain_entry = chain_entries.get(box.hotkey)
+        uid = (
+            str(getattr(chain_entry, "uid", "—"))
+            if chain_entry is not None
+            else "unregistered"
+        )
+        fresh = bool(getattr(box, "standalone_fresh", False))
+        lifecycle = telemetry.get("window_lifecycle")
+        lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+        lifecycle_status = str(lifecycle.get("status") or "").upper()
+        if certification:
+            tone = "var(--yellow)"
+            status = (
+                "certifying · "
+                f"{certification.get('phase') or 'transition'}"
+            )
+            status_sub = (
+                "non-mining · "
+                + (
+                    "wallet-free · "
+                    if certification.get("service_unit")
+                    else ""
+                )
+                + "submit-disabled · "
+                +
+                f"runner {int(certification.get('runner_pid') or 0)} · "
+                f"worker {int(certification.get('worker_pid') or 0)} · "
+                f"GPU {int(certification_gpu.get('utilization_pct') or 0)}% "
+                f"{int(certification_gpu.get('memory_used_mb') or 0)//1024}/"
+                f"{int(certification_gpu.get('memory_total_mb') or 0)//1024} GB"
+            )
+        else:
+            if not box.proc_alive:
+                supervisor_phase = str(
+                    supervisor.get("phase")
+                    or supervisor.get("state")
+                    or ""
+                )
+                tone = "var(--yellow)"
+                status = (
+                    f"fenced · {supervisor_phase.lower()}"
+                    if supervisor_phase
+                    else "fenced · no mining unit"
+                )
+            elif not fresh:
+                tone = "var(--red)"
+                status = str(
+                    getattr(box, "standalone_error", "") or "stale"
+                )
+            elif lifecycle_status == "RECOVERING":
+                tone = "var(--yellow)"
+                status = "recovering"
+            elif lifecycle_status == "STALLED":
+                tone = "var(--red)"
+                status = "stalled"
+            elif lifecycle_status in {"READY", "ACTIVE"}:
+                tone = "var(--green)"
+                status = lifecycle_status.lower()
+            else:
+                tone = "var(--green)"
+                status = "fresh"
+            heartbeat_age = lifecycle.get("heartbeat_age_seconds")
+            status_sub = (
+                f"file {getattr(box, 'standalone_age_s', -1.0):.1f}s"
+                f" · progress {getattr(box, 'standalone_progress_age_s', -1.0):.1f}s"
+                + (
+                    f" · heartbeat {float(heartbeat_age):.1f}s"
+                    if isinstance(heartbeat_age, (int, float))
+                    and not isinstance(heartbeat_age, bool)
+                    else ""
+                )
+            )
+            blockers = supervisor.get("blockers")
+            if (
+                not controller_authority
+                and isinstance(blockers, list)
+                and blockers
+            ):
+                status_sub += " · " + ", ".join(
+                    str(value) for value in blockers[:2]
+                )
+        terminal = funnel.get("terminal_final")
+        unresolved = funnel.get("terminal_unresolved")
+        attempts = funnel.get("attempts")
+        if terminal is not None:
+            pending = max(int(attempts or 0) - int(terminal), 0)
+            terminal_text = f"{terminal}/{pending}"
+        elif unresolved is not None:
+            terminal_text = f"—/{unresolved}"
+        else:
+            terminal_text = "—"
+        selected_rate = telemetry.get(
+            "selected_slots_per_physical_gpu_hour"
+        )
+        rewarded_rate = telemetry.get(
+            "rewarded_slots_per_physical_gpu_hour"
+        )
+        live_unit = (
+            "no mining unit"
+            if certification or not box.proc_alive
+            else str(getattr(box, "active_unit", "") or box.unit or "—")
+        )
+        miner_source = (
+            str(certification_identity.get("miner_source_revision") or "—")
+            if certification
+            else str(getattr(box, "miner_source_revision", "") or "—")
+        )
+        validator_source = (
+            str(
+                certification_identity.get(
+                    "validator_source_revision"
+                ) or "—"
+            )
+            if certification
+            else str(
+                getattr(box, "reliquary_source_revision", "") or "—"
+            )
+        )
+        checkpoint_n = (
+            int(certification_identity.get("checkpoint_n") or 0)
+            if certification
+            else int(getattr(box, "runtime_checkpoint_n", 0) or 0)
+        )
+        advertised_protocol = int(
+            advertised_profile.get("protocol_version") or 0
+        )
+        advertised_profile_id = str(
+            advertised_profile.get("generation_profile_id") or "unknown"
+        )
+        advertised_contract = str(
+            advertised_profile.get("generation_contract_sha256") or ""
+        )
+        active_protocol = (
+            int(active_profile.get("protocol_version") or 0)
+            if isinstance(active_profile, dict)
+            else 0
+        )
+        active_profile_id = (
+            str(active_profile.get("generation_profile_id") or "unknown")
+            if isinstance(active_profile, dict)
+            else "none"
+        )
+        historical_protocol = int(
+            manifest_profile.get("protocol_version") or 2
+        )
+        historical_profile_id = str(
+            manifest_profile.get("generation_profile_id")
+            or "legacy-unscoped"
+        )
+        profile_cell = (
+            f"advertised v{advertised_protocol or '?'} "
+            f"{advertised_profile_id}"
+            f"<div class='dim mono small'>contract "
+            f"{html.escape(advertised_contract[:12] or '—')}</div>"
+            f"<div class='small'>active "
+            f"{('v' + str(active_protocol) + ' ') if active_protocol else ''}"
+            f"{html.escape(active_profile_id)}</div>"
+            f"<div class='dim small'>historical v{historical_protocol} "
+            f"{html.escape(historical_profile_id)}</div>"
+        )
+        advertised_checkpoint = (
+            f"n{int(getattr(validator, 'checkpoint_n', 0) or 0)} "
+            f"{str(advertised_profile.get('checkpoint_revision') or '')[:12]}"
+        )
+        identity_label = "" if box.proc_alive else "historical "
+        checkpoint_revision = (
+            str(certification_identity.get("checkpoint_revision") or "—")
+            if certification
+            else str(
+                getattr(box, "runtime_checkpoint_revision", "") or "—"
+            )
+        )
+        physical_gpu_hours_text = (
+            "—"
+            if certification
+            else f"{float(telemetry.get('physical_gpu_hours') or 0.0):.3f}"
+        )
+        selected_rate_text = (
+            "—"
+            if certification
+            else f"{float(selected_rate or 0.0):.3f}"
+        )
+        rewarded_rate_text = (
+            "—"
+            if certification
+            else f"{float(rewarded_rate or 0.0):.3f}"
+        )
+        latest_window = telemetry.get("latest_window")
+        latest_window_activity = (
+            "requested · completed groups "
+            f"{int(funnel.get('generation_complete') or 0)}"
+            if isinstance(latest_window, int)
+            and not isinstance(latest_window, bool)
+            else ""
+        )
+        rows.append(f"""
+<tr>
+  <td><span class="lbl" style="color:{box.color}">{html.escape(box.label)}</span>
+    <div class="dim small mono">{html.escape(live_unit)}</div>
+  </td>
+  <td class="mono" style="color:{tone}">{html.escape(status)}
+    <div class="dim small">{html.escape(status_sub)}</div>
+  </td>
+  <td class="num">{cell(latest_window)}
+    <div class="dim small">{html.escape(latest_window_activity)}</div>
+    <div class="dim small">advertised w{int(advertised_profile.get("window_n") or 0)}</div>
+  </td>
+  <td class="mono small">{html.escape(box.hotkey or "—")}</td>
+  <td class="num">{html.escape(uid)}</td>
+  <td class="mono small">{html.escape(str(getattr(box, "operator", "") or "—"))}</td>
+  <td class="mono small">{identity_label}{html.escape(miner_source)}
+    <div class="dim">{identity_label}validator {html.escape(validator_source)}</div>
+    <div class="dim">advertised validator {html.escape(str(advertised_profile.get("validator_image_revision") or "—"))}</div>
+  </td>
+  <td class="mono small">{identity_label}n{checkpoint_n}
+    <div class="dim">{html.escape(checkpoint_revision)}</div>
+    <div class="dim">advertised {html.escape(advertised_checkpoint)}</div>
+  </td>
+  <td class="mono small">{profile_cell}</td>
+  <td class="num">{cell(funnel.get("attempts"))}</td>
+  <td class="num">{cell(funnel.get("natural_complete_m8"))}</td>
+  <td class="num">{cell(funnel.get("local_eligible"))}</td>
+  <td class="num">{cell(funnel.get("precommit_accepted"))}</td>
+  <td class="num">{cell(funnel.get("reveal_accepted"))}</td>
+  <td class="num">{cell(funnel.get("pool_accepted"))}</td>
+  <td class="num">{cell(funnel.get("network_proof_passed"))}</td>
+  <td class="num">{cell(funnel.get("selected"))}</td>
+  <td class="num">{cell(funnel.get("rewarded"))}</td>
+  <td class="num">{terminal_text}</td>
+  <td class="num">{physical_gpu_hours_text}</td>
+  <td class="num">{selected_rate_text}</td>
+  <td class="num">{rewarded_rate_text}</td>
+</tr>""")
+        scopes = telemetry.get("comparison_scopes")
+        scopes = scopes if isinstance(scopes, dict) else {}
+        for scope_name in ("active_profile", "release", "latest_six", "lifetime"):
+            scope = scopes.get(scope_name)
+            if not isinstance(scope, dict):
+                continue
+            scope_funnel = scope.get("funnel")
+            scope_funnel = (
+                scope_funnel if isinstance(scope_funnel, dict) else {}
+            )
+            quota = scope.get("quota")
+            quota = quota if isinstance(quota, dict) else {}
+            timings = scope.get("timings_ms")
+            timings = timings if isinstance(timings, dict) else {}
+            per_gpu = scope.get("per_gpu")
+            per_gpu = per_gpu if isinstance(per_gpu, dict) else {}
+
+            def p95(
+                timing_source: dict[str, object],
+                *names: str,
+            ) -> str:
+                values = []
+                for name in names:
+                    row = timing_source.get(name)
+                    if isinstance(row, dict) and isinstance(
+                        row.get("p95"), (int, float)
+                    ):
+                        values.append(float(row["p95"]))
+                return (
+                    f"{max(values):.0f}"
+                    if values
+                    else "—"
+                )
+
+            window_start = scope.get("window_start")
+            window_end = scope.get("window_end")
+            window_text = (
+                f"w{int(window_start)}–{int(window_end)}"
+                if isinstance(window_start, int)
+                and isinstance(window_end, int)
+                else "—"
+            )
+            release_id = str(scope.get("release_id") or "")
+            if scope_name == "active_profile":
+                scope_label = "active profile"
+            elif scope_name == "release":
+                scope_label = f"historical v{historical_protocol} · release {release_id[:10]}"
+            elif scope_name == "latest_six":
+                scope_label = f"historical v{historical_protocol} · latest 6 completed"
+            else:
+                scope_label = f"historical v{historical_protocol} · lifetime"
+            for gpu, gpu_row in per_gpu.items():
+                if not isinstance(gpu_row, dict):
+                    continue
+                gpu_timings = gpu_row.get("timings_ms")
+                gpu_timings = (
+                    gpu_timings
+                    if isinstance(gpu_timings, dict) and gpu_timings
+                    else timings
+                )
+                gpu_quota = gpu_row.get("quota")
+                gpu_quota = (
+                    gpu_quota
+                    if isinstance(gpu_quota, dict)
+                    else quota
+                )
+                quota_occupancy = gpu_quota.get("peak_occupancy")
+                quota_text = (
+                    f"{100.0 * float(quota_occupancy):.0f}%"
+                    if isinstance(quota_occupancy, (int, float))
+                    else "—"
+                )
+                quota_peak = cell(gpu_quota.get("peak_effective"))
+                quota_capacity = cell(
+                    gpu_quota.get("capacity_per_hotkey")
+                )
+                quota_drops = cell(
+                    gpu_quota.get("dropped_solely_for_quota")
+                )
+                comparison_rows.append(f"""
+<tr>
+  <td><span class="lbl" style="color:{box.color}">{html.escape(box.label)}</span></td>
+  <td class="mono">{html.escape(scope_label)}
+    <div class="dim small">{html.escape(window_text)}</div>
+  </td>
+  <td class="mono small" title="{html.escape(str(gpu))}">{html.escape(str(gpu)[-12:])}</td>
+  <td class="num">{cell(gpu_row.get("generated_natural_m8"))}</td>
+  <td class="num">{cell(gpu_row.get("raw_k2"))}</td>
+  <td class="num">{cell(gpu_row.get("malformed_k2"))}/{cell(gpu_row.get("distribution_dropped_k2"))}</td>
+  <td class="num">{cell(gpu_row.get("exact_preflight_passing_k2"))}</td>
+  <td class="num">{cell(gpu_row.get("precommit_accepted"))}</td>
+  <td class="num">{cell(gpu_row.get("pool_accepted"))}</td>
+  <td class="num">{cell(gpu_row.get("selected"))}</td>
+  <td class="num">{cell(gpu_row.get("rewarded"))}</td>
+  <td class="num">{p95(gpu_timings, "grading", "local_gate")}</td>
+  <td class="num">{p95(gpu_timings, "proof", "local_proof")}</td>
+  <td class="num">{p95(gpu_timings, "transport", "precommit", "reveal", "provisional")}</td>
+  <td class="num">{html.escape(quota_text)}
+    <div class="dim small">peak {quota_peak}/{quota_capacity} · drops {quota_drops}</div>
+  </td>
+  <td class="num">{float(gpu_row.get("physical_gpu_hours") or 0.0):.3f}</td>
+  <td class="num">{float(gpu_row.get("selected_slots_per_physical_gpu_hour") or 0.0):.3f}</td>
+  <td class="num">{float(gpu_row.get("rewarded_slots_per_physical_gpu_hour") or 0.0):.3f}</td>
+</tr>""")
+    comparison_panel = (
+        f"""
+<div class="panel">
+  <h2>Comparable GPU yield <span class="dim small">active profile + explicitly historical scopes</span></h2>
+  <table class="grid compact pipeline-table">
+    <thead><tr>
+      <th>miner</th><th>scope / windows</th><th>physical GPU</th>
+      <th class="num">natural M=8</th><th class="num">raw k2</th>
+      <th class="num">malformed/dist.</th><th class="num">exact k2</th>
+      <th class="num">precommit</th><th class="num">pool</th>
+      <th class="num">selected</th><th class="num">rewarded</th>
+      <th class="num">grade p95 ms</th><th class="num">proof p95 ms</th>
+      <th class="num">transport p95 ms</th><th class="num">quota</th>
+      <th class="num">GPUh</th><th class="num">selected/GPUh</th>
+      <th class="num">rewarded/GPUh</th>
+    </tr></thead>
+    <tbody>{''.join(comparison_rows)}</tbody>
+  </table>
+</div>
+"""
+        if comparison_rows
+        else ""
+    )
+    return f"""
+<div class="panel">
+  <h2>Standalone mining truth <span class="dim small">atomic miner telemetry · fail-stale</span></h2>
+  <table class="grid compact pipeline-table">
+    <thead><tr>
+      <th>worker / live unit</th><th>snapshot</th><th class="num">window</th>
+      <th>hotkey</th><th class="num">UID</th><th>operator</th>
+      <th>miner / validator source</th><th>checkpoint</th><th>profile truth</th>
+      <th class="num">attempts</th><th class="num">natural M=8</th>
+      <th class="num">eligible</th><th class="num">precommit</th>
+      <th class="num">reveal</th><th class="num">pool</th>
+      <th class="num">network proof</th><th class="num">selected</th>
+      <th class="num">rewarded</th><th class="num">terminal/pending</th>
+      <th class="num">physical GPUh</th><th class="num">selected/GPUh</th>
+      <th class="num">rewarded/GPUh</th>
+    </tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+{comparison_panel}"""
+
+
 def render_pipeline_html() -> str:
     """Per-service fresh-miner pipeline table, including RTX8 shards."""
     with _lock:
@@ -3686,11 +7505,37 @@ def render_pipeline_html() -> str:
 
     rows = []
     for b in boxes:
+        certification = _active_standalone_certification(b)
+        certification_gpu = certification.get("gpu", {})
+        certification_gpu = (
+            certification_gpu
+            if isinstance(certification_gpu, dict)
+            else {}
+        )
+        certification_identity = certification.get("identity", {})
+        certification_identity = (
+            certification_identity
+            if isinstance(certification_identity, dict)
+            else {}
+        )
         code_auction = _box_code_auction_details(b, vs)
+        crossover = _box_code_selector_crossover_details(b, vs)
+        overlap_abba = _box_code_overlap_abba_details(b, vs)
         stage_title = ""
         if getattr(b, "quarantine_active", False):
             stage = "quarantined"
             stage_color = "var(--red)"
+        elif certification:
+            stage = "certifying"
+            stage_color = "var(--yellow)"
+            stage_title = (
+                "exact standalone certification · submit-disabled · "
+                f"phase={certification.get('phase') or 'transition'} · "
+                f"runner pid={int(certification.get('runner_pid') or 0)} · "
+                f"worker pid={int(certification.get('worker_pid') or 0)} · "
+                f"GPU-bound={bool(certification.get('gpu_process_bound'))} · "
+                "no active mining unit and no mining funnel"
+            )
         elif (b.unit or b.unit_candidates) and not getattr(
             b, "env_file_ok", False
         ):
@@ -3699,12 +7544,100 @@ def render_pipeline_html() -> str:
         elif not b.proc_alive:
             stage = "down"
             stage_color = "var(--red)"
+        elif getattr(b, "standalone_telemetry_path", "") and not getattr(
+            b, "standalone_fresh", False
+        ):
+            stage = "telemetry-stale"
+            stage_color = "var(--red)"
+            stage_title = str(
+                getattr(b, "standalone_error", "") or "atomic snapshot stale"
+            )
+        elif getattr(b, "standalone_telemetry_path", ""):
+            telemetry = getattr(b, "standalone_telemetry", {})
+            telemetry = telemetry if isinstance(telemetry, dict) else {}
+            lifecycle = telemetry.get("window_lifecycle")
+            lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+            lifecycle_status = str(lifecycle.get("status") or "").upper()
+            if lifecycle_status == "STALLED":
+                stage = "stalled"
+                stage_color = "var(--red)"
+                stage_title = "Math controller lifecycle is stalled"
+            elif lifecycle_status == "RECOVERING":
+                stage = "recovering"
+                stage_color = "var(--yellow)"
+                latest_run = lifecycle.get("latest_run")
+                latest_run = (
+                    latest_run if isinstance(latest_run, dict) else {}
+                )
+                stage_title = " · ".join(
+                    part
+                    for part in (
+                        "Math controller lifecycle is recovering",
+                        str(latest_run.get("failure_stage") or ""),
+                        str(latest_run.get("failure_type") or ""),
+                    )
+                    if part
+                )
+            elif lifecycle_status == "READY":
+                stage = "ready"
+                stage_color = "var(--green)"
+                stage_title = "fresh Math telemetry · ready for the next window"
+            elif b.miner_state == "active_generation":
+                stage = "generating"
+                stage_color = "var(--green)"
+                stage_title = (
+                    "attested current-window generation is active · "
+                    "submission funnel remains zero until atomic completion"
+                )
+            else:
+                stage = "mining"
+                stage_color = "var(--green)"
+                stage_title = (
+                    "fresh Math telemetry · active window"
+                    if lifecycle_status == "ACTIVE"
+                    else "fresh standalone atomic mining telemetry"
+                )
+        elif getattr(b, "miner_kind", "") == "reliquary_one":
+            v5 = _box_v5_host_telemetry(b)
+            events = v5.get("fleet_events", {})
+            events = events if isinstance(events, dict) else {}
+            if events.get("complete_30m") is True:
+                stage = "v5-host-events"
+                stage_color = "var(--green)"
+                stage_title = (
+                    "Per-host V5 fleet-events cover the window; accepted=True "
+                    "rows are observed admissions only, and rejected outcomes "
+                    "remain unavailable"
+                )
+            else:
+                stage = "v5-unattributed"
+                stage_color = "var(--yellow)"
+                stage_title = (
+                    "V5 host event coverage is incomplete; shared-hotkey "
+                    "validator totals remain explicitly unattributable"
+                )
         elif code_auction["applicable"] and not code_auction["ok"]:
             stage = "auction-blocked"
             stage_color = "var(--red)"
             stage_title = " · ".join(
                 _readiness_issue_label(str(issue))
                 for issue in code_auction.get("issues", [])
+            )
+        elif crossover["configured"] and not crossover["ok"]:
+            stage = "selector-blocked"
+            stage_color = "var(--red)"
+            stage_title = " · ".join(
+                _readiness_issue_label(
+                    f"code_selector_crossover:{issue}"
+                )
+                for issue in crossover.get("issues", [])
+            )
+        elif overlap_abba["configured"] and not overlap_abba["ok"]:
+            stage = "selector-blocked"
+            stage_color = "var(--red)"
+            stage_title = " · ".join(
+                _readiness_issue_label(f"code_overlap_abba:{issue}")
+                for issue in overlap_abba.get("issues", [])
             )
         elif b.batch_filled_30m and b.acpt_30m == 0:
             stage = "late"
@@ -3726,29 +7659,80 @@ def render_pipeline_html() -> str:
             stage_color = "var(--dim)"
 
         hk = _short_hotkey(b.hotkey)
-        environment = getattr(b, "miner_environment", "") or "—"
-        engine_mode = getattr(b, "engine_mode", "") or "—"
+        environment = (
+            str(certification_identity.get("environment") or "—")
+            if certification
+            else getattr(b, "miner_environment", "") or "—"
+        )
+        engine_mode = (
+            "certifier" if certification
+            else getattr(b, "engine_mode", "") or "—"
+        )
         protocol = getattr(b, "protocol_profile", "") or "—"
         parity = (
-            "protocol+runtime"
+            "exact evidence"
+            if certification
+            else "protocol+runtime"
             if getattr(b, "protocol_profile", "") and getattr(b, "runtime_parity_ok", False)
             else "protocol only"
             if getattr(b, "protocol_profile", "")
             else "pending"
         )
         parity_color = (
+            "var(--yellow)" if parity == "exact evidence" else
             "var(--green)" if parity == "protocol+runtime" else
             "var(--yellow)" if parity == "protocol only" else
             "var(--dim)"
         )
         source_revs = "/".join(
             rev[:8] for rev in (
-                getattr(b, "miner_source_revision", ""),
-                getattr(b, "reliquary_source_revision", ""),
+                str(
+                    certification_identity.get(
+                        "miner_source_revision"
+                    ) or ""
+                )
+                if certification
+                else getattr(b, "miner_source_revision", ""),
+                str(
+                    certification_identity.get(
+                        "validator_source_revision"
+                    ) or ""
+                )
+                if certification
+                else getattr(b, "reliquary_source_revision", ""),
             ) if rev
         ) or "—"
-        final_accept = int(getattr(b, "final_accept_30m", b.acpt_30m) or 0)
-        final_reject = int(getattr(b, "final_reject_30m", b.rej_30m) or 0)
+        display_gpu_util = (
+            int(certification_gpu.get("utilization_pct") or 0)
+            if certification
+            else b.gpu_util
+        )
+        display_gpu_mem_mb = (
+            int(certification_gpu.get("memory_used_mb") or 0)
+            if certification
+            else b.gpu_mem_mb
+        )
+        display_gpu_total_mb = (
+            int(certification_gpu.get("memory_total_mb") or 1)
+            if certification
+            else b.gpu_total_mb
+        )
+        final_accept_value = getattr(b, "final_accept_30m", b.acpt_30m)
+        final_reject_value = getattr(b, "final_reject_30m", b.rej_30m)
+        final_accept = (
+            int(final_accept_value)
+            if isinstance(final_accept_value, int)
+            and not isinstance(final_accept_value, bool)
+            else None
+        )
+        final_reject = (
+            int(final_reject_value)
+            if isinstance(final_reject_value, int)
+            and not isinstance(final_reject_value, bool)
+            else None
+        )
+        final_accept_text = "—" if final_accept is None else str(final_accept)
+        final_reject_text = "—" if final_reject is None else str(final_reject)
         live_window = b.miner_window
         if (
             getattr(b, "reference_ready", False)
@@ -3756,6 +7740,112 @@ def render_pipeline_html() -> str:
             and vs.window
         ):
             live_window = vs.window
+        current_abba = overlap_abba.get("current")
+        if isinstance(current_abba, list) and current_abba:
+            arm_parts = []
+            detail_parts = []
+            for lane in current_abba:
+                slot = int(lane.get("shard_slot", 0) or 0)
+                latest = lane.get("latest_attempt")
+                latest = latest if isinstance(latest, dict) else {}
+                itt = str(latest.get("itt_arm") or "?")
+                execution = str(latest.get("execution_arm") or "?")
+                arm = itt[:1].upper()
+                if execution != itt:
+                    arm += "→" + execution[:1].upper()
+                arm_parts.append(f"s{slot}:{arm}")
+                fallbacks = lane.get("fallback_counts")
+                fallbacks = (
+                    fallbacks if isinstance(fallbacks, dict) else {}
+                )
+                fallback_text = ",".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(fallbacks.items())
+                ) or "none"
+                detail_parts.append(
+                    f"s{slot} window attempts="
+                    f"{int(lane.get('attempt_count', 0) or 0)} "
+                    f"activations="
+                    f"{int(lane.get('activation_count', 0) or 0)} "
+                    f"selected-overlap="
+                    f"{int(lane.get('selected_overlap_count', 0) or 0)} "
+                    f"fallbacks={fallback_text} · latest attempt: "
+                    f"ITT={itt} execution={execution} "
+                    f"policy={latest.get('selector_policy') or '—'} "
+                    f"overlap={latest.get('overlap_candidate_count', 0)} "
+                    f"selected={bool(latest.get('selected_overlap'))} "
+                    f"activated={bool(latest.get('activated'))} "
+                    f"fallback={latest.get('fallback_reason') or 'none'}"
+                )
+            contract = overlap_abba.get("contract")
+            contract = contract if isinstance(contract, dict) else {}
+            selector_label = "ABBA " + " ".join(arm_parts)
+            selector_color = "var(--green)"
+            selector_title = (
+                f"{contract.get('experiment_id') or 'AB/BA'} · "
+                f"contract={contract.get('sha256') or '—'} · "
+                f"windows={contract.get('start_window', '—')}-"
+                f"{contract.get('end_window', '—')} · "
+                + " · ".join(detail_parts)
+            )
+        elif overlap_abba["configured"] and overlap_abba["ok"]:
+            contract = overlap_abba.get("contract")
+            contract = contract if isinstance(contract, dict) else {}
+            selector_label = (
+                "ABBA "
+                + str(overlap_abba.get("current_status") or "pending")
+            )
+            selector_color = "var(--yellow)"
+            selector_title = (
+                f"{contract.get('experiment_id') or 'AB/BA'} · "
+                f"contract={contract.get('sha256') or '—'} · "
+                f"windows={contract.get('start_window', '—')}-"
+                f"{contract.get('end_window', '—')}"
+            )
+        elif overlap_abba["configured"]:
+            selector_label = "ABBA invalid"
+            selector_color = "var(--red)"
+            selector_title = " · ".join(
+                str(issue) for issue in overlap_abba.get("issues", [])
+            )
+        else:
+            current_crossover = crossover.get("current")
+            if isinstance(current_crossover, dict):
+                selector_label = str(
+                    current_crossover.get("execution_arm") or "unknown"
+                )
+                selector_color = (
+                    "var(--green)"
+                    if selector_label == "treatment"
+                    else "var(--cyan)"
+                )
+                selector_title = (
+                    f"CURRENT exact validator window "
+                    f"{int(current_crossover.get('validator_window', 0) or 0)} · "
+                    f"ITT={current_crossover.get('itt_arm') or '—'} · "
+                    f"execution={selector_label} · "
+                    f"validation={current_crossover.get('validation_status') or '—'}"
+                )
+            elif crossover["configured"] and crossover["ok"]:
+                selector_label = str(
+                    crossover.get("current_status") or "pending"
+                )
+                selector_color = "var(--yellow)"
+                selector_title = (
+                    "Crossover artifacts are valid; no exact fresh OPEN "
+                    "validator window has a matching persisted decision. "
+                    "Historical arms are intentionally not painted as current."
+                )
+            elif crossover["configured"]:
+                selector_label = "invalid"
+                selector_color = "var(--red)"
+                selector_title = " · ".join(
+                    str(issue) for issue in crossover.get("issues", [])
+                )
+            else:
+                selector_label = "off"
+                selector_color = "var(--dim)"
+                selector_title = "No process-bound selector experiment"
         rows.append(f"""
 <tr>
   <td><span class="lbl" style="color:{b.color}">{html.escape(b.label)}</span></td>
@@ -3764,12 +7854,13 @@ def render_pipeline_html() -> str:
   <td class="mono" title="service configuration: {html.escape(getattr(b, 'env_file_error', '') or 'readable')}">{html.escape(environment)}</td>
   <td class="mono dim">{html.escape(engine_mode)}</td>
   <td class="mono" style="color:{parity_color}" title="profile={html.escape(protocol)}">{html.escape(parity)}</td>
-  <td class="num">{b.gpu_util}%</td>
-  <td class="num dim">{b.gpu_mem_mb//1024}/{b.gpu_total_mb//1024} GB</td>
+  <td class="mono" style="color:{selector_color}" title="{html.escape(selector_title)}">{html.escape(selector_label)}</td>
+  <td class="num">{display_gpu_util}%</td>
+  <td class="num dim">{display_gpu_mem_mb//1024}/{display_gpu_total_mb//1024} GB</td>
   <td class="num">{b.miner_ready}</td>
   <td class="num dim">{b.miner_inflight}</td>
   <td class="num">{b.miner_submitted_this_win}</td>
-  <td class="num" title="Direct /verdicts pool/proof outcomes in the last 30 minutes; selection and reward are reported separately from R2">{final_accept}/{final_reject}</td>
+  <td class="num" title="V5 rows show observed host-local admissions as accepted/—; fleet-events does not provide a complete rejected-outcome source. Otherwise shared-hotkey /verdicts totals are not assigned to a host. Canonical selection/reward remain R2-only.">{final_accept_text}/{final_reject_text}</td>
   <td class="num dim">{b.fresh_built_30m}</td>
   <td class="num dim">{b.cache_fwd_30m}/{b.prefinalized_30m}</td>
   <td class="num" style="color:{'var(--yellow)' if b.late_grace_30m else 'var(--dim)'}">{b.late_grace_30m}</td>
@@ -3779,12 +7870,13 @@ def render_pipeline_html() -> str:
   <td class="mono dim" title="miner-pro/reliquary source revisions">{html.escape(source_revs)}</td>
 </tr>""")
 
-    return f"""
+    standalone = render_standalone_mining_truth_html()
+    return standalone + f"""
 <div class="panel">
   <h2>GPU/reference pipeline <span class="dim small">parity · generation · pool/proof verdicts</span></h2>
   <table class="grid compact pipeline-table">
     <thead><tr>
-      <th>worker</th><th>hotkey</th><th>stage</th><th>env</th><th>engine</th><th>parity</th><th class="num">util</th>
+      <th>worker</th><th>hotkey</th><th>stage</th><th>env</th><th>engine</th><th>parity</th><th title="Current only when a fresh exact OPEN validator window matches persisted process-bound selector assignments">selector</th><th class="num">util</th>
       <th class="num">mem</th><th class="num">ready</th><th class="num">inflight</th>
       <th class="num">sent</th><th class="num">pool a/r</th><th class="num">fresh/30m</th><th class="num">cache/pre</th>
       <th class="num">grace</th><th class="num">batch_fill</th><th class="num">last build</th><th>state</th><th>source revs</th>
@@ -3912,8 +8004,17 @@ def render_fleet_summary_html() -> str:
     targets = _configured_target_rows(chain_hotkeys, chain_seen)
     target_hotkeys = {str(t["hotkey"]) for t in targets}
     target_boxes = [b for b in boxes if b.hotkey in target_hotkeys]
-    target_acpt_30m = sum(b.acpt_30m for b in target_boxes)
-    target_reject_30m = sum(b.rej_30m + b.late_drops_30m for b in target_boxes)
+    target_acpt_30m = _sum_available_counts(
+        b.acpt_30m for b in target_boxes
+    )
+    target_reject_30m = _sum_available_counts(
+        (
+            None
+            if b.rej_30m is None
+            else b.rej_30m + b.late_drops_30m
+        )
+        for b in target_boxes
+    )
     primary_target = targets[0] if targets else None
     if primary_target:
         target_label = str(primary_target["label"])
@@ -3942,8 +8043,8 @@ def render_fleet_summary_html() -> str:
         target_status = "missing"
         target_status_color = "var(--red)"
 
-    total_acpt_30m = sum(b.acpt_30m for b in boxes)
-    total_acpt_60m = sum(b.acpt_60m for b in boxes)
+    total_acpt_30m = _sum_available_counts(b.acpt_30m for b in boxes)
+    total_acpt_60m = _sum_available_counts(b.acpt_60m for b in boxes)
     total_oom_60m = sum(b.oom_60m for b in boxes)
     total_wm = sum(b.window_mismatch_30m for b in boxes)
     total_alive = sum(1 for b in boxes if b.proc_alive)
@@ -4069,6 +8170,9 @@ def render_fleet_summary_html() -> str:
             f"{sub_html}"
         )
 
+    def count_text(value: int | None) -> str:
+        return "—" if value is None else str(value)
+
     verdict_watch_warning = str(getattr(vs, "verdicts_warning", "") or "")
     verdict_watch_html = (
         "<div class='yellow small' role='status' style='margin-top:7px'>"
@@ -4089,14 +8193,14 @@ def render_fleet_summary_html() -> str:
         <td class="lbl">target</td>
         <td>{cell(html.escape(target_label), html.escape(target_sub), color="var(--amber)" if primary_target else "var(--red)")}</td>
         <td title="{html.escape(target_hotkey)}">{cell(html.escape(target_prefix), "active hotkey", color="var(--bone)")}</td>
-        <td>{cell(f"{target_acpt_30m}/{target_reject_30m}", "pool/reject+late", color="var(--green)" if target_acpt_30m else "var(--dim)")}</td>
+        <td>{cell(f"{count_text(target_acpt_30m)}/{count_text(target_reject_30m)}", "pool/reject+late", color="var(--green)" if target_acpt_30m else "var(--dim)")}</td>
         <td>{cell(target_status, "", color=target_status_color)}</td>
       </tr>
       <tr>
         <td class="lbl">fleet</td>
         <td>{cell(health_lbl, health_sub, color=health_color)}</td>
         <td>{cell(fmt_age(streak_s), "OOM-free", color=streak_color)}</td>
-        <td>{cell(str(total_acpt_30m), f"pool/30m · {total_acpt_60m}/60m", color="var(--green)")}</td>
+        <td>{cell(count_text(total_acpt_30m), f"pool/30m · {count_text(total_acpt_60m)}/60m", color="var(--green)" if total_acpt_30m else "var(--dim)")}</td>
         <td>{cell(html.escape(attention), "", color=attention_color)}</td>
       </tr>
       <tr>
@@ -4476,14 +8580,18 @@ def render_validator_html() -> str:
 
 def render_windows_html() -> str:
     with _lock:
-        windows = list(_windows)
-    if not windows:
+        all_windows = list(_windows)
+    if not all_windows:
         return "<div class='panel'><h2>Recent windows</h2><span class='dim'>R2 unavailable (set R2_ENDPOINT/R2_BUCKET)</span></div>"
+    windows = all_windows[:24]
+    score_context = all_windows[:72]
     rows = []
     completed = [
-        w for w in windows if getattr(w, "window_status", "completed") == "completed"
+        w
+        for w in score_context
+        if getattr(w, "window_status", "completed") == "completed"
     ]
-    aborted_count = len(windows) - len(completed)
+    aborted_count = len(score_context) - len(completed)
     total_ours = sum(w.ours for w in completed)
     total_slots = sum(w.total_batch for w in completed)
     pct = _share_pct(total_ours, total_slots)
@@ -4554,13 +8662,13 @@ def render_windows_html() -> str:
     summary = " ".join(summary_parts)
     return f"""
 <div class="panel">
-  <h2>Window history <span class="dim small">last {len(windows)}</span></h2>
+  <h2>Window history <span class="dim small">{len(windows)} shown · {len(score_context)}-window score context</span></h2>
   <div class="window-share-summary">{summary}</div>
   <table class="grid compact">
     <thead><tr><th>win</th><th>slot share</th><th class="num">reward %</th><th>rt₀</th><th>rejects</th></tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
-  <div class="total">TOTAL: <b style="color:{total_color}">{total_ours}/{total_slots} = {_fmt_pct(pct, total_slots)}</b></div>
+  <div class="total">{len(score_context)}-WINDOW TOTAL: <b style="color:{total_color}">{total_ours}/{total_slots} = {_fmt_pct(pct, total_slots)}</b></div>
 </div>
 """
 
@@ -5504,7 +9612,9 @@ def render_ema_leaderboard_html(top_n: int = 12, mode: str = "top") -> str:
     <thead><tr>
       <th class='num'>#</th><th aria-label='Target status'><span class='visually-hidden'>Target status</span></th><th>scope</th><th>hotkey</th>
       <th class='num'>weight</th>
-      <th class='num' title='Slots in last 12 windows'>last 12</th>
+      <th class='num' title='Selected slots in the last 12 sealed windows'>
+        selected slots · last 12
+      </th>
     </tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
@@ -5522,6 +9632,23 @@ def render_box_detail_html(label: str) -> str:
             "aria-label='Close miner details'>×</button>"
             f"<h3>unknown box: {html.escape(label)}</h3>"
         )
+    pregen_30m, _pregen_60m, pregen_source = _box_rolling_pregen(b)
+    pregen_30m_text = "—" if pregen_30m is None else str(pregen_30m)
+    pregen_title = (
+        "Exact rolling generation from this V5 host's fleet-events sidecar; "
+        "not shared-hotkey validator admission"
+        if pregen_source == "v5_fleet_events_generation"
+        else "V5 fleet-events does not cover a complete rolling generation "
+        "window yet; no zero is inferred"
+        if pregen_source == "v5_fleet_events_generation_unavailable"
+        else
+        "Exact rolling generation is unavailable for this standalone miner; "
+        "use its profile-scoped natural-M8 generation funnel"
+        if pregen_30m is None
+        else "Miner pregen rate (queue activity, not validator-confirmed)"
+    )
+    pool_30m_text = "—" if b.acpt_30m is None else str(b.acpt_30m)
+    pool_60m_text = "—" if b.acpt_60m is None else str(b.acpt_60m)
     pct = b.gpu_mem_mb * 100 // max(b.gpu_total_mb, 1)
     events = list(b.recent_lines)
     event_rows = []
@@ -5551,9 +9678,9 @@ def render_box_detail_html(label: str) -> str:
     <span class="kpi-mini">disk <b>{b.disk_used_pct}%</b></span>
   </div>
   <div class="kpi-row" style="margin-top:8px">
-    <span class="kpi-mini" title="Validator /verdicts pool/proof admissions; not selection or reward">pool/30m <b style="color:var(--green)">{b.acpt_30m}</b></span>
-    <span class="kpi-mini" title="Validator /verdicts pool/proof admissions in the last 60 min; R2 carries selection/reward">pool/60m <b>{b.acpt_60m}</b></span>
-    <span class="kpi-mini" title="Miner pregen rate (queue activity, NOT validator-confirmed)">pregen/30m <b class='dim'>{b.pregen_30m}</b></span>
+    <span class="kpi-mini" title="Observed host-local V5 admissions when the fleet-events tail covers the window; otherwise a shared-hotkey validator aggregate is not assigned to this box">pool/30m <b style="color:var(--green)">{pool_30m_text}</b></span>
+    <span class="kpi-mini" title="Observed host-local V5 admissions only; rejected outcomes remain unavailable, and R2 carries canonical selection/reward">pool/60m <b>{pool_60m_text}</b></span>
+    <span class="kpi-mini" data-pregen-source="{html.escape(pregen_source)}" title="{html.escape(pregen_title)}">pregen/30m <b class='dim'>{html.escape(pregen_30m_text)}</b></span>
     <span class="kpi-mini" title="Late drops — submissions lost to FIFO race before validation">late/30m <b style="color:{('var(--red)' if b.late_drops_30m > 0 else 'var(--dim)')}">{b.late_drops_30m}</b></span>
     <span class="kpi-mini">mean rt <b>{b.mean_accept_t_s:.0f}s</b></span>
     <span class="kpi-mini">skip/30m <b>{b.skip_30m}</b></span>
@@ -5646,6 +9773,11 @@ def compute_healthz(
     with _lock:
         boxes = list(_boxes)
         labs = list(_labs)
+        components = list(_components)
+        chain_entries = {
+            str(getattr(entry, "hotkey", "") or ""): entry
+            for entry in _chain.hotkeys
+        }
         vs = _vs
         windows = list(_windows)
         poll_at = _last_poll_at
@@ -5686,14 +9818,33 @@ def compute_healthz(
             "active_units": list(getattr(box, "active_units", []) or []),
             "active_lane": getattr(box, "active_lane", ""),
             "active_lanes": list(getattr(box, "active_lanes", []) or []),
+            "coordinated_unit_statuses": (
+                _coordinated_unit_status_payload(box)
+            ),
             "active_environment": getattr(box, "active_environment", ""),
             "active_pid": int(getattr(box, "active_pid", 0) or 0),
             "restarts": int(getattr(box, "restart_count", 0) or 0),
+            "restart_count_semantics": _box_restart_count_semantics(box),
             "unit_resolution_error": getattr(box, "unit_resolution_error", ""),
             "unexpected_active_units": list(
                 getattr(box, "unexpected_active_units", []) or []
             ),
+            "active_unit_registry": dict(
+                getattr(box, "active_unit_registry", {}) or {}
+            ),
+            "lane_status": _box_lane_status(box, validator_state=vs),
             "quarantine_active": bool(getattr(box, "quarantine_active", False)),
+            "standalone": {
+                "configured": bool(
+                    getattr(box, "standalone_telemetry_path", "")
+                ),
+                "fresh": bool(getattr(box, "standalone_fresh", False)),
+                "age_s": getattr(box, "standalone_age_s", -1.0),
+                "error": getattr(box, "standalone_error", ""),
+            },
+            "certification": dict(
+                getattr(box, "standalone_certification", {}) or {}
+            ),
             "issues": issues,
             "model": _box_model_details(box, vs),
             "code_auction": _box_code_auction_details(
@@ -5702,10 +9853,40 @@ def compute_healthz(
                 now=now,
                 health_stale_s=poll_limit,
             ),
+            "code_selector_crossover": (
+                _box_code_selector_crossover_details(
+                    box,
+                    vs,
+                    now=now,
+                    stale_after_s=poll_limit,
+                )
+            ),
+            "code_overlap_abba": _box_code_overlap_abba_details(
+                box,
+                vs,
+                now=now,
+                stale_after_s=poll_limit,
+            ),
         })
     # Lab status is additive observability only. A failed or idle offline lab
     # must never make the live miner fleet healthy or unhealthy.
-    lab_details = [_lab_payload(lab, now=now) for lab in labs]
+    lab_details = [
+        _lab_payload(
+            lab,
+            now=now,
+            validator_window=int(getattr(vs, "window", 0) or 0),
+        )
+        for lab in labs
+    ]
+    component_details = [
+        _component_payload(
+            component,
+            boxes=boxes,
+            chain_entries=chain_entries,
+            now=now,
+        )
+        for component in components
+    ]
 
     r2 = _r2_status_snapshot()
     r2_last_success = float(
@@ -5805,6 +9986,14 @@ def compute_healthz(
         "poll_fresh": poll_age is not None and poll_age <= poll_limit,
         "fleet_configured": bool(boxes),
         "fleet_ready": bool(boxes) and all(item["ok"] for item in box_details),
+        # Unattached components are prospective capacity. Once an immutable
+        # controller binding makes one part of the live topology, its health
+        # becomes a readiness requirement.
+        "attached_components_ready": all(
+            item["ok"]
+            for item in component_details
+            if item["controller_binding"]["attached"]
+        ),
         "validator_state_fresh": validator_state_is_fresh,
         "validator_health_fresh": health_is_fresh,
         "validator_verdicts_fresh": (
@@ -5843,6 +10032,7 @@ def compute_healthz(
             "r2": r2_age,
         },
         "fleet": box_details,
+        "components": component_details,
         "labs": lab_details,
         "validator": {
             "window": validator_window,
@@ -5880,13 +10070,23 @@ def render_export_json() -> dict:
     from settings import SETTINGS as runtime_settings
 
     with _lock:
-        chain_hotkeys = {getattr(h, "hotkey", "") for h in _chain.hotkeys}
+        validator_state = _vs
+        chain_by_hotkey = {
+            getattr(h, "hotkey", ""): h for h in _chain.hotkeys
+        }
+        chain_hotkeys = set(chain_by_hotkey)
         chain_seen = bool(_chain.last_fetch_at)
         watched_hotkeys = _watched_hotkey_rows()
         targets_data = _configured_target_rows(chain_hotkeys, chain_seen)
         boxes_data = [
             {
                 "label": b.label,
+                "miner_kind": getattr(b, "miner_kind", "legacy"),
+                "miner": (
+                    _reliquary_one_public_projection(b, list(_windows))
+                    if getattr(b, "miner_kind", "legacy") == "reliquary_one"
+                    else {}
+                ),
                 "alias": _display_ssh_alias(b.alias),
                 "unit": b.unit,
                 "configured_units": [
@@ -5902,6 +10102,9 @@ def render_export_json() -> dict:
                 "active_units": list(getattr(b, "active_units", []) or []),
                 "active_lane": getattr(b, "active_lane", ""),
                 "active_lanes": list(getattr(b, "active_lanes", []) or []),
+                "coordinated_unit_statuses": (
+                    _coordinated_unit_status_payload(b)
+                ),
                 "active_environment": getattr(b, "active_environment", ""),
                 "active_pid": int(getattr(b, "active_pid", 0) or 0),
                 "miner_unit_enablement": getattr(
@@ -5914,8 +10117,21 @@ def render_export_json() -> dict:
                 "unexpected_active_units": list(
                     getattr(b, "unexpected_active_units", []) or []
                 ),
+                "active_unit_registry": dict(
+                    getattr(b, "active_unit_registry", {}) or {}
+                ),
+                "lane_status": _box_lane_status(
+                    b,
+                    validator_state=validator_state,
+                ),
                 "env_file_ok": bool(getattr(b, "env_file_ok", False)),
                 "env_file_error": getattr(b, "env_file_error", ""),
+                "operator": getattr(b, "operator", ""),
+                "uid": (
+                    int(getattr(chain_by_hotkey[b.hotkey], "uid", -1))
+                    if b.hotkey in chain_by_hotkey
+                    else None
+                ),
                 "hotkey": b.hotkey, "alive": b.proc_alive,
                 "hotkey_short": _short_hotkey(b.hotkey),
                 "hotkey_prefix": b.hotkey[:12] if b.hotkey else "",
@@ -5924,9 +10140,13 @@ def render_export_json() -> dict:
                 "gpu_mem_mb": b.gpu_mem_mb, "gpu_total_mb": b.gpu_total_mb,
                 "gpu_util": b.gpu_util,
                 "cpu_pct": b.cpu_pct, "rss_mb": b.rss_mb,
-                "disk_used_pct": b.disk_used_pct, "restart_count": b.restart_count,
+                "disk_used_pct": b.disk_used_pct,
+                "restart_count": b.restart_count,
+                "restart_count_semantics": _box_restart_count_semantics(b),
                 "acpt_30m": b.acpt_30m, "acpt_60m": b.acpt_60m,
-                "pregen_30m": b.pregen_30m, "pregen_60m": b.pregen_60m,
+                "pregen_30m": _box_rolling_pregen(b)[0],
+                "pregen_60m": _box_rolling_pregen(b)[1],
+                "pregen_source": _box_rolling_pregen(b)[2],
                 "late_drops_30m": b.late_drops_30m, "late_drops_60m": b.late_drops_60m,
                 "rej_30m": b.rej_30m,
                 "window_mismatch_30m": b.window_mismatch_30m,
@@ -5954,8 +10174,48 @@ def render_export_json() -> dict:
                 "protocol_profile": getattr(b, "protocol_profile", ""),
                 "runtime_parity_ok": bool(getattr(b, "runtime_parity_ok", False)),
                 "reference_ready": bool(getattr(b, "reference_ready", False)),
+                "standalone": {
+                    "configured": bool(
+                        getattr(b, "standalone_telemetry_path", "")
+                    ),
+                    "telemetry_path": getattr(
+                        b, "standalone_telemetry_path", ""
+                    ),
+                    "runtime_manifest_path": getattr(
+                        b, "standalone_runtime_manifest_path", ""
+                    ),
+                    "supervisor_status_path": getattr(
+                        b, "standalone_supervisor_status_path", ""
+                    ),
+                    "generated_at": getattr(
+                        b, "standalone_generated_at", 0.0
+                    ),
+                    "age_s": getattr(b, "standalone_age_s", -1.0),
+                    "progress_age_s": getattr(
+                        b, "standalone_progress_age_s", -1.0
+                    ),
+                    "fresh": bool(getattr(b, "standalone_fresh", False)),
+                    "error": getattr(b, "standalone_error", ""),
+                    "telemetry": (
+                        {}
+                        if _active_standalone_certification(b)
+                        else getattr(b, "standalone_telemetry", {})
+                    ),
+                    "runtime_components": list(
+                        getattr(b, "runtime_components", []) or []
+                    ),
+                    "supervisor": dict(
+                        getattr(b, "standalone_supervisor", {}) or {}
+                    ),
+                },
+                "certification": dict(
+                    getattr(b, "standalone_certification", {}) or {}
+                ),
                 "miner_source_revision": getattr(b, "miner_source_revision", ""),
                 "reliquary_source_revision": getattr(b, "reliquary_source_revision", ""),
+                "observed_validator_image_revision": getattr(
+                    b, "observed_validator_image_revision", ""
+                ),
                 "source_manifest_provisioned_ok": bool(getattr(
                     b, "source_manifest_provisioned_ok", False
                 )),
@@ -5984,6 +10244,12 @@ def render_export_json() -> dict:
                 "base_model_revision": getattr(b, "base_model_revision", ""),
                 "model": _box_model_details(b, _vs),
                 "code_auction": _box_code_auction_details(b, _vs),
+                "code_selector_crossover": (
+                    _box_code_selector_crossover_details(b, _vs)
+                ),
+                "code_overlap_abba": _box_code_overlap_abba_details(
+                    b, _vs
+                ),
                 "readiness_issues": _box_readiness_issues(
                     b, validator_state=_vs
                 ),
@@ -6028,7 +10294,21 @@ def render_export_json() -> dict:
             }
             for b in _boxes
         ]
-        labs_data = [_lab_payload(lab) for lab in _labs]
+        labs_data = [
+            _lab_payload(
+                lab,
+                validator_window=int(getattr(_vs, "window", 0) or 0),
+            )
+            for lab in _labs
+        ]
+        components_data = [
+            _component_payload(
+                component,
+                boxes=list(_boxes),
+                chain_entries=chain_by_hotkey,
+            )
+            for component in _components
+        ]
         windows_data = [
             {
                 "n": w.n,
@@ -6120,6 +10400,16 @@ def render_export_json() -> dict:
             "health_status": getattr(_vs, "health_status", ""),
             "health_raw": getattr(_vs, "health_raw", {}),
             "image_revision": getattr(_vs, "image_revision", ""),
+            "protocol_version": getattr(_vs, "protocol_version", 0),
+            "generation_profile_id": getattr(
+                _vs, "generation_profile_id", ""
+            ),
+            "generation_contract_sha256": getattr(
+                _vs, "generation_contract_sha256", ""
+            ),
+            "checkpoint_profile_sha256": getattr(
+                _vs, "checkpoint_profile_sha256", ""
+            ),
             "app_started_at": getattr(_vs, "app_started_at", 0.0),
             "batch_size": getattr(_vs, "batch_size", 0),
             "queue_depth": getattr(_vs, "queue_depth", 0),
@@ -6150,6 +10440,7 @@ def render_export_json() -> dict:
         "targets": targets_data,
         "watched_hotkeys": watched_hotkeys,
         "fleet": boxes_data,
+        "components": components_data,
         "labs": labs_data,
         "windows": windows_data,
         "r2": _r2_status_snapshot(),
@@ -6455,6 +10746,72 @@ PAGE = """<!doctype html>
 <aside id="drawer" role="dialog" aria-modal="true" aria-hidden="true" aria-label="Miner details" tabindex="-1" hx-target="this" hx-swap="innerHTML" inert></aside>
 
 <main class="dashboard-shell" id="main-content">
+  <div class="operator-command" aria-label="Reliquary One operator view">
+    <div class="operator-columns">
+      <div class="operator-column operator-column-primary">
+        <section class="area-one-now dashboard-area"
+         aria-busy="true"
+         aria-label="Our miner now"
+         data-panel="miner_now"
+         hx-get="/api/miner-now"
+         hx-trigger="fleet:refresh"
+         hx-swap="innerHTML">
+          <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span></div>
+        </section>
+        <section class="area-one-attempts dashboard-area"
+             aria-busy="true"
+             aria-label="Our recent attempts"
+             data-panel="miner_attempts"
+             hx-get="/api/miner-attempts"
+             hx-trigger="fleet:refresh"
+             hx-swap="innerHTML">
+          <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span></div>
+        </section>
+      </div>
+      <div class="operator-column operator-column-secondary">
+        <section class="area-one-pipeline dashboard-area"
+         aria-busy="true"
+         aria-label="Current window pipeline"
+         data-panel="miner_pipeline"
+         hx-get="/api/miner-pipeline"
+         hx-trigger="fleet:refresh"
+         hx-swap="innerHTML">
+          <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+        </section>
+        <section class="area-one-auction dashboard-area"
+         aria-busy="true"
+         aria-label="Last sealed auction"
+         data-panel="miner_auction"
+         hx-get="/api/miner-auction"
+         hx-trigger="fleet:refresh"
+         hx-swap="innerHTML">
+          <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+        </section>
+        <section class="area-one-runtime dashboard-area"
+         aria-busy="true"
+         aria-label="Checkpoint and runtime"
+         data-panel="miner_runtime"
+         hx-get="/api/miner-runtime"
+         hx-trigger="fleet:refresh"
+         hx-swap="innerHTML">
+          <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row short"></span></div>
+        </section>
+      </div>
+    </div>
+    <section class="area-one-log dashboard-area"
+         aria-busy="true"
+         aria-label="Structured live log"
+         data-panel="miner_log"
+         hx-get="/api/miner-log"
+         hx-trigger="fleet:refresh"
+         hx-swap="innerHTML">
+      <div class="panel skeleton-panel" aria-hidden="true"><span class="skeleton skeleton-heading"></span><span class="skeleton skeleton-row"></span><span class="skeleton skeleton-row"></span></div>
+    </section>
+  </div>
+
+  <details class="advanced-dashboard">
+    <summary><span>Fleet, validator and network diagnostics</span><small>Advanced and historical panels</small></summary>
+    <div class="advanced-dashboard-body">
   <div class="dashboard-core">
     <div class="dashboard-stack dashboard-stack-primary">
       <section class="area-score dashboard-area"
@@ -6629,6 +10986,8 @@ PAGE = """<!doctype html>
       </div>
     </div>
   </div>
+    </div>
+  </details>
 </main>
 
 <script src="/static/dashboard.js?v={asset_version}" defer></script>
@@ -6665,6 +11024,12 @@ def render_dashboard_snapshot(
             return dict(cached[1])
 
         renderers = {
+            "miner_now": render_our_miner_now_html,
+            "miner_pipeline": render_current_miner_pipeline_html,
+            "miner_attempts": render_recent_miner_attempts_html,
+            "miner_auction": render_last_sealed_auction_html,
+            "miner_runtime": render_checkpoint_runtime_html,
+            "miner_log": render_structured_miner_log_html,
             "score": render_scoreboard_html,
             "windows": render_windows_html,
             "ema": lambda: render_ema_leaderboard_html(
@@ -6756,7 +11121,7 @@ def make_app(
         )
         page = (
             PAGE.replace("{browser_refresh_s}", browser_refresh_label)
-            .replace("{asset_version}", __version__)
+            .replace("{asset_version}", _STATIC_ASSET_VERSION)
             .replace("{demo_mode}", "true" if demo_mode else "false")
             .replace(
                 "{demo_badge}",
@@ -6769,7 +11134,7 @@ def make_app(
     def logs_page():
         """Dedicated forensic-grade logs page. Full deque (6000 events),
         filterable, no truncation."""
-        return LOGS_PAGE.replace("{asset_version}", __version__)
+        return LOGS_PAGE.replace("{asset_version}", _STATIC_ASSET_VERSION)
 
     @app.get("/api/logs", response_class=HTMLResponse)
     def api_logs(
@@ -6846,6 +11211,30 @@ def make_app(
     @app.get("/api/summary", response_class=HTMLResponse)
     def api_summary():
         return render_fleet_summary_html()
+
+    @app.get("/api/miner-now", response_class=HTMLResponse)
+    def api_miner_now():
+        return render_our_miner_now_html()
+
+    @app.get("/api/miner-pipeline", response_class=HTMLResponse)
+    def api_miner_pipeline():
+        return render_current_miner_pipeline_html()
+
+    @app.get("/api/miner-attempts", response_class=HTMLResponse)
+    def api_miner_attempts():
+        return render_recent_miner_attempts_html()
+
+    @app.get("/api/miner-auction", response_class=HTMLResponse)
+    def api_miner_auction():
+        return render_last_sealed_auction_html()
+
+    @app.get("/api/miner-runtime", response_class=HTMLResponse)
+    def api_miner_runtime():
+        return render_checkpoint_runtime_html()
+
+    @app.get("/api/miner-log", response_class=HTMLResponse)
+    def api_miner_log():
+        return render_structured_miner_log_html()
 
     @app.get("/api/scoreboard", response_class=HTMLResponse)
     def api_scoreboard():
@@ -7001,6 +11390,7 @@ def make_app(
     def api_targets():
         """Authoritative configured mining targets plus chain visibility."""
         with _lock:
+            validator_state = _vs
             chain_hotkeys = {getattr(h, "hotkey", "") for h in _chain.hotkeys}
             chain_seen = bool(_chain.last_fetch_at)
             targets = _configured_target_rows(chain_hotkeys, chain_seen)
@@ -7023,12 +11413,25 @@ def make_app(
                     "active_lanes": list(
                         getattr(b, "active_lanes", []) or []
                     ),
+                    "coordinated_unit_statuses": (
+                        _coordinated_unit_status_payload(b)
+                    ),
                     "active_environment": getattr(b, "active_environment", ""),
                     "active_pid": int(getattr(b, "active_pid", 0) or 0),
                     "restart_count": int(getattr(b, "restart_count", 0) or 0),
+                    "restart_count_semantics": (
+                        _box_restart_count_semantics(b)
+                    ),
                     "unit_resolution_error": getattr(b, "unit_resolution_error", ""),
                     "unexpected_active_units": list(
                         getattr(b, "unexpected_active_units", []) or []
+                    ),
+                    "active_unit_registry": dict(
+                        getattr(b, "active_unit_registry", {}) or {}
+                    ),
+                    "lane_status": _box_lane_status(
+                        b,
+                        validator_state=validator_state,
                     ),
                     "env_file_ok": bool(getattr(b, "env_file_ok", False)),
                     "env_file_error": getattr(b, "env_file_error", ""),

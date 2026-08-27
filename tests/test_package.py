@@ -127,8 +127,10 @@ def test_web_assets_and_security_headers_are_local() -> None:
     page = _request(app, "GET", "/")
     assert page.status_code == 200
     assert 'src="/static/htmx.min.js"' in page.text
-    assert f'href="/static/dashboard.css?v={__version__}"' in page.text
-    assert f'src="/static/dashboard.js?v={__version__}"' in page.text
+    asset_version = fleet_web._STATIC_ASSET_VERSION
+    assert asset_version.startswith(f"{__version__}-")
+    assert f'href="/static/dashboard.css?v={asset_version}"' in page.text
+    assert f'src="/static/dashboard.js?v={asset_version}"' in page.text
     assert "unpkg.com" not in page.text
     assert page.headers["x-frame-options"] == "DENY"
     policy = page.headers["content-security-policy"]
@@ -172,10 +174,15 @@ def test_demo_badge_is_explicit_and_opt_in() -> None:
     assert 'data-demo="true"' in demo_page
     assert 'hx-trigger="load, every' not in production_page
     assert 'hx-trigger="load, every' not in demo_page
-    assert production_page.count('data-panel="') == 18
+    assert production_page.count('data-panel="') == 24
     assert "/api/dashboard-snapshot" in _request(
         fleet_web.make_app(5), "GET", "/static/dashboard.js"
     ).text
+
+
+def test_operational_ages_stay_compact_for_fractional_sources() -> None:
+    assert fleet_web.fmt_age(5.436737060546875) == "5s"
+    assert fleet_web.fmt_age(6_240.75) == "1h 44m"
 
 
 def test_fixture_source_contains_only_synthetic_identifiers() -> None:

@@ -13,6 +13,7 @@
   let snapshotTimer = null;
   let snapshotFailures = 0;
   let snapshotLoaded = false;
+  let attemptFilter = "all";
   const demoMode = document.body.dataset.demo === "true";
   const snapshotIntervalMs =
     Math.max(5, Number.parseFloat(document.body.dataset.refreshSeconds) || 5) *
@@ -80,6 +81,39 @@
       table.querySelectorAll("thead th").forEach((heading) => {
         heading.setAttribute("scope", "col");
       });
+    });
+  }
+
+  function applyAttemptFilter(root = document) {
+    const panels = [
+      ...(root.matches?.(".area-one-attempts") ? [root] : []),
+      ...root.querySelectorAll(".area-one-attempts"),
+    ];
+    panels.forEach((panel) => {
+      const buttons = Array.from(
+        panel.querySelectorAll("[data-one-attempt-filter]"),
+      );
+      if (!buttons.length) return;
+      if (
+        attemptFilter !== "all" &&
+        !buttons.some((button) => button.dataset.oneAttemptFilter === attemptFilter)
+      ) {
+        attemptFilter = "all";
+      }
+      buttons.forEach((button) => {
+        const active = button.dataset.oneAttemptFilter === attemptFilter;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
+      let visible = 0;
+      panel.querySelectorAll("[data-attempt-row]").forEach((row) => {
+        const show =
+          attemptFilter === "all" || row.dataset.attemptState === attemptFilter;
+        row.hidden = !show;
+        if (show) visible += 1;
+      });
+      const status = panel.querySelector("[data-one-attempt-visible]");
+      if (status) status.textContent = `${visible} shown`;
     });
   }
 
@@ -178,6 +212,29 @@
     openDrawer(row, detailButton || row);
   });
 
+  document.body.addEventListener("change", (event) => {
+    const filter = event.target.closest("[data-one-log-filter]");
+    if (!filter) return;
+    const panel = filter.closest(".one-panel");
+    if (!panel) return;
+    const selected = {};
+    panel.querySelectorAll("[data-one-log-filter]").forEach((control) => {
+      selected[control.dataset.oneLogFilter] = control.value;
+    });
+    panel.querySelectorAll("[data-one-log-row]").forEach((row) => {
+      row.hidden = Object.entries(selected).some(
+        ([name, value]) => value && row.dataset[name] !== value,
+      );
+    });
+  });
+
+  document.body.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-one-attempt-filter]");
+    if (!button) return;
+    attemptFilter = button.dataset.oneAttemptFilter || "all";
+    applyAttemptFilter(button.closest(".area-one-attempts") || document);
+  });
+
   document.addEventListener("keydown", (event) => {
     if (!drawer.classList.contains("open")) return;
     if (event.key === "Escape") {
@@ -260,6 +317,9 @@
   });
 
   const scrollableClasses = new Set([
+    "area-one-attempts",
+    "area-one-auction",
+    "area-one-log",
     "area-ema",
     "area-windows",
     "area-forensics",
@@ -303,6 +363,7 @@
     enhanceTables(target);
     enhanceFleetRows(target);
     enhanceScrollableRegions(target);
+    applyAttemptFilter(target);
     updateHealth(target);
     restorePanelScroll(target);
   }
@@ -414,6 +475,7 @@
     enhanceTables(target);
     enhanceFleetRows(target);
     enhanceScrollableRegions(target);
+    applyAttemptFilter(target);
     updateHealth(target);
     restorePanelScroll(target);
   });
@@ -429,6 +491,7 @@
   enhanceTables();
   enhanceFleetRows();
   enhanceScrollableRegions();
+  applyAttemptFilter();
   setSound(false);
   refreshSnapshot(true);
 })();

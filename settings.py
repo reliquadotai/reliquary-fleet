@@ -37,6 +37,35 @@ class FleetUnit:
 
     unit: str
     env_file: str | None = None
+    # Optional standalone controller TOML bound to this exact unit. The
+    # dashboard verifies the live process argv uses this path, then reads the
+    # active runtime-manifest and ledger paths from its inert [paths] table.
+    controller_config_path: str | None = None
+
+
+@dataclass(frozen=True)
+class StandaloneCertification:
+    """Exact submit-disabled certification process allowed for one miner."""
+
+    runner_path: str
+    runner_sha256: str
+    artifact_dir: str
+    runtime_manifest_path: str
+    proof_profile_path: str
+    checkpoint_path: str
+    gpu_uuid: str
+    # Optional exact generation-only systemd worker.  This remains a
+    # certification surface; it is deliberately not added to allowed mining
+    # units and can never supply funnel counters.
+    service_unit: str = ""
+    service_user: str = ""
+    service_config_path: str = ""
+    service_config_sha256: str = ""
+    progress_path: str = ""
+    # ``wallet_free_generator`` attests the long-lived generation-only
+    # worker. ``submit_disabled_certification`` attests a bounded systemd
+    # certification job whose exact GPU child carries --submit-disabled.
+    service_kind: str = ""
 
 
 @dataclass
@@ -53,6 +82,7 @@ class FleetBox:
     # ``miner-pro-<instance>.env``; guessing from the unit name is therefore
     # not reliable.
     env_file: str | None = None
+    controller_config_path: str | None = None
     # Additional service identities that may replace ``unit`` on the same
     # logical box. They are an allowlist, not discovery hints: the poller
     # rejects concurrent entries unless their exact set is also declared in
@@ -62,6 +92,32 @@ class FleetBox:
     # the fail-closed exactly-one-active behavior. A non-empty set must name at
     # least two units already present in ``unit`` + ``allowed_units``.
     coordinated_units: list[str] = field(default_factory=list)
+    # Standalone miners publish one atomically-replaced, non-secret JSON
+    # snapshot instead of the legacy journal/SQLite readiness surfaces.
+    # When configured, Fleet treats this file as the authoritative mining
+    # funnel and the runtime manifest as the authoritative source/checkpoint
+    # identity. Both paths are read remotely over the box's existing SSH
+    # connection.
+    telemetry_path: str = ""
+    runtime_manifest_path: str = ""
+    # Optional root-owned, atomically replaced deployment registry.  When it
+    # exists the dashboard derives the current/rollback controller units and
+    # their attested paths from this stable file instead of requiring a config
+    # edit for every checkpoint-scoped unit name.
+    active_unit_registry_path: str = ""
+    # Optional walletless profile-supervisor status. This is read-only
+    # observability: it never grants submission authority and may exist while
+    # every canary/mine unit is deliberately fenced.
+    supervisor_status_path: str = ""
+    telemetry_stale_seconds: float = 90.0
+    # ``reliquary_one`` consumes the miner's redacted structured state through
+    # the dedicated bounded adapter. It deliberately does not reuse the older
+    # checkpoint-certification dashboard.json contract.
+    miner_kind: str = "legacy"
+    state_root: str = ""
+    standalone_certification: StandaloneCertification | None = None
+    # Coldkey/operator address is public chain identity, not wallet material.
+    operator: str = ""
     # Per-box override for the SSH key. Falls back to the validator
     # SSH key (which the legacy fleet.py also used as the global key).
     ssh_key: str | None = None
@@ -88,6 +144,34 @@ class LabBox:
 
 
 @dataclass
+class FleetComponent:
+    """One wallet-free accelerator component of a configured miner.
+
+    A component has no hotkey or submission authority of its own.  Its work is
+    attributed to exactly one full miner row through ``controller_label``.
+    """
+
+    alias: str
+    label: str
+    color: str
+    role: str
+    controller_label: str
+    generator_unit: str
+    tunnel_unit: str
+    runtime_manifest_path: str
+    runtime_profile_path: str
+    component_config_path: str
+    evidence_alias: str
+    evidence_dir: str
+    evidence_runtime_manifest_path: str
+    evidence_runtime_profile_path: str
+    evidence_target_windows: int = 20
+    evidence_stale_seconds: float = 300.0
+    telemetry_stale_seconds: float = 180.0
+    ssh_key: str | None = None
+
+
+@dataclass
 class Settings:
     """Mutable singleton of all operator-tunable values.
 
@@ -108,6 +192,9 @@ class Settings:
     # Wallet-free, submit-disabled accelerator labs. These are observability
     # rows only and never contribute to the fleet's hotkey set or readiness.
     labs: list[LabBox] = field(default_factory=list)
+    # Wallet-free live accelerator components. These are topology rows, not
+    # miners: controller-owned funnel and reward accounting remains singular.
+    components: list[FleetComponent] = field(default_factory=list)
 
     # Source-pinned Code grader/readiness surface. These are public host-local
     # service paths, never wallet or R2 credentials. The dashboard uses the
@@ -261,9 +348,7 @@ def _bounded_int(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be an integer") from exc
     if not minimum <= parsed <= maximum:
-        raise ValueError(
-            f"{field_name} must be in {minimum}..{maximum}"
-        )
+        raise ValueError(f"{field_name} must be in {minimum}..{maximum}")
     return parsed
 
 
@@ -313,9 +398,7 @@ def _validator_base_url(value: Any) -> str:
         or parsed.path not in {"", "/"}
         or (port is not None and not 1 <= port <= 65535)
     ):
-        raise ValueError(
-            "validator.url must be a credential-free http(s) origin"
-        )
+        raise ValueError("validator.url must be a credential-free http(s) origin")
     return url
 
 
@@ -337,6 +420,15 @@ def _coerce_fleet_box(d: dict[str, Any]) -> FleetBox:
     if not isinstance(d, dict):
         raise ValueError("fleet entries must be mappings")
     primary_unit = str(d.get("unit") or "").strip() or None
+    miner_kind = str(d.get("miner_kind") or "legacy").strip().lower()
+    if miner_kind not in {"legacy", "reliquary_one"}:
+        raise ValueError("fleet.miner_kind must be legacy or reliquary_one")
+    state_root_raw = d.get("state_root")
+    state_root = (
+        _absolute_path(state_root_raw, "fleet.state_root")
+        if state_root_raw not in (None, "")
+        else ""
+    )
     raw_allowed = d.get("allowed_units")
     if raw_allowed is None:
         raw_allowed = []
@@ -354,9 +446,18 @@ def _coerce_fleet_box(d: dict[str, Any]) -> FleetBox:
         if isinstance(raw, str):
             unit = raw.strip()
             env_file = None
+            controller_config_path = None
         elif isinstance(raw, dict):
             unit = str(raw.get("unit") or "").strip()
             env_file = _expand(str(raw.get("env_file") or "")) or None
+            controller_config_path = (
+                _absolute_path(
+                    raw.get("controller_config_path"),
+                    "fleet.allowed_units.controller_config_path",
+                )
+                if raw.get("controller_config_path") not in (None, "")
+                else None
+            )
         else:
             raise ValueError("fleet.allowed_units entries must be strings or mappings")
         if not unit:
@@ -365,7 +466,13 @@ def _coerce_fleet_box(d: dict[str, Any]) -> FleetBox:
         if canonical in seen_units:
             raise ValueError(f"duplicate fleet allowed unit: {unit}")
         seen_units.add(canonical)
-        allowed_units.append(FleetUnit(unit=unit, env_file=env_file))
+        allowed_units.append(
+            FleetUnit(
+                unit=unit,
+                env_file=env_file,
+                controller_config_path=controller_config_path,
+            )
+        )
 
     raw_coordinated = d.get("coordinated_units")
     if raw_coordinated is None:
@@ -385,6 +492,193 @@ def _coerce_fleet_box(d: dict[str, Any]) -> FleetBox:
     if coordinated_units and len(coordinated_units) < 2:
         raise ValueError("fleet.coordinated_units requires at least two units")
 
+    telemetry_path_raw = d.get("telemetry_path")
+    runtime_manifest_path_raw = d.get("runtime_manifest_path")
+    telemetry_path = (
+        _absolute_path(telemetry_path_raw, "fleet.telemetry_path")
+        if telemetry_path_raw not in (None, "")
+        else ""
+    )
+    runtime_manifest_path = (
+        _absolute_path(
+            runtime_manifest_path_raw,
+            "fleet.runtime_manifest_path",
+        )
+        if runtime_manifest_path_raw not in (None, "")
+        else ""
+    )
+    supervisor_status_path_raw = d.get("supervisor_status_path")
+    supervisor_status_path = (
+        _absolute_path(
+            supervisor_status_path_raw,
+            "fleet.supervisor_status_path",
+        )
+        if supervisor_status_path_raw not in (None, "")
+        else ""
+    )
+    active_unit_registry_path_raw = d.get("active_unit_registry_path")
+    active_unit_registry_path = (
+        _absolute_path(
+            active_unit_registry_path_raw,
+            "fleet.active_unit_registry_path",
+        )
+        if active_unit_registry_path_raw not in (None, "")
+        else ""
+    )
+    if bool(telemetry_path) != bool(runtime_manifest_path):
+        raise ValueError(
+            "fleet.telemetry_path and fleet.runtime_manifest_path "
+            "must be configured together"
+        )
+    if miner_kind == "reliquary_one":
+        if not primary_unit:
+            raise ValueError("reliquary_one fleet entries require unit")
+        if not state_root:
+            raise ValueError("reliquary_one fleet entries require state_root")
+        if any(
+            (
+                allowed_units,
+                coordinated_units,
+                telemetry_path,
+                runtime_manifest_path,
+                active_unit_registry_path,
+                supervisor_status_path,
+            )
+        ):
+            raise ValueError(
+                "reliquary_one uses unit + state_root, not legacy lane telemetry"
+            )
+    elif state_root:
+        raise ValueError("fleet.state_root requires miner_kind: reliquary_one")
+    certification_raw = d.get("standalone_certification")
+    certification: StandaloneCertification | None = None
+    if certification_raw is not None:
+        if not isinstance(certification_raw, dict):
+            raise ValueError("fleet.standalone_certification must be a mapping")
+        if not telemetry_path:
+            raise ValueError(
+                "fleet.standalone_certification requires standalone telemetry"
+            )
+        certification = StandaloneCertification(
+            runner_path=_absolute_path(
+                certification_raw.get("runner_path"),
+                "fleet.standalone_certification.runner_path",
+            ),
+            runner_sha256=str(certification_raw.get("runner_sha256") or "")
+            .strip()
+            .lower(),
+            artifact_dir=_absolute_path(
+                certification_raw.get("artifact_dir"),
+                "fleet.standalone_certification.artifact_dir",
+            ),
+            runtime_manifest_path=_absolute_path(
+                certification_raw.get("runtime_manifest_path"),
+                "fleet.standalone_certification.runtime_manifest_path",
+            ),
+            proof_profile_path=_absolute_path(
+                certification_raw.get("proof_profile_path"),
+                "fleet.standalone_certification.proof_profile_path",
+            ),
+            checkpoint_path=_absolute_path(
+                certification_raw.get("checkpoint_path"),
+                "fleet.standalone_certification.checkpoint_path",
+            ),
+            gpu_uuid=str(certification_raw.get("gpu_uuid") or "").strip(),
+            service_unit=(
+                unit_key(str(certification_raw.get("service_unit") or "").strip())
+                if certification_raw.get("service_unit")
+                else ""
+            ),
+            service_user=str(
+                certification_raw.get("service_user") or ""
+            ).strip(),
+            service_config_path=(
+                _absolute_path(
+                    certification_raw.get("service_config_path"),
+                    "fleet.standalone_certification.service_config_path",
+                )
+                if certification_raw.get("service_unit")
+                else ""
+            ),
+            service_config_sha256=str(
+                certification_raw.get("service_config_sha256") or ""
+            ).strip().lower(),
+            progress_path=(
+                _absolute_path(
+                    certification_raw.get("progress_path"),
+                    "fleet.standalone_certification.progress_path",
+                )
+                if certification_raw.get("progress_path")
+                else ""
+            ),
+            service_kind=str(
+                certification_raw.get("service_kind")
+                or (
+                    "wallet_free_generator"
+                    if certification_raw.get("service_unit")
+                    else ""
+                )
+            ).strip(),
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", certification.runner_sha256):
+            raise ValueError(
+                "fleet.standalone_certification.runner_sha256 "
+                "must be 64 lowercase hex characters"
+            )
+        if not re.fullmatch(
+            r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}"
+            r"-[0-9a-fA-F]{12}",
+            certification.gpu_uuid,
+        ):
+            raise ValueError(
+                "fleet.standalone_certification.gpu_uuid must be a full NVIDIA GPU UUID"
+            )
+        if certification.service_unit:
+            if certification.service_kind not in {
+                "wallet_free_generator",
+                "submit_disabled_certification",
+            }:
+                raise ValueError(
+                    "fleet.standalone_certification.service_kind is invalid"
+                )
+            if not re.fullmatch(
+                r"[a-z_][a-z0-9_-]{0,31}", certification.service_user
+            ):
+                raise ValueError(
+                    "fleet.standalone_certification.service_user is invalid"
+                )
+            if not re.fullmatch(
+                r"[0-9a-f]{64}", certification.service_config_sha256
+            ):
+                raise ValueError(
+                    "fleet.standalone_certification.service_config_sha256 "
+                    "must be 64 lowercase hex characters"
+                )
+        artifact_prefix = certification.artifact_dir.rstrip("/") + "/"
+        if not (
+            certification.proof_profile_path.startswith(artifact_prefix)
+            and (
+                certification.service_unit
+                or certification.runner_path.startswith(artifact_prefix)
+            )
+        ):
+            raise ValueError(
+                "fleet.standalone_certification runner/profile "
+                "must be inside artifact_dir"
+            )
+    try:
+        telemetry_stale_seconds = float(d.get("telemetry_stale_seconds", 90.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("fleet.telemetry_stale_seconds must be numeric") from exc
+    if (
+        not math.isfinite(telemetry_stale_seconds)
+        or telemetry_stale_seconds < 15.0
+        or telemetry_stale_seconds > 3600.0
+    ):
+        raise ValueError("fleet.telemetry_stale_seconds must be in 15..3600")
+    operator_raw = str(d.get("operator") or "").strip()
+    operator = _ss58_hotkey(operator_raw, "fleet.operator") if operator_raw else ""
+
     return FleetBox(
         alias=_ssh_host(d.get("alias", ""), "fleet.alias"),
         hotkey=str(d.get("hotkey", "")).strip(),
@@ -392,8 +686,25 @@ def _coerce_fleet_box(d: dict[str, Any]) -> FleetBox:
         color=str(d.get("color", "white")).strip(),
         unit=primary_unit,
         env_file=_expand(str(d.get("env_file") or "")) or None,
+        controller_config_path=(
+            _absolute_path(
+                d.get("controller_config_path"),
+                "fleet.controller_config_path",
+            )
+            if d.get("controller_config_path") not in (None, "")
+            else None
+        ),
         allowed_units=allowed_units,
         coordinated_units=coordinated_units,
+        telemetry_path=telemetry_path,
+        runtime_manifest_path=runtime_manifest_path,
+        active_unit_registry_path=active_unit_registry_path,
+        supervisor_status_path=supervisor_status_path,
+        telemetry_stale_seconds=telemetry_stale_seconds,
+        miner_kind=miner_kind,
+        state_root=state_root,
+        standalone_certification=certification,
+        operator=operator,
         ssh_key=d.get("ssh_key") or None,
     )
 
@@ -453,6 +764,103 @@ def _coerce_lab_box(d: dict[str, Any]) -> LabBox:
     )
 
 
+def _coerce_component(d: dict[str, Any]) -> FleetComponent:
+    if not isinstance(d, dict):
+        raise ValueError("components entries must be mappings")
+    if str(d.get("hotkey") or "").strip():
+        raise ValueError("components entries must not define a hotkey")
+
+    alias = _ssh_host(d.get("alias"), "components.alias")
+    label = str(d.get("label") or "").strip()
+    controller_label = str(d.get("controller_label") or "").strip()
+    role = str(d.get("role") or "").strip().lower()
+    if not alias or not label or not controller_label:
+        raise ValueError("components entries require alias, label and controller_label")
+    if role != "generation":
+        raise ValueError("components.role must be generation")
+
+    def service(name: str) -> str:
+        value = str(d.get(name) or "").strip()
+        if not _SYSTEMD_UNIT_RE.fullmatch(value):
+            raise ValueError(f"components.{name} must be a valid systemd unit")
+        return value if value.endswith(".service") else f"{value}.service"
+
+    try:
+        evidence_target_windows = int(d.get("evidence_target_windows", 20))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "components.evidence_target_windows must be an integer"
+        ) from exc
+    if not 1 <= evidence_target_windows <= 10_000:
+        raise ValueError("components.evidence_target_windows must be in 1..10000")
+    try:
+        stale_seconds = float(d.get("telemetry_stale_seconds", 180.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("components.telemetry_stale_seconds must be numeric") from exc
+    if (
+        not math.isfinite(stale_seconds)
+        or stale_seconds < 15.0
+        or stale_seconds > 3600.0
+    ):
+        raise ValueError("components.telemetry_stale_seconds must be in 15..3600")
+    try:
+        evidence_stale_seconds = float(d.get("evidence_stale_seconds", 300.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("components.evidence_stale_seconds must be numeric") from exc
+    if (
+        not math.isfinite(evidence_stale_seconds)
+        or evidence_stale_seconds < 60.0
+        or evidence_stale_seconds > 86_400.0
+    ):
+        raise ValueError("components.evidence_stale_seconds must be in 60..86400")
+
+    runtime_manifest_path = _absolute_path(
+        d.get("runtime_manifest_path"),
+        "components.runtime_manifest_path",
+    )
+    runtime_profile_path = _absolute_path(
+        d.get("runtime_profile_path"),
+        "components.runtime_profile_path",
+    )
+    evidence_alias = _ssh_host(
+        d.get("evidence_alias") or alias,
+        "components.evidence_alias",
+    )
+
+    return FleetComponent(
+        alias=alias,
+        label=label,
+        color=str(d.get("color", "white") or "white").strip(),
+        role=role,
+        controller_label=controller_label,
+        generator_unit=service("generator_unit"),
+        tunnel_unit=service("tunnel_unit"),
+        runtime_manifest_path=runtime_manifest_path,
+        runtime_profile_path=runtime_profile_path,
+        component_config_path=_absolute_path(
+            d.get("component_config_path"),
+            "components.component_config_path",
+        ),
+        evidence_alias=evidence_alias,
+        evidence_dir=_absolute_path(
+            d.get("evidence_dir"),
+            "components.evidence_dir",
+        ),
+        evidence_runtime_manifest_path=_absolute_path(
+            d.get("evidence_runtime_manifest_path") or runtime_manifest_path,
+            "components.evidence_runtime_manifest_path",
+        ),
+        evidence_runtime_profile_path=_absolute_path(
+            d.get("evidence_runtime_profile_path") or runtime_profile_path,
+            "components.evidence_runtime_profile_path",
+        ),
+        evidence_target_windows=evidence_target_windows,
+        evidence_stale_seconds=evidence_stale_seconds,
+        telemetry_stale_seconds=stale_seconds,
+        ssh_key=d.get("ssh_key") or None,
+    )
+
+
 def load(path: Path | str = "config.yaml") -> Settings:
     """Load config.yaml + env overrides into the SETTINGS singleton."""
     cfg_path = Path(path)
@@ -492,11 +900,20 @@ def load(path: Path | str = "config.yaml") -> Settings:
 
     SETTINGS.fleet = [_coerce_fleet_box(b) for b in _list(raw.get("fleet"), "fleet")]
     SETTINGS.labs = [_coerce_lab_box(b) for b in _list(raw.get("labs"), "labs")]
-    labels = [box.label for box in SETTINGS.fleet] + [
-        lab.label for lab in SETTINGS.labs
+    SETTINGS.components = [
+        _coerce_component(b) for b in _list(raw.get("components"), "components")
     ]
+    labels = (
+        [box.label for box in SETTINGS.fleet]
+        + [lab.label for lab in SETTINGS.labs]
+        + [component.label for component in SETTINGS.components]
+    )
     if len(labels) != len(set(labels)):
-        raise ValueError("fleet and labs labels must be unique")
+        raise ValueError("fleet, labs and components labels must be unique")
+    fleet_labels = {box.label for box in SETTINGS.fleet}
+    for component in SETTINGS.components:
+        if component.controller_label not in fleet_labels:
+            raise ValueError("components.controller_label must name one fleet entry")
     # Default per-box ssh_key falls back to the validator key. Doing
     # this at config-load time means every downstream call to a box
     # can use box.ssh_key without re-running the fallback logic.
@@ -510,6 +927,11 @@ def load(path: Path | str = "config.yaml") -> Settings:
             lab.ssh_key = SETTINGS.validator_ssh_key
         else:
             lab.ssh_key = _expand(lab.ssh_key)
+    for component in SETTINGS.components:
+        if not component.ssh_key:
+            component.ssh_key = SETTINGS.validator_ssh_key
+        else:
+            component.ssh_key = _expand(component.ssh_key)
 
     code = _mapping(raw.get("code_readiness"), "code_readiness")
     code_grader_unit = str(
@@ -706,6 +1128,33 @@ def apply_to_fleet_module() -> None:
         )
         for b in SETTINGS.labs
     ]
+    fleet.FLEET_COMPONENTS = [
+        {
+            "alias": _ssh_target(b),
+            "label": b.label,
+            "color": b.color,
+            "role": b.role,
+            "controller_label": b.controller_label,
+            "generator_unit": b.generator_unit,
+            "tunnel_unit": b.tunnel_unit,
+            "runtime_manifest_path": b.runtime_manifest_path,
+            "runtime_profile_path": b.runtime_profile_path,
+            "component_config_path": b.component_config_path,
+            "evidence_alias": (
+                f"-i {shlex.quote(str(b.ssh_key))} "
+                f"-o IdentitiesOnly=yes {b.evidence_alias}"
+                if b.ssh_key
+                else b.evidence_alias
+            ),
+            "evidence_dir": b.evidence_dir,
+            "evidence_runtime_manifest_path": (b.evidence_runtime_manifest_path),
+            "evidence_runtime_profile_path": (b.evidence_runtime_profile_path),
+            "evidence_target_windows": b.evidence_target_windows,
+            "evidence_stale_seconds": b.evidence_stale_seconds,
+            "telemetry_stale_seconds": b.telemetry_stale_seconds,
+        }
+        for b in SETTINGS.components
+    ]
     fleet.FLEET_ENV_FILES = {
         b.label: b.env_file for b in SETTINGS.fleet if b.label and b.env_file
     }
@@ -717,10 +1166,73 @@ def apply_to_fleet_module() -> None:
         for b in SETTINGS.fleet
         if b.label and b.allowed_units
     }
+    fleet.FLEET_CONTROLLER_CONFIG_PATHS = {
+        b.label: {
+            **(
+                {str(b.unit): str(b.controller_config_path)}
+                if b.unit and b.controller_config_path
+                else {}
+            ),
+            **{
+                str(unit.unit): str(unit.controller_config_path)
+                for unit in b.allowed_units
+                if unit.controller_config_path
+            },
+        }
+        for b in SETTINGS.fleet
+        if b.label
+        and (
+            b.controller_config_path
+            or any(unit.controller_config_path for unit in b.allowed_units)
+        )
+    }
     fleet.FLEET_COORDINATED_UNITS = {
         b.label: list(b.coordinated_units)
         for b in SETTINGS.fleet
         if b.label and b.coordinated_units
+    }
+    fleet.FLEET_STANDALONE_TELEMETRY = {
+        b.label: {
+            "telemetry_path": b.telemetry_path,
+            "runtime_manifest_path": b.runtime_manifest_path,
+            "active_unit_registry_path": b.active_unit_registry_path,
+            "supervisor_status_path": b.supervisor_status_path,
+            "stale_seconds": b.telemetry_stale_seconds,
+            "operator": b.operator,
+        }
+        for b in SETTINGS.fleet
+        if b.label and b.telemetry_path
+    }
+    fleet.FLEET_RELIQUARY_ONE = {
+        b.label: {
+            "state_root": b.state_root,
+            "stale_seconds": b.telemetry_stale_seconds,
+        }
+        for b in SETTINGS.fleet
+        if b.label and b.miner_kind == "reliquary_one"
+    }
+    fleet.FLEET_STANDALONE_CERTIFICATION = {
+        b.label: {
+            "runner_path": b.standalone_certification.runner_path,
+            "runner_sha256": b.standalone_certification.runner_sha256,
+            "artifact_dir": b.standalone_certification.artifact_dir,
+            "runtime_manifest_path": (b.standalone_certification.runtime_manifest_path),
+            "proof_profile_path": (b.standalone_certification.proof_profile_path),
+            "checkpoint_path": b.standalone_certification.checkpoint_path,
+            "gpu_uuid": b.standalone_certification.gpu_uuid,
+            "service_unit": b.standalone_certification.service_unit,
+            "service_user": b.standalone_certification.service_user,
+            "service_config_path": (
+                b.standalone_certification.service_config_path
+            ),
+            "service_config_sha256": (
+                b.standalone_certification.service_config_sha256
+            ),
+            "progress_path": b.standalone_certification.progress_path,
+            "service_kind": b.standalone_certification.service_kind,
+        }
+        for b in SETTINGS.fleet
+        if b.label and b.standalone_certification is not None
     }
     host_units: dict[str, set[str]] = {}
     for box in SETTINGS.fleet:

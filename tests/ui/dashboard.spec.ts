@@ -2,14 +2,12 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
 const mobileOrder = [
-  "Window score",
-  "Operations overview",
-  "Window history",
-  "Window forensics",
-  "EMA leaderboard",
-  "GPU and reference pipeline",
-  "Frontier selection",
-  "Fleet health",
+  "Our miner now",
+  "Current window pipeline",
+  "Our recent attempts",
+  "Last sealed auction",
+  "Checkpoint and runtime",
+  "Structured live log",
 ];
 
 test.beforeEach(async ({ page }) => {
@@ -43,7 +41,7 @@ test("keeps every panel contained and non-overlapping", async ({ page }, testInf
         top: rect.top + window.scrollY,
         bottom: rect.bottom + window.scrollY,
       };
-    });
+    }).filter((box) => box.right - box.left > 0 && box.bottom - box.top > 0);
     const overlaps: string[] = [];
     for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) {
       for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
@@ -73,7 +71,7 @@ test("keeps every panel contained and non-overlapping", async ({ page }, testInf
 
 test("uses the operator-first order on narrow screens", async ({ page }, testInfo) => {
   test.skip(!testInfo.project.name.startsWith("mobile-"));
-  const labels = await page.locator(".dashboard-core section").evaluateAll((areas) =>
+  const labels = await page.locator(".operator-command section.dashboard-area").evaluateAll((areas) =>
     areas
       .map((area) => ({
         label: area.getAttribute("aria-label"),
@@ -85,8 +83,28 @@ test("uses the operator-first order on narrow screens", async ({ page }, testInf
   expect(labels).toEqual(mobileOrder);
 });
 
+test("lets each desktop operator column flow independently", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-1440");
+  const gaps = await page.evaluate(() => {
+    const rect = (selector: string) =>
+      document.querySelector(selector)?.getBoundingClientRect();
+    const now = rect(".area-one-now");
+    const attempts = rect(".area-one-attempts");
+    const pipeline = rect(".area-one-pipeline");
+    const auction = rect(".area-one-auction");
+    return {
+      primary: now && attempts ? attempts.top - now.bottom : -1,
+      secondary: pipeline && auction ? auction.top - pipeline.bottom : -1,
+    };
+  });
+  expect(gaps.primary).toBeGreaterThanOrEqual(8);
+  expect(gaps.primary).toBeLessThanOrEqual(12);
+  expect(gaps.secondary).toBeGreaterThanOrEqual(8);
+  expect(gaps.secondary).toBeLessThanOrEqual(12);
+});
+
 test("preserves internal panel scroll after an HTMX refresh", async ({ page }) => {
-  const area = page.locator(".area-windows");
+  const area = page.locator(".area-one-attempts");
   const dimensions = await area.evaluate((element) => ({
     clientHeight: element.clientHeight,
     scrollHeight: element.scrollHeight,
@@ -95,7 +113,7 @@ test("preserves internal panel scroll after an HTMX refresh", async ({ page }) =
 
   const restored = await area.evaluate(async (element) => {
     element.scrollTop = 72;
-    await window.htmx.ajax("GET", element.getAttribute("hx-get") || "/api/windows", {
+    await window.htmx.ajax("GET", element.getAttribute("hx-get") || "/api/miner-attempts", {
       source: element,
       target: element,
       swap: "innerHTML",
@@ -107,6 +125,7 @@ test("preserves internal panel scroll after an HTMX refresh", async ({ page }) =
 });
 
 test("opens and closes miner details from the keyboard", async ({ page }) => {
+  await page.locator(".advanced-dashboard > summary").click();
   const trigger = page.locator(".fleet-detail-button").first();
   await trigger.scrollIntoViewIfNeeded();
   await trigger.focus();
@@ -123,6 +142,67 @@ test("opens and closes miner details from the keyboard", async ({ page }) => {
   await expect(drawer).toHaveAttribute("aria-hidden", "true");
   await expect(drawer).toHaveAttribute("inert", "");
   await expect(trigger).toBeFocused();
+});
+
+test("keeps local transport, validator admission, and auction truth separate", async ({ page }) => {
+  const attempts = page.locator(".area-one-attempts");
+  await expect(attempts).toContainText("local accepted");
+  await expect(attempts).toContainText("rejected · out_of_zone");
+  await expect(attempts).toContainText("not selected");
+  await expect(attempts).toContainText("not rewarded");
+  await expect(attempts).toContainText("58.7500s");
+  await expect(attempts).toContainText("5.7500s");
+});
+
+test("filters attempts locally and preserves the choice after refresh", async ({ page }) => {
+  const attempts = page.locator(".area-one-attempts");
+  await attempts.locator('[data-one-attempt-filter="rejected"]').click();
+  await expect(attempts.locator("[data-attempt-row]:visible")).toHaveCount(2);
+  await expect(attempts.locator("[data-one-attempt-visible]")).toHaveText("2 shown");
+
+  const response = page.waitForResponse((candidate) =>
+    candidate.url().includes("/api/dashboard-snapshot"),
+  );
+  await page.evaluate(() => window.reliquaryFleetRefresh());
+  await response;
+  await expect(attempts.locator("[data-attempt-row]:visible")).toHaveCount(2);
+  await expect(
+    attempts.locator('[data-one-attempt-filter="rejected"]'),
+  ).toHaveAttribute("aria-pressed", "true");
+});
+
+test("renders recent attempts as contained cards on phones", async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith("mobile-"));
+  const presentation = await page.locator(".area-one-attempts").evaluate((area) => {
+    const row = area.querySelector("[data-attempt-row]");
+    const table = area.querySelector(".one-attempt-table");
+    return {
+      rowDisplay: row ? getComputedStyle(row).display : "missing",
+      overflow: table ? table.scrollWidth - area.clientWidth : 999,
+      labels: Array.from(row?.querySelectorAll("td") || []).map((cell) =>
+        cell.getAttribute("data-label"),
+      ),
+    };
+  });
+  expect(presentation.rowDisplay).toBe("grid");
+  expect(presentation.overflow).toBeLessThanOrEqual(0);
+  expect(presentation.labels).toEqual([
+    "Attempt",
+    "OPEN+",
+    "Generate",
+    "Proof",
+    "Submit",
+    "Total",
+    "Truth",
+  ]);
+});
+
+test("filters the structured miner log without a network request", async ({ page }) => {
+  const filter = page.locator('[data-one-log-filter="window"]');
+  await filter.selectOption("42002");
+  const visible = page.locator("[data-one-log-row]:visible");
+  await expect(visible).toHaveCount(3);
+  await expect(page.locator(".area-one-log")).toContainText("runtime_other");
 });
 
 test("keeps alert audio opt-in", async ({ page }) => {

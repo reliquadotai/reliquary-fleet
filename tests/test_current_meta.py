@@ -436,6 +436,7 @@ def test_settings_propagates_named_unit_allowlist(monkeypatch):
             "color": "cyan",
             "unit": "reliquary-miner-pro.service",
             "env_file": "/srv/reliquary-miner-pro/state/miner-pro.env",
+            "controller_config_path": "/etc/reliquary-code/mine.toml",
             "allowed_units": [
                 {
                     "unit": "reliquary-miner-pro@math-reserve1.service",
@@ -444,6 +445,9 @@ def test_settings_propagates_named_unit_allowlist(monkeypatch):
                 {
                     "unit": "reliquary-miner-pro@code-reserve1.service",
                     "env_file": "/srv/reliquary-miner-pro/state/miner-pro-code-reserve1.env",
+                    "controller_config_path": (
+                        "/etc/reliquary-code/canary.toml"
+                    ),
                 },
             ],
         }
@@ -452,6 +456,7 @@ def test_settings_propagates_named_unit_allowlist(monkeypatch):
     monkeypatch.setattr(fleet, "FLEET", [])
     monkeypatch.setattr(fleet, "FLEET_ENV_FILES", {})
     monkeypatch.setattr(fleet, "FLEET_UNIT_CANDIDATES", {})
+    monkeypatch.setattr(fleet, "FLEET_CONTROLLER_CONFIG_PATHS", {})
     monkeypatch.setattr(fleet, "OUR_SS58", {})
 
     settings.apply_to_fleet_module()
@@ -470,6 +475,179 @@ def test_settings_propagates_named_unit_allowlist(monkeypatch):
             "/srv/reliquary-miner-pro/state/miner-pro-code-reserve1.env",
         ),
     ]
+    assert fleet.FLEET_CONTROLLER_CONFIG_PATHS["h100-reserve1"] == {
+        "reliquary-miner-pro.service": (
+            "/etc/reliquary-code/mine.toml"
+        ),
+        "reliquary-miner-pro@code-reserve1.service": (
+            "/etc/reliquary-code/canary.toml"
+        ),
+    }
+
+
+def test_settings_propagates_stable_active_unit_registry(monkeypatch):
+    configured = settings._coerce_fleet_box(
+        {
+            "alias": "ubuntu@192.0.2.10",
+            "hotkey": OUR_HOTKEY,
+            "label": "h100-reserve1",
+            "color": "cyan",
+            "unit": "reliquary-code-cp67-canary.service",
+            "telemetry_path": "/state/cp67/dashboard.json",
+            "runtime_manifest_path": "/evidence/cp67/runtime.json",
+            "active_unit_registry_path": "/state/active-unit-registry.json",
+        }
+    )
+    monkeypatch.setattr(settings.SETTINGS, "fleet", [configured])
+    monkeypatch.setattr(fleet, "FLEET_STANDALONE_TELEMETRY", {})
+
+    settings.apply_to_fleet_module()
+
+    assert fleet.FLEET_STANDALONE_TELEMETRY["h100-reserve1"][
+        "active_unit_registry_path"
+    ] == "/state/active-unit-registry.json"
+
+
+def test_active_unit_registry_replaces_checkpoint_specific_paths(monkeypatch):
+    state = _box(
+        unit="reliquary-code-cp67-canary.service",
+        unit_candidates=(("reliquary-code-cp67-canary.service", ""),),
+        standalone_telemetry_path="/state/cp67/dashboard.json",
+        standalone_runtime_manifest_path="/evidence/cp67/runtime.json",
+        active_unit_registry_path="/state/active-unit-registry.json",
+    )
+    active = {
+        "unit": "reliquary-code-cp68-mine.service",
+        "mode": "mine",
+        "controller_config_path": "/etc/reliquary-code/cp68.toml",
+        "telemetry_path": "/state/cp68/dashboard.json",
+        "runtime_manifest_path": "/evidence/cp68/runtime.json",
+        "checkpoint_revision": "a" * 40,
+        "source_revision": "b" * 40,
+        "unit_fragment_sha256": "c" * 64,
+        "controller_config_sha256": "d" * 64,
+        "runtime_manifest_sha256": "e" * 64,
+    }
+    rollback = {**active, "unit": "reliquary-code-cp67-canary.service"}
+    registry = {
+        "schema_version": 1,
+        "generated_at": 1234.5,
+        "registry_sha256": "f" * 64,
+        "active": active,
+        "rollback": [rollback],
+    }
+
+    def fake_ssh(alias: str, command: str, timeout_s: int = 0):
+        assert alias == state.alias
+        assert timeout_s == 12
+        assert "root-owned, bounded and non-writable" in command
+        assert "systemd unit fragment digest mismatch" in command
+        assert "digest_systemctl_cat(entry['unit']" in command
+        assert "len(raw['rollback']) > 8" in command
+        assert "/state/active-unit-registry.json" in command
+        return 0, json.dumps(registry), ""
+
+    monkeypatch.setattr(fleet, "ssh_run", fake_ssh)
+
+    assert fleet._refresh_active_unit_registry(state) is True
+    assert state.unit == active["unit"]
+    assert state.unit_candidates == (
+        (active["unit"], ""),
+        (rollback["unit"], ""),
+    )
+    assert state.standalone_telemetry_path == active["telemetry_path"]
+    assert state.standalone_runtime_manifest_path == active["runtime_manifest_path"]
+    assert fleet._select_active_unit_registry_entry(state, rollback["unit"])
+    assert state.standalone_telemetry_path == rollback["telemetry_path"]
+
+
+def test_active_unit_registry_allows_unloaded_transient_rollback_units(monkeypatch):
+    state = _box(active_unit_registry_path="/state/active-unit-registry.json")
+    registry = {
+        "schema_version": 1,
+        "generated_at": 1234.5,
+        "registry_sha256": "f" * 64,
+        "active": {
+            "unit": "reliquary-code-cp71-canary-active1.service",
+            "mode": "canary",
+            "controller_config_path": "/etc/reliquary-code/cp71-active1.toml",
+            "telemetry_path": "/state/cp71/dashboard.json",
+            "runtime_manifest_path": "/evidence/cp71/runtime.json",
+            "checkpoint_revision": "a" * 40,
+            "source_revision": "b" * 40,
+            "unit_fragment_sha256": "c" * 64,
+            "controller_config_sha256": "d" * 64,
+            "runtime_manifest_sha256": "e" * 64,
+        },
+        "rollback": [],
+    }
+    observed = {}
+
+    def fake_ssh(_alias: str, command: str, timeout_s: int = 0):
+        observed["command"] = command
+        return 0, json.dumps(registry), ""
+
+    monkeypatch.setattr(fleet, "ssh_run", fake_ssh)
+
+    assert fleet._refresh_active_unit_registry(state) is True
+    command = observed["command"]
+    assert "def normalize_entry(raw, *, require_live_fragment):" in command
+    assert "normalize_entry(raw['active'], require_live_fragment=True)" in command
+    assert "normalize_entry(item, require_live_fragment=False)" in command
+    assert "elif require_live_fragment:" in command
+
+
+def test_active_unit_registry_accepts_exact_systemctl_cat_canonicalization(
+    monkeypatch,
+):
+    """The reader supports both producer-approved fragment byte formats."""
+    state = _box(active_unit_registry_path="/state/active-unit-registry.json")
+    registry = {
+        "schema_version": 1,
+        "generated_at": 1234.5,
+        "registry_sha256": "f" * 64,
+        "active": {
+            "unit": "reliquary-code-cp75-canary.service",
+            "mode": "canary",
+            "controller_config_path": "/etc/reliquary-code/cp75.toml",
+            "telemetry_path": "/state/cp75/dashboard.json",
+            "runtime_manifest_path": "/evidence/cp75/runtime.json",
+            "checkpoint_revision": "a" * 40,
+            "source_revision": "b" * 40,
+            "unit_fragment_sha256": "c" * 64,
+            "controller_config_sha256": "d" * 64,
+            "runtime_manifest_sha256": "e" * 64,
+        },
+        "rollback": [],
+        "fragment_verification": {
+            "reliquary-code-cp75-canary.service": "systemctl_cat",
+        },
+    }
+
+    def fake_ssh(_alias: str, command: str, timeout_s: int = 0):
+        assert "['systemctl', 'cat', '--no-pager', unit]" in command
+        assert "fragment_verification = 'systemctl_cat'" in command
+        return 0, json.dumps(registry), ""
+
+    monkeypatch.setattr(fleet, "ssh_run", fake_ssh)
+
+    assert fleet._refresh_active_unit_registry(state) is True
+    assert state.active_unit_registry["fragment_verification"] == {
+        "reliquary-code-cp75-canary.service": "systemctl_cat",
+    }
+
+
+def test_active_unit_registry_failure_is_fail_closed(monkeypatch):
+    state = _box(active_unit_registry_path="/state/active-unit-registry.json")
+    monkeypatch.setattr(
+        fleet,
+        "ssh_run",
+        lambda *_args, **_kwargs: (1, "", "registry digest mismatch"),
+    )
+
+    assert fleet._refresh_active_unit_registry(state) is False
+    assert state.unit_resolution_error == "active_unit_registry_invalid"
+    assert state.active_unit_registry["error"] == "registry digest mismatch"
 
 
 def test_settings_propagates_only_the_exact_coordinated_unit_set(monkeypatch):
@@ -750,7 +928,7 @@ def test_resolver_accepts_only_the_explicit_coordinated_active_set(monkeypatch):
                 "active_state": "active",
                 "sub_state": "running",
                 "pid": 4101,
-                "restarts": 0,
+                "restarts": 2,
             },
             "active_units": [
                 {
@@ -758,14 +936,30 @@ def test_resolver_accepts_only_the_explicit_coordinated_active_set(monkeypatch):
                     "active_state": "active",
                     "sub_state": "running",
                     "pid": 4101,
-                    "restarts": 0,
+                    "restarts": 2,
                 },
                 {
                     "unit": code_two,
                     "active_state": "active",
                     "sub_state": "running",
                     "pid": 4102,
-                    "restarts": 0,
+                    "restarts": 5,
+                },
+            ],
+            "coordinated_unit_statuses": [
+                {
+                    "unit": code_one,
+                    "active_state": "active",
+                    "sub_state": "running",
+                    "pid": 4101,
+                    "restarts": 2,
+                },
+                {
+                    "unit": code_two,
+                    "active_state": "active",
+                    "sub_state": "running",
+                    "pid": 4102,
+                    "restarts": 5,
                 },
             ],
             "candidates": [],
@@ -781,6 +975,23 @@ def test_resolver_accepts_only_the_explicit_coordinated_active_set(monkeypatch):
     )
     assert state.active_units == [code_one, code_two]
     assert state.active_lanes == ["code-reserve1", "code-reserve2"]
+    assert state.coordinated_unit_statuses == [
+        {
+            "unit": code_one,
+            "active_state": "active",
+            "sub_state": "running",
+            "pid": 4101,
+            "restarts": 2,
+        },
+        {
+            "unit": code_two,
+            "active_state": "active",
+            "sub_state": "running",
+            "pid": 4102,
+            "restarts": 5,
+        },
+    ]
+    assert state.restart_count == 7
 
 
 def test_collect_fails_closed_on_unexpected_active_lane(monkeypatch):
@@ -3574,6 +3785,23 @@ def test_fleet_panel_displays_the_complete_coordinated_lane_set(monkeypatch):
         active_environment="opencodeinstruct",
         active_pid=4242,
         coordinated_units=(code_one, code_two),
+        coordinated_unit_statuses=[
+            {
+                "unit": code_one,
+                "active_state": "active",
+                "sub_state": "running",
+                "pid": 4242,
+                "restarts": 2,
+            },
+            {
+                "unit": code_two,
+                "active_state": "active",
+                "sub_state": "running",
+                "pid": 4243,
+                "restarts": 5,
+            },
+        ],
+        restart_count=7,
     )
     monkeypatch.setattr(fleet_web, "_boxes", [box])
     monkeypatch.setattr(fleet_web, "_vs", fleet.ValidatorState())
@@ -3583,6 +3811,88 @@ def test_fleet_panel_displays_the_complete_coordinated_lane_set(monkeypatch):
     assert "code-reserve1 + code-reserve2" in rendered
     assert "2 coordinated lanes" in rendered
     assert f"active_set={code_one},{code_two}" in rendered
+    assert "sum_systemd_nrestarts_across_coordinated_units" in rendered
+    assert f"{code_one}[active/running,pid=4242,r=2]" in rendered
+    assert f"{code_two}[active/running,pid=4243,r=5]" in rendered
+    assert "rΣ7" in rendered
+
+
+def test_coordinated_restart_projection_is_exact_in_health_and_export(
+    monkeypatch,
+):
+    import fleet_web
+
+    now = 40_000.0
+    code_one = "reliquary-miner-pro@code-reserve1.service"
+    code_two = "reliquary-miner-pro@code-reserve2.service"
+    statuses = [
+        {
+            "unit": code_one,
+            "active_state": "active",
+            "sub_state": "running",
+            "pid": 4242,
+            "restarts": 2,
+        },
+        {
+            "unit": code_two,
+            "active_state": "active",
+            "sub_state": "running",
+            "pid": 4243,
+            "restarts": 5,
+        },
+    ]
+    box = _box(
+        proc_alive=True,
+        last_poll_s=now - 1,
+        active_unit=code_one,
+        active_units=[code_one, code_two],
+        active_lane="code-reserve1",
+        active_lanes=["code-reserve1", "code-reserve2"],
+        active_environment="opencodeinstruct",
+        active_pid=4242,
+        coordinated_units=(code_one, code_two),
+        coordinated_unit_statuses=statuses,
+        restart_count=7,
+    )
+    validator = fleet.ValidatorState(
+        state="open",
+        window=100,
+        last_fetch_at=now - 1,
+        health_last_fetch_at=now - 1,
+        health_status="ok",
+        verdicts_last_fetch_at=now - 1,
+    )
+    monkeypatch.setattr(fleet_web, "_boxes", [box])
+    monkeypatch.setattr(fleet_web, "_vs", validator)
+    monkeypatch.setattr(fleet_web, "_windows", [])
+    monkeypatch.setattr(fleet_web, "_last_poll_at", now - 1)
+    monkeypatch.setattr(fleet_web, "_poll_count", 1)
+    monkeypatch.setattr(fleet_web, "_chain", fleet.ChainState())
+    monkeypatch.setattr(
+        fleet_web,
+        "_r2_status_snapshot",
+        lambda: {
+            "last_success_at": now - 1,
+            "error": "",
+            "latest_window": 0,
+            "coverage_complete": False,
+            "coverage": {"complete": False},
+        },
+    )
+
+    health_box = fleet_web.compute_healthz(5, now=now)["fleet"][0]
+    exported_box = fleet_web.render_export_json()["fleet"][0]
+
+    assert health_box["coordinated_unit_statuses"] == statuses
+    assert health_box["restarts"] == 7
+    assert health_box["restart_count_semantics"] == (
+        "sum_systemd_nrestarts_across_coordinated_units"
+    )
+    assert exported_box["coordinated_unit_statuses"] == statuses
+    assert exported_box["restart_count"] == 7
+    assert exported_box["restart_count_semantics"] == (
+        "sum_systemd_nrestarts_across_coordinated_units"
+    )
 
 
 def test_explicit_clean_base_uses_manifest_and_ignores_old_journal_checkpoint():
@@ -4790,7 +5100,9 @@ def test_code_auction_probe_reads_terminal_funnel_15_11_3_1_without_writes(
             accepted INTEGER,
             accepted_into_pool INTEGER,
             selected_for_batch INTEGER,
-            rewarded INTEGER
+            rewarded INTEGER,
+            reason_code TEXT NOT NULL DEFAULT '',
+            reject_stage TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE generation_outcomes (
             attempt_key TEXT NOT NULL,
@@ -4931,6 +5243,115 @@ def test_code_auction_probe_reads_terminal_funnel_15_11_3_1_without_writes(
             1,
         ),
     )
+    # A drand ticket expiry is a proven pre-network local drop only while no
+    # network-stage fact exists for the same attempt. The second expiry below
+    # has a precommit observation and must remain unresolved; an ordinary
+    # transport failure is always unresolved.
+    legacy_transport_insert = (
+        "INSERT INTO events (event_key, observed_at, model_repository, "
+        "checkpoint_revision, checkpoint_n, public_source_revision, "
+        "runtime_profile_hash, environment, attempt_key, window_n, "
+        "lifecycle, merkle_root, accepted, reason_code, reject_stage) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    connection.executemany(
+        legacy_transport_insert,
+        [
+            (
+                "legacy-expired-local",
+                242.0,
+                *partition,
+                "attempt-12",
+                23849,
+                "transport_error",
+                "merkle-12",
+                0,
+                "_DrandSendTicketExpired",
+                "",
+            ),
+            (
+                "legacy-expired-after-precommit",
+                243.0,
+                *partition,
+                "attempt-13",
+                23849,
+                "transport_error",
+                "merkle-13",
+                0,
+                "_DrandSendTicketExpired",
+                "",
+            ),
+            (
+                "legacy-timeout",
+                244.0,
+                *partition,
+                "attempt-14",
+                23849,
+                "transport_error",
+                "merkle-14",
+                0,
+                "ReadTimeout",
+                "",
+            ),
+        ],
+    )
+    connection.executemany(
+        terminal_insert,
+        [
+            (
+                "typed-expired-local",
+                245.0,
+                *partition,
+                "attempt-12",
+                23849,
+                "terminal_unresolved",
+                "merkle-12",
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typed-expired-after-precommit",
+                246.0,
+                *partition,
+                "attempt-13",
+                23849,
+                "terminal_unresolved",
+                "merkle-13",
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typed-precommit",
+                247.0,
+                *partition,
+                "attempt-13",
+                23849,
+                "precommit_sent",
+                "merkle-13",
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typed-timeout",
+                248.0,
+                *partition,
+                "attempt-14",
+                23849,
+                "terminal_unresolved",
+                "merkle-14",
+                None,
+                None,
+                None,
+                None,
+            ),
+        ],
+    )
     # The miner deliberately materializes immutable public-population R2
     # outcomes in the same table under a reserved attempt-key namespace.
     # They inform population intelligence, but must never be attributed to
@@ -5035,6 +5456,7 @@ def test_code_auction_probe_reads_terminal_funnel_15_11_3_1_without_writes(
     assert summary["pool_accepted"] == 3
     assert summary["selected"] == 1
     assert summary["rewarded"] == 1
+    assert summary["terminal_unresolved"] == 2
     assert "accepted" not in summary
     assert ledger_path.read_bytes() == before
 
@@ -5313,7 +5735,7 @@ def test_code_terminal_funnel_surfaces_exact_current_15_11_3_1(
     assert current["selected"] == 1
     assert current["rewarded"] == 1
     assert "accepted" not in current
-    assert "terminal v2: attempts=15" in fleet_html
+    assert "terminal funnel (schema v2): attempts=15" in fleet_html
     assert "HTTP provisional=11" in fleet_html
     assert "pool accepted=3" in fleet_html
     assert "selected=1" in fleet_html
@@ -6208,6 +6630,14 @@ def _code_selector_artifact_document() -> dict:
             "public_source_revision": "2" * 40,
         },
         "model_version": "hierarchical_empirical_bayes_v1",
+        "policy": {
+            "expires_after_window": 24919,
+            "exploration_bps": 2000,
+            "objective": (
+                "P(complete) * E(emitted_full_slots) / expected_gpu_seconds"
+            ),
+            "online_activation_allowed": False,
+        },
         "schema_version": 1,
         "source": {
             "completion": {
@@ -6423,6 +6853,10 @@ def test_lab_collector_preserves_math_emission_selector_contract(monkeypatch):
         "artifact_model_version": "catboost_v2_emitted_slots",
         "artifact_payout_profile": "boundary_fair_split",
         "artifact_economic_target": "effective_full_slots",
+        "artifact_online_activation_allowed": False,
+        "artifact_expires_after_window": 24919,
+        "artifact_objective": "expected_slots_per_gpu_second",
+        "artifact_exploration_bps": 2000,
         "artifact_emitted_slot_lift": 1.625,
         "artifact_emission_mse": 0.07125,
         "artifact_emission_base_mse": 0.0925,
@@ -6440,6 +6874,10 @@ def test_lab_collector_preserves_math_emission_selector_contract(monkeypatch):
 
     assert snapshot.artifact_payout_profile == "boundary_fair_split"
     assert snapshot.artifact_economic_target == "effective_full_slots"
+    assert snapshot.artifact_online_activation_allowed is False
+    assert snapshot.artifact_expires_after_window == 24919
+    assert snapshot.artifact_objective == "expected_slots_per_gpu_second"
+    assert snapshot.artifact_exploration_bps == 2000
     assert snapshot.artifact_emitted_slot_lift == pytest.approx(1.625)
     assert snapshot.artifact_emission_mse == pytest.approx(0.07125)
     assert snapshot.artifact_emission_base_mse == pytest.approx(0.0925)
@@ -6483,6 +6921,12 @@ def test_code_selector_artifact_probe_flattens_censor_aware_evidence(tmp_path):
     assert payload["artifact_heldout_value_lift"] == pytest.approx(0.0167581683)
     assert payload["artifact_completion_brier"] == pytest.approx(0.4031744354)
     assert payload["artifact_selection_brier"] == pytest.approx(0.1718261971)
+    assert payload["artifact_online_activation_allowed"] is False
+    assert payload["artifact_expires_after_window"] == 24919
+    assert payload["artifact_objective"] == (
+        "P(complete) * E(emitted_full_slots) / expected_gpu_seconds"
+    )
+    assert payload["artifact_exploration_bps"] == 2000
     assert payload["artifact_blockers"] == [
         "completion_top_quintile_lift_1_5x",
         "exact_k2_top_quintile_lift_1_5x",
@@ -6933,6 +7377,11 @@ def test_math_emission_selector_artifact_panel_and_api_show_economic_gate(
     assert payload["policy"] == {
         "payout_profile": "boundary_fair_split",
         "economic_target": "effective_full_slots",
+        "online_activation_allowed": None,
+        "expires_after_window": None,
+        "objective": "",
+        "exploration_bps": None,
+        "exploration_rate": None,
     }
     assert payload["validation"]["emitted_slot_lift"] == pytest.approx(1.625)
     assert payload["validation"]["emission_mse"] == pytest.approx(0.07125)
@@ -6993,6 +7442,123 @@ def test_code_selector_artifact_panel_displays_censor_aware_metrics(monkeypatch)
     assert "BLOCKED: completion top quintile lift 1 5x" in rendered
 
 
+def test_expired_shadow_artifact_is_explicit_without_losing_integrity(
+    monkeypatch,
+):
+    import fleet_web
+
+    lab = fleet.LabState(
+        alias="root@198.51.100.136",
+        label="rtx6000b-selector-lab",
+        color="magenta",
+        unit="",
+        evidence_db="",
+        source_manifest="/srv/source-manifest.env",
+        selector_artifact_manifest="/srv/code-selector/manifest.json",
+        last_poll_s=100.0,
+        manifest_submit_disabled=True,
+        manifest_provisioned_ok=True,
+        artifact_manifest_ok=True,
+        artifact_status="shadow_only",
+        artifact_kind="reliquary_code_selector_challenger",
+        artifact_model_version="hierarchical_empirical_bayes_v1",
+        artifact_digest="a" * 64,
+        artifact_checkpoint_n=53,
+        artifact_window_start=24821,
+        artifact_window_end=24871,
+        artifact_online_activation_allowed=False,
+        artifact_expires_after_window=24919,
+        artifact_objective="expected_slots_per_gpu_second",
+        artifact_exploration_bps=2000,
+        artifact_decision_reason="shadow-only challenger",
+    )
+    payload = fleet_web._lab_payload(
+        lab,
+        now=110.0,
+        validator_window=25003,
+    )
+
+    assert payload["status"] == "selector_expired"
+    assert "expired after w24919" in payload["status_detail"]
+    artifact = payload["selector_artifact"]
+    assert artifact["ok"] is True
+    assert artifact["status"] == "shadow_only"
+    assert artifact["artifact_current"] is False
+    assert artifact["expired"] is True
+    assert artifact["validator_window"] == 25003
+    assert artifact["policy"] == {
+        "payout_profile": "",
+        "economic_target": "",
+        "online_activation_allowed": False,
+        "expires_after_window": 24919,
+        "objective": "expected_slots_per_gpu_second",
+        "exploration_bps": 2000,
+        "exploration_rate": pytest.approx(0.2),
+    }
+
+    monkeypatch.setattr(fleet_web, "_labs", [lab])
+    monkeypatch.setattr(fleet_web, "_vs", fleet.ValidatorState(window=25003))
+    monkeypatch.setattr(fleet_web, "_last_poll_at", 100.0)
+    monkeypatch.setattr(fleet_web.time, "time", lambda: 110.0)
+    rendered = fleet_web.render_labs_html()
+
+    assert "SELECTOR EXPIRED" in rendered
+    assert "EXPIRED SHADOW · NOT ACTIVATION ELIGIBLE" in rendered
+    assert "expires after w24919" in rendered
+
+
+def test_current_shadow_artifact_reports_temporal_currency(monkeypatch):
+    import fleet_web
+
+    lab = fleet.LabState(
+        alias="root@198.51.100.136",
+        label="rtx6000b-selector-lab",
+        color="magenta",
+        unit="",
+        evidence_db="",
+        source_manifest="/srv/source-manifest.env",
+        selector_artifact_manifest="/srv/code-selector/manifest.json",
+        last_poll_s=100.0,
+        manifest_submit_disabled=True,
+        manifest_provisioned_ok=True,
+        artifact_manifest_ok=True,
+        artifact_status="shadow_only",
+        artifact_kind="reliquary_code_selector_challenger",
+        artifact_model_version="hierarchical_empirical_bayes_v1",
+        artifact_digest="a" * 64,
+        artifact_checkpoint_n=53,
+        artifact_window_start=24821,
+        artifact_window_end=24871,
+        artifact_online_activation_allowed=False,
+        artifact_expires_after_window=24919,
+        artifact_objective="expected_slots_per_gpu_second",
+        artifact_exploration_bps=2000,
+        artifact_decision_reason="shadow-only challenger",
+    )
+    payload = fleet_web._lab_payload(
+        lab,
+        now=110.0,
+        validator_window=24919,
+    )
+
+    assert payload["status"] == "selector_shadow"
+    artifact = payload["selector_artifact"]
+    assert artifact["ok"] is True
+    assert artifact["artifact_current"] is True
+    assert artifact["expired"] is False
+    assert artifact["validator_window"] == 24919
+
+    monkeypatch.setattr(fleet_web, "_labs", [lab])
+    monkeypatch.setattr(fleet_web, "_vs", fleet.ValidatorState(window=24919))
+    monkeypatch.setattr(fleet_web, "_last_poll_at", 100.0)
+    monkeypatch.setattr(fleet_web.time, "time", lambda: 110.0)
+    rendered = fleet_web.render_labs_html()
+
+    assert "SELECTOR SHADOW" in rendered
+    assert "SELECTOR EXPIRED" not in rendered
+    assert "SHADOW-ONLY · NOT ACTIVATION ELIGIBLE" in rendered
+
+
 def test_failed_lab_never_changes_live_fleet_health(monkeypatch):
     import fleet_web
 
@@ -7018,3 +7584,553 @@ def test_failed_lab_never_changes_live_fleet_health(monkeypatch):
     assert observed["checks"] == baseline["checks"]
     assert "labs" not in observed["checks"]
     assert observed["labs"][0]["status"] == "offline_failed"
+
+
+def _valid_crossover_probe(
+    box: fleet.BoxState,
+    *,
+    window_n: int,
+) -> dict:
+    contract_sha = "1" * 64
+    assignment_sha = "2" * 64
+    return {
+        "schema_version": 1,
+        "configured": True,
+        "valid": True,
+        "settings_process_bound": True,
+        "process_unit": "reliquary-miner-pro@code-reserve2.service",
+        "process_pid": 5252,
+        "lane": "code-reserve2",
+        "contract": {
+            "sha256": contract_sha,
+            "experiment_id": "c53-code-crossover",
+            "control_policy_id": "fast-numeric-meta-v1",
+            "treatment_policy_id": "conditional-k2-v1",
+            "treatment_artifact_sha256": "3" * 64,
+            "public_source_revision": box.reliquary_source_revision,
+            "checkpoint_repository": box.provisioned_model_repo,
+            "checkpoint_revision": box.provisioned_model_revision,
+            "checkpoint_n": box.provisioned_checkpoint_n,
+            "runtime_profile_sha256": box.runtime_profile_hash,
+            "miner_release_revision": box.miner_source_revision,
+            "start_window": window_n - 6,
+            "end_window": window_n + 5,
+            "environment": "opencodeinstruct",
+        },
+        "score_index": {
+            "file_sha256": "3" * 64,
+            "row_count": 2_481_806,
+            "content_digest": "4" * 64,
+            "training_window_start": window_n - 100,
+            "training_window_end": window_n - 7,
+        },
+        "state": {
+            "application_id": 0x52435352,
+            "user_version": 1,
+            "contract_sha256": contract_sha,
+            "latest_assignment": {
+                "block_start_window": window_n,
+                "record_sha256": assignment_sha,
+                "sequence": "BA",
+                "public_randomness_round": 123,
+                "windows": [
+                    {"window_n": window_n, "itt_arm": "treatment"},
+                    {"window_n": window_n + 1, "itt_arm": "control"},
+                ],
+            },
+            "latest_decision": {
+                "window_n": window_n,
+                "record_sha256": "5" * 64,
+                "assignment_sha256": assignment_sha,
+                "itt_arm": "treatment",
+                "execution_arm": "treatment",
+                "validation_status": "passed",
+                "validation_failure_codes": [],
+                "fallback_to_control": False,
+                "reason": "itt_treatment_validated",
+            },
+        },
+        "error": "",
+    }
+
+
+def test_crossover_probe_source_is_process_bound_and_read_only():
+    source = fleet._CODE_SELECTOR_CROSSOVER_PROBE_SOURCE
+
+    compile(source, "<code-selector-crossover-probe>", "exec")
+    assert "/proc/{pid}/environ" in source
+    assert "PRAGMA query_only=ON" in source
+    assert "?mode=ro" in source
+    assert "PRAGMA quick_check" in source
+    assert "sha256_file(path)" in source
+    assert "record_not_canonical" in source
+    assert "ORDER BY window_n DESC LIMIT 1" in source
+    for key in (
+        "RELIQUARY_CODE_SELECTOR_CROSSOVER_CONTRACT_PATH",
+        "RELIQUARY_CODE_SELECTOR_CROSSOVER_CONTRACT_SHA256",
+        "RELIQUARY_CODE_SELECTOR_CROSSOVER_SCORE_INDEX_PATH",
+        "RELIQUARY_CODE_SELECTOR_CROSSOVER_STATE_PATH",
+    ):
+        assert key in source
+    upper = source.upper()
+    for write_sql in (
+        "INSERT INTO",
+        "UPDATE ",
+        "DELETE FROM",
+        "CREATE TABLE",
+        "DROP TABLE",
+        "VACUUM",
+    ):
+        assert write_sql not in upper
+
+
+def test_crossover_probe_parser_is_bounded_and_whitelisted():
+    box, _validator = _ready_code_context()
+    payload = _valid_crossover_probe(box, window_n=23806)
+
+    parsed = fleet._parse_code_selector_crossover_probe(
+        [json.dumps(payload)]
+    )
+
+    assert parsed == payload
+    assert fleet._parse_code_selector_crossover_probe(
+        ["x" * 65_537]
+    ) == {}
+    polluted = copy.deepcopy(payload)
+    polluted["secret"] = "must-not-pass"
+    assert fleet._parse_code_selector_crossover_probe(
+        [json.dumps(polluted)]
+    ) == {}
+    malformed = copy.deepcopy(payload)
+    malformed["state"]["latest_decision"]["window_n"] = True
+    assert fleet._parse_code_selector_crossover_probe(
+        [json.dumps(malformed)]
+    ) == {}
+
+
+def test_crossover_current_arm_requires_exact_fresh_open_window(monkeypatch):
+    import fleet_web
+
+    box, validator = _ready_code_context()
+    now = box.last_poll_s + 1
+    window_n = validator.window
+    reserve2 = "reliquary-miner-pro@code-reserve2.service"
+    box.active_units = [box.active_unit, reserve2]
+    box.active_lanes = [box.active_lane, "code-reserve2"]
+    box.code_selector_crossover_probe = _valid_crossover_probe(
+        box, window_n=window_n
+    )
+    validator.state_raw = {"state": "open", "window_n": window_n}
+
+    current = fleet_web._box_code_selector_crossover_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert current["ok"] is True
+    assert current["current_status"] == "current"
+    assert current["current"]["execution_arm"] == "treatment"
+
+    validator.window = window_n - 7
+    validator.state_raw["window_n"] = validator.window
+    outside = fleet_web._box_code_selector_crossover_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert outside["latest_persisted"]["execution_arm"] == "treatment"
+    assert outside["current"] is None
+    assert outside["current_status"] == "outside_contract"
+
+    # A persisted treatment record remains available only under the explicitly
+    # historical key after the validator advances.
+    validator.window = window_n + 1
+    validator.state_raw["window_n"] = validator.window
+    advanced = fleet_web._box_code_selector_crossover_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert advanced["latest_persisted"]["execution_arm"] == "treatment"
+    assert advanced["current"] is None
+    assert advanced["current_status"] == "decision_pending"
+
+    validator.window = window_n
+    validator.state_raw["window_n"] = window_n
+    validator.last_fetch_at = now - 16
+    stale = fleet_web._box_code_selector_crossover_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert stale["current"] is None
+    assert stale["current_status"] == "validator_stale"
+
+    validator.last_fetch_at = now - 1
+    validator.state = "training"
+    validator.state_raw["state"] = "training"
+    non_open = fleet_web._box_code_selector_crossover_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert non_open["current"] is None
+    assert non_open["current_status"] == "validator_not_open"
+
+    monkeypatch.setattr(fleet_web, "_boxes", [box])
+    monkeypatch.setattr(fleet_web, "_vs", validator)
+    monkeypatch.setattr(fleet_web, "_chain", fleet.ChainState())
+    monkeypatch.setattr(fleet_web, "_windows", [])
+    exported = fleet_web.render_export_json()["fleet"][0][
+        "code_selector_crossover"
+    ]
+    rendered = fleet_web.render_pipeline_html()
+    assert exported["current"] is None
+    assert exported["latest_persisted"]["execution_arm"] == "treatment"
+    assert ">treatment</td>" not in rendered
+
+
+def _valid_overlap_abba_probe(
+    box: fleet.BoxState,
+    *,
+    window_n: int,
+) -> dict:
+    contract_sha = "6" * 64
+    start_window = window_n - 6
+    contract = {
+        "checkpoint_n": box.provisioned_checkpoint_n,
+        "checkpoint_repository": box.provisioned_model_repo,
+        "checkpoint_revision": box.provisioned_model_revision,
+        "end_window": start_window + 63,
+        "experiment_id": "c53-overlap-first-abba-confirmatory",
+        "feature_index_content_digest": "7" * 64,
+        "feature_index_file_sha256": "8" * 64,
+        "miner_release_revision": box.miner_source_revision,
+        "period0_treatment_slot": 0,
+        "public_source_revision": box.reliquary_source_revision,
+        "runtime_profile_sha256": box.runtime_profile_hash,
+        "selector_policy_id": "arithmetic-overlap-first-v2",
+        "selector_policy_version": 2,
+        "sha256": contract_sha,
+        "start_window": start_window,
+    }
+
+    def attempt(shard_slot: int, *, latest_is_activation: bool) -> dict:
+        offset = window_n - start_window
+        treatment_slot = contract["period0_treatment_slot"] ^ (offset % 2)
+        itt_arm = (
+            "treatment" if shard_slot == treatment_slot else "control"
+        )
+        execution_arm = itt_arm
+        selector_policy = (
+            "exploit" if latest_is_activation else "explore"
+        )
+        selected_overlap = latest_is_activation
+        fallback_reason = "" if latest_is_activation else "explore_policy"
+        assignment_record = {
+            "assignment_algorithm":
+                "period0_slot_complementary_two_shard_ab_ba_v1",
+            "assignment_unit": "window_shard",
+            "contract_sha256": contract_sha,
+            "inside_experiment": True,
+            "itt_arm": itt_arm,
+            "kind": "reliquary_code_overlap_abba_assignment",
+            "pair_index": offset // 2,
+            "period": offset % 2,
+            "reason": (
+                "assigned_treatment"
+                if itt_arm == "treatment"
+                else "assigned_control"
+            ),
+            "schema_version": 1,
+            "shard_slot": shard_slot,
+            "treatment_slot": treatment_slot,
+            "window_n": window_n,
+        }
+        return {
+            "activated": bool(
+                itt_arm == "treatment" and latest_is_activation
+            ),
+            "assigned_at": 1000.0 + shard_slot,
+            "assignment_sha256": hashlib.sha256(
+                json.dumps(
+                    assignment_record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "execution_arm": execution_arm,
+            "fallback_reason": fallback_reason,
+            "itt_arm": itt_arm,
+            "overlap_candidate_count": 1 if latest_is_activation else 0,
+            "pair_index": offset // 2,
+            "period": offset % 2,
+            "selected_overlap": selected_overlap,
+            "selector_policy": selector_policy,
+            "treatment_slot": treatment_slot,
+            "window_n": window_n,
+        }
+
+    treatment_latest = attempt(0, latest_is_activation=False)
+    control_latest = attempt(1, latest_is_activation=False)
+    return {
+        "schema_version": 1,
+        "configured": True,
+        "valid": True,
+        "settings_process_bound": True,
+        "contract": contract,
+        "lanes": [
+            {
+                "lane": "code-reserve1",
+                "latest_window": {
+                    "activation_count": 1,
+                    "attempt_count": 2,
+                    "fallback_counts": {
+                        "explore_policy": 1,
+                        "none": 1,
+                    },
+                    "latest_attempt": treatment_latest,
+                    "selected_overlap_count": 1,
+                    "window_n": window_n,
+                },
+                "process_pid": 4242,
+                "process_unit":
+                    "reliquary-miner-pro@code-reserve1.service",
+                "shard_count": 2,
+                "shard_slot": 0,
+            },
+            {
+                "lane": "code-reserve2",
+                "latest_window": {
+                    "activation_count": 0,
+                    "attempt_count": 1,
+                    "fallback_counts": {"explore_policy": 1},
+                    "latest_attempt": control_latest,
+                    "selected_overlap_count": 0,
+                    "window_n": window_n,
+                },
+                "process_pid": 4243,
+                "process_unit":
+                    "reliquary-miner-pro@code-reserve2.service",
+                "shard_count": 2,
+                "shard_slot": 1,
+            },
+        ],
+        "error": "",
+    }
+
+
+def _configure_overlap_abba_pair(box: fleet.BoxState) -> None:
+    reserve1 = "reliquary-miner-pro@code-reserve1.service"
+    reserve2 = "reliquary-miner-pro@code-reserve2.service"
+    box.active_units = [reserve1, reserve2]
+    box.active_lanes = ["code-reserve1", "code-reserve2"]
+    box.coordinated_units = (reserve1, reserve2)
+    box.coordinated_unit_statuses = [
+        {
+            "unit": reserve1,
+            "active_state": "active",
+            "sub_state": "running",
+            "pid": 4242,
+            "restarts": 0,
+        },
+        {
+            "unit": reserve2,
+            "active_state": "active",
+            "sub_state": "running",
+            "pid": 4243,
+            "restarts": 0,
+        },
+    ]
+
+
+def test_overlap_abba_probe_source_is_process_bound_and_read_only():
+    source = fleet._CODE_OVERLAP_ABBA_PROBE_SOURCE
+
+    compile(source, "<code-overlap-abba-probe>", "exec")
+    assert "/proc/{pid}/environ" in source
+    assert "PRAGMA query_only=ON" in source
+    assert "?mode=ro" in source
+    assert "ORDER BY window_n DESC,assigned_at DESC,attempt_key DESC" in source
+    assert "window_n=(SELECT MAX(window_n)" in source
+    assert 'fail(out, "process_identity_unavailable")' in source
+    assert 'fail(out, "process_environment_unavailable")' in source
+    for key in (
+        "RELIQUARY_CODE_OVERLAP_ABBA_CONTRACT_PATH",
+        "RELIQUARY_CODE_OVERLAP_ABBA_CONTRACT_SHA256",
+        "RELIQUARY_CODE_OUTCOME_LEDGER",
+    ):
+        assert key in source
+    upper = source.upper()
+    for write_sql in (
+        "INSERT INTO",
+        "UPDATE ",
+        "DELETE FROM",
+        "CREATE TABLE",
+        "DROP TABLE",
+        "VACUUM",
+    ):
+        assert write_sql not in upper
+
+
+def test_overlap_abba_probe_parser_preserves_window_aggregate_and_fails_closed():
+    box, validator = _ready_code_context()
+    payload = _valid_overlap_abba_probe(box, window_n=validator.window)
+
+    parsed = fleet._parse_code_overlap_abba_probe([json.dumps(payload)])
+
+    assert parsed == payload
+    treatment_window = parsed["lanes"][0]["latest_window"]
+    assert treatment_window["activation_count"] == 1
+    assert treatment_window["attempt_count"] == 2
+    assert treatment_window["latest_attempt"]["activated"] is False
+    assert fleet._parse_code_overlap_abba_probe(["x" * 65_537]) == {}
+    unavailable = {
+        "schema_version": 1,
+        "configured": True,
+        "valid": False,
+        "settings_process_bound": False,
+        "contract": {},
+        "lanes": [],
+        "error": "process_identity_unavailable",
+    }
+    assert fleet._parse_code_overlap_abba_probe(
+        [json.dumps(unavailable)]
+    ) == unavailable
+
+    mutations = []
+    polluted = copy.deepcopy(payload)
+    polluted["secret"] = "must-not-pass"
+    mutations.append(polluted)
+    bool_schema = copy.deepcopy(payload)
+    bool_schema["schema_version"] = True
+    mutations.append(bool_schema)
+    float_shards = copy.deepcopy(payload)
+    float_shards["lanes"][0]["shard_count"] = 2.0
+    mutations.append(float_shards)
+    bool_period = copy.deepcopy(payload)
+    bool_period["lanes"][0]["latest_window"]["latest_attempt"][
+        "period"
+    ] = False
+    mutations.append(bool_period)
+    control_escalation = copy.deepcopy(payload)
+    control_escalation["lanes"][1]["latest_window"]["latest_attempt"][
+        "execution_arm"
+    ] = "treatment"
+    mutations.append(control_escalation)
+    lane_mismatch = copy.deepcopy(payload)
+    lane_mismatch["lanes"][0]["lane"] = "code-reserve2"
+    mutations.append(lane_mismatch)
+    bad_total = copy.deepcopy(payload)
+    bad_total["lanes"][0]["latest_window"]["attempt_count"] = 3
+    mutations.append(bad_total)
+
+    for malformed in mutations:
+        assert fleet._parse_code_overlap_abba_probe(
+            [json.dumps(malformed)]
+        ) == {}
+
+
+def test_overlap_abba_current_export_health_and_ui_use_window_aggregate(
+    monkeypatch,
+):
+    import fleet_web
+
+    box, validator = _ready_code_context()
+    now = box.last_poll_s + 1
+    _configure_overlap_abba_pair(box)
+    validator.state_raw = {"state": "open", "window_n": validator.window}
+    payload = _valid_overlap_abba_probe(box, window_n=validator.window)
+    box.code_overlap_abba_probe = fleet._parse_code_overlap_abba_probe(
+        [json.dumps(payload)]
+    )
+    monkeypatch.setattr(
+        settings.SETTINGS, "health_poll_stale_seconds", 60.0
+    )
+    within_configured_budget = (
+        fleet_web._box_code_overlap_abba_details(
+            box,
+            validator,
+            now=box.last_poll_s + 30,
+        )
+    )
+    assert within_configured_budget["current_status"] == "current"
+    monkeypatch.setattr(fleet_web, "_boxes", [box])
+    monkeypatch.setattr(fleet_web, "_labs", [])
+    monkeypatch.setattr(fleet_web, "_vs", validator)
+    monkeypatch.setattr(fleet_web, "_windows", [])
+    monkeypatch.setattr(fleet_web, "_last_poll_at", now - 1)
+    monkeypatch.setattr(fleet_web, "_poll_count", 1)
+    monkeypatch.setattr(fleet_web, "_chain", fleet.ChainState())
+    monkeypatch.setattr(
+        fleet_web,
+        "_r2_status_snapshot",
+        lambda: {
+            "last_success_at": now - 1,
+            "latest_window": validator.window - 1,
+            "coverage_complete": True,
+            "coverage": {"complete": True},
+        },
+    )
+
+    details = fleet_web._box_code_overlap_abba_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    exported = fleet_web.render_export_json()["fleet"][0][
+        "code_overlap_abba"
+    ]
+    health = fleet_web.compute_healthz(5, now=now)["fleet"][0][
+        "code_overlap_abba"
+    ]
+    pipeline = fleet_web.render_pipeline_html()
+
+    assert details["ok"] is True
+    assert details["current_status"] == "current"
+    treatment = details["current"][0]
+    assert treatment["activation_count"] == 1
+    assert treatment["attempt_count"] == 2
+    assert treatment["latest_attempt"]["activated"] is False
+    assert exported["current"] == details["current"]
+    assert health["current"] == details["current"]
+    assert "activations=1" in pipeline
+    assert "latest attempt" in pipeline
+
+
+def test_overlap_abba_current_requires_fresh_open_window_and_exact_pid():
+    import fleet_web
+
+    box, validator = _ready_code_context()
+    now = box.last_poll_s + 1
+    _configure_overlap_abba_pair(box)
+    validator.state_raw = {"state": "open", "window_n": validator.window}
+    box.code_overlap_abba_probe = _valid_overlap_abba_probe(
+        box, window_n=validator.window
+    )
+
+    current = fleet_web._box_code_overlap_abba_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert current["current_status"] == "current"
+
+    validator.window += 1
+    validator.state_raw["window_n"] = validator.window
+    pending = fleet_web._box_code_overlap_abba_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert pending["current"] is None
+    assert pending["current_status"] == "assignment_pending"
+
+    validator.window -= 1
+    validator.state_raw["window_n"] = validator.window
+    validator.last_fetch_at = now - 16
+    stale = fleet_web._box_code_overlap_abba_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert stale["current_status"] == "validator_stale"
+
+    validator.last_fetch_at = now - 1
+    box.coordinated_unit_statuses[1]["pid"] = 9999
+    drifted = fleet_web._box_code_overlap_abba_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert drifted["ok"] is False
+    assert "process_identity_mismatch:1" in drifted["issues"]
+
+    box.code_overlap_abba_probe = {}
+    disabled = fleet_web._box_code_overlap_abba_details(
+        box, validator, now=now, stale_after_s=15
+    )
+    assert disabled["configured"] is False
+    assert disabled["ok"] is True
+    assert disabled["current_status"] == "disabled"

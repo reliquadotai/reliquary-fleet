@@ -484,7 +484,7 @@ def test_dashboard_snapshot_is_single_failure_isolated_payload(monkeypatch) -> N
     assert response.status_code == 200
     payload = response.json()
     assert payload["schema_version"] == 1
-    assert len(payload["panels"]) == 18
+    assert len(payload["panels"]) == 24
     assert set(payload["panels"]) == {
         "score",
         "windows",
@@ -504,6 +504,12 @@ def test_dashboard_snapshot_is_single_failure_isolated_payload(monkeypatch) -> N
         "rtt",
         "quality",
         "events",
+        "miner_now",
+        "miner_pipeline",
+        "miner_attempts",
+        "miner_auction",
+        "miner_runtime",
+        "miner_log",
     }
 
 

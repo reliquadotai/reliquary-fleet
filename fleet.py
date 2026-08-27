@@ -32,6 +32,7 @@ import argparse
 import copy
 import concurrent.futures
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -143,9 +144,16 @@ FLEET: list = []
 # No hotkey exists in this structure, so labs cannot enter OUR_SS58 or any
 # submission/reward aggregation.
 LABS: list = []
+# Wallet-free accelerator components are separate from both full miner rows
+# and offline labs. They have no hotkey and cannot enter reward accounting.
+FLEET_COMPONENTS: list[dict[str, Any]] = []
 FLEET_ENV_FILES: dict[str, str] = {}
 FLEET_UNIT_CANDIDATES: dict[str, list[tuple[str, str]]] = {}
+FLEET_CONTROLLER_CONFIG_PATHS: dict[str, dict[str, str]] = {}
 FLEET_COORDINATED_UNITS: dict[str, list[str]] = {}
+FLEET_STANDALONE_TELEMETRY: dict[str, dict[str, Any]] = {}
+FLEET_STANDALONE_CERTIFICATION: dict[str, dict[str, str]] = {}
+FLEET_RELIQUARY_ONE: dict[str, dict[str, Any]] = {}
 # Per-row view of every explicitly configured miner service on the same SSH
 # host. A row still collects only its own service (or replacement candidates),
 # while the resolver permits sibling lanes in this host-wide allowlist and
@@ -207,12 +215,38 @@ class BoxState:
     # this logical box. Exactly one must be active unless ``coordinated_units``
     # explicitly names the complete multi-lane set allowed to run together.
     unit_candidates: tuple[tuple[str, str], ...] = ()
+    unit_controller_config_paths: tuple[tuple[str, str], ...] = ()
     coordinated_units: tuple[str, ...] = ()
     host_unit_allowlist: tuple[str, ...] = ()
+    standalone_telemetry_path: str = ""
+    standalone_runtime_manifest_path: str = ""
+    active_unit_registry_path: str = ""
+    active_unit_registry: dict[str, object] = field(default_factory=dict)
+    standalone_supervisor_status_path: str = ""
+    standalone_telemetry_stale_seconds: float = 90.0
+    miner_kind: str = "legacy"
+    reliquary_one_state_root: str = ""
+    reliquary_one: dict[str, Any] = field(default_factory=dict)
+    reliquary_one_error: str = ""
+    standalone_certification_config: dict[str, str] = field(
+        default_factory=dict
+    )
+    operator: str = ""
     active_unit: str = ""
     active_lane: str = ""
     active_units: list[str] = field(default_factory=list)
     active_lanes: list[str] = field(default_factory=list)
+    # Exact bounded systemd projection for every explicitly coordinated unit.
+    # The legacy ``restart_count`` scalar is the sum of ``restarts`` across
+    # this complete set; for a non-coordinated box it remains the selected
+    # active unit's NRestarts value.
+    coordinated_unit_statuses: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    # Host-wide, read-only inventory of active Reliquary services.  These rows
+    # are systemd/process attestations only: discovery never grants mining
+    # authority or bypasses the configured controller allowlist.
+    service_inventory: list[dict[str, object]] = field(default_factory=list)
     active_environment: str = ""
     active_pid: int = 0
     unit_resolution_error: str = ""
@@ -245,14 +279,14 @@ class BoxState:
     # `pregen_30m` / `pregen_60m` for the "miner is alive and producing"
     # signal, while `acpt_30m` reflects actual earning activity.
     last_event_at: str = "—"
-    acpt_30m: int = 0
-    rej_30m: int = 0
+    acpt_30m: int | None = 0
+    rej_30m: int | None = 0
     window_mismatch_30m: int = 0  # split out from generic rejects
     grail_fail_30m: int = 0
     bad_term_30m: int = 0
     last_reject_reason: str = ""
     # Throughput rolling (last 60 min, validator-confirmed).
-    acpt_60m: int = 0
+    acpt_60m: int | None = 0
     # Miner-side pregen queue activity. ACCEPTED-PREGEN lines from
     # the miner's journal. Tells you the box is producing rollouts;
     # doesn't tell you the validator accepted any of them.
@@ -313,8 +347,41 @@ class BoxState:
     miner_unit_enablement: str = ""
     runtime_profile_hash: str = ""
     code_auction_probe: dict[str, Any] = field(default_factory=dict)
+    # Cross-lane Code selector experiment truth. Unlike ``code_auction_probe``
+    # this may describe a coordinated sibling (currently reserve2), so the
+    # remote probe enumerates the resolver-approved active set and reads the
+    # four activation variables from each live process, never from a stale
+    # EnvironmentFile.
+    code_selector_crossover_probe: dict[str, Any] = field(default_factory=dict)
+    # Process-bound same-shard AB/BA contract plus latest durable assignment
+    # per coordinated lane. Kept separate from the retired k2 crossover
+    # because the two experiments have different activation/state schemas.
+    code_overlap_abba_probe: dict[str, Any] = field(default_factory=dict)
+    # Schema-normalized, freshness-bound snapshot from a standalone miner's
+    # atomic dashboard JSON. Empty means this row uses the legacy probe.
+    standalone_telemetry: dict[str, Any] = field(default_factory=dict)
+    standalone_generated_at: float = 0.0
+    standalone_age_s: float = -1.0
+    standalone_fresh: bool = False
+    standalone_error: str = ""
+    standalone_controller_mode: str = ""
+    standalone_controller_config_path: str = ""
+    standalone_active_runtime_manifest_path: str = ""
+    standalone_active_ledger_path: str = ""
+    standalone_supervisor: dict[str, Any] = field(default_factory=dict)
+    standalone_progress_age_s: float = -1.0
+    # Exact, submit-disabled standalone certification is deliberately
+    # separate from live miner process and funnel state. It is populated only
+    # when no configured canary/mine unit is active.
+    standalone_certification: dict[str, Any] = field(default_factory=dict)
+    runtime_components: list[dict[str, Any]] = field(default_factory=list)
     miner_source_revision: str = ""
     reliquary_source_revision: str = ""
+    # The validator image may contain private deployment-only commits while
+    # ``reliquary_source_revision`` names the public protocol source closure.
+    # Keep both identities: compatibility is certified against the latter,
+    # whereas live deployment drift is checked against the former.
+    observed_validator_image_revision: str = ""
     source_manifest_provisioned_ok: bool = False
     provisioned_model_kind: str = ""
     provisioned_checkpoint_n: int = -1
@@ -326,11 +393,16 @@ class BoxState:
     quarantine_path: str = ""
     quarantine_reason: str = ""
     quarantine_at: float = 0.0
+    # ``acceptance_scope`` makes the ownership of a verdict counter explicit.
+    # A validator endpoint is keyed by hotkey, so two host rows sharing one
+    # hotkey must never receive a made-up per-host zero or a duplicated total.
     acceptance_source: str = "events"
-    final_accept_30m: int = 0
-    final_accept_60m: int = 0
-    final_reject_30m: int = 0
-    final_reject_60m: int = 0
+    acceptance_scope: str = "per_hotkey"
+    shared_hotkey_verdicts: dict[str, object] = field(default_factory=dict)
+    final_accept_30m: int | None = 0
+    final_accept_60m: int | None = 0
+    final_reject_30m: int | None = 0
+    final_reject_60m: int | None = 0
     last_final_reason: str = ""
     last_final_window: int = 0
     last_final_ts: float = 0.0
@@ -378,7 +450,7 @@ class BoxState:
     watchdog_last_action: str = ""
     watchdog_last_error: str = ""
     # Process / system health
-    restart_count: int = 0     # systemd NRestarts
+    restart_count: int = 0     # coordinated sum or selected-unit NRestarts
     rss_mb: int = 0
     cpu_pct: int = 0
     disk_used_pct: int = 0     # /srv volume
@@ -466,6 +538,10 @@ class LabState:
     artifact_value_multiclass_brier: float | None = None
     artifact_payout_profile: str = ""
     artifact_economic_target: str = ""
+    artifact_online_activation_allowed: bool | None = None
+    artifact_expires_after_window: int | None = None
+    artifact_objective: str = ""
+    artifact_exploration_bps: int | None = None
     artifact_emitted_slot_lift: float | None = None
     artifact_emission_mse: float | None = None
     artifact_emission_base_mse: float | None = None
@@ -483,6 +559,97 @@ class LabState:
     artifact_blockers: list[str] = field(default_factory=list)
     artifact_decision_reason: str = ""
     artifact_error: str = ""
+    error: str = ""
+
+
+@dataclass
+class ComponentState:
+    """Read-only truth for one wallet-free component of a full miner."""
+
+    alias: str
+    label: str
+    color: str
+    role: str
+    controller_label: str
+    generator_unit: str
+    tunnel_unit: str
+    runtime_manifest_path: str
+    runtime_profile_path: str
+    component_config_path: str
+    evidence_alias: str
+    evidence_dir: str
+    evidence_runtime_manifest_path: str
+    evidence_runtime_profile_path: str
+    evidence_target_windows: int
+    evidence_stale_seconds: float
+    telemetry_stale_seconds: float
+    last_poll_s: float = 0.0
+    generator_active_state: str = "unknown"
+    generator_sub_state: str = "unknown"
+    generator_enablement: str = "unknown"
+    generator_pid: int = 0
+    generator_restarts: int = 0
+    tunnel_active_state: str = "unknown"
+    tunnel_sub_state: str = "unknown"
+    tunnel_enablement: str = "unknown"
+    tunnel_pid: int = 0
+    tunnel_restarts: int = 0
+    gpu_uuid: str = ""
+    gpu_name: str = ""
+    compute_capability: str = ""
+    gpu_mem_mb: int = 0
+    gpu_total_mb: int = 1
+    gpu_util: int = 0
+    gpu_power_w: float = 0.0
+    gpu_power_limit_w: float = 0.0
+    component_role: str = ""
+    manifest_schema_version: int = 0
+    manifest_sha256: str = ""
+    manifest_profile_sha256: str = ""
+    miner_source_revision: str = ""
+    validator_source_revision: str = ""
+    checkpoint_n: int = 0
+    checkpoint_revision: str = ""
+    model_repo: str = ""
+    environment: str = ""
+    runtime_profile_sha256: str = ""
+    runtime_regime: str = ""
+    profile_file_sha256: str = ""
+    profile_source_revision: str = ""
+    profile_checkpoint_revision: str = ""
+    profile_gpu_uuid: str = ""
+    identity_ok: bool = False
+    wallet_absent_attested: bool = False
+    submit_authority: bool = False
+    evidence_valid_windows: int = 0
+    evidence_complete_groups: int = 0
+    evidence_first_window: int = 0
+    evidence_last_window: int = 0
+    evidence_latest_at: float = 0.0
+    evidence_source_ok: bool = False
+    evidence_fresh: bool = False
+    evidence_certificate_bound: bool = False
+    evidence_manifest_sha256: str = ""
+    evidence_profile_sha256: str = ""
+    evidence_error: str = ""
+    # A live component can advance checkpoints independently from the static
+    # rollback row in config.yaml.  These fields are populated only after the
+    # running worker process, its immutable runtime manifest, and the current
+    # controller manifest all agree on one exact component identity.
+    resolution_source: str = "static_config"
+    worker_state: str = ""
+    worker_progress_fresh: bool = False
+    worker_progress_age_s: float = -1.0
+    worker_boot_id: str = ""
+    worker_engine_epoch: str = ""
+    worker_recovery_count: int = 0
+    active_job_id: str = ""
+    active_window_n: int = 0
+    active_started_at: float = 0.0
+    active_deadline_at: float = 0.0
+    last_completed_job_id: str = ""
+    last_completed_window_n: int = 0
+    last_completed_at: float = 0.0
     error: str = ""
 
 
@@ -562,6 +729,10 @@ result = {
     "artifact_value_multiclass_brier": None,
     "artifact_payout_profile": "",
     "artifact_economic_target": "",
+    "artifact_online_activation_allowed": None,
+    "artifact_expires_after_window": None,
+    "artifact_objective": "",
+    "artifact_exploration_bps": None,
     "artifact_emitted_slot_lift": None,
     "artifact_emission_mse": None,
     "artifact_emission_base_mse": None,
@@ -875,6 +1046,10 @@ if selector_artifact_manifest:
         extra = {
             "artifact_payout_profile": "",
             "artifact_economic_target": "",
+            "artifact_online_activation_allowed": None,
+            "artifact_expires_after_window": None,
+            "artifact_objective": "",
+            "artifact_exploration_bps": None,
             "artifact_emitted_slot_lift": None,
             "artifact_emission_mse": None,
             "artifact_emission_base_mse": None,
@@ -892,6 +1067,46 @@ if selector_artifact_manifest:
             "artifact_blockers": [],
             "artifact_decision_reason": "",
         }
+        policy_document = document.get("policy")
+        if policy_document is None:
+            policy_document = {}
+        if not isinstance(policy_document, dict):
+            raise RuntimeError("artifact_policy")
+        online_activation_allowed = policy_document.get(
+            "online_activation_allowed"
+        )
+        if (
+            online_activation_allowed is not None
+            and not isinstance(online_activation_allowed, bool)
+        ):
+            raise RuntimeError("artifact_online_activation_allowed")
+        expires_after_window = policy_document.get("expires_after_window")
+        if expires_after_window is not None:
+            expires_after_window = nonnegative_int(expires_after_window)
+            if expires_after_window <= 0:
+                raise RuntimeError("artifact_expires_after_window")
+        objective = policy_document.get("objective", "")
+        if (
+            not isinstance(objective, str)
+            or len(objective) > 2048
+            or any(ord(character) < 0x20 for character in objective)
+        ):
+            raise RuntimeError("artifact_objective")
+        exploration_bps = policy_document.get("exploration_bps")
+        if exploration_bps is not None:
+            exploration_bps = nonnegative_int(exploration_bps)
+            if exploration_bps > 10_000:
+                raise RuntimeError("artifact_exploration_bps")
+        extra.update(
+            {
+                "artifact_online_activation_allowed": (
+                    online_activation_allowed
+                ),
+                "artifact_expires_after_window": expires_after_window,
+                "artifact_objective": objective,
+                "artifact_exploration_bps": exploration_bps,
+            }
+        )
         if report_kind == "reliquary_math_selector_bounded_search":
             cutoff = document.get("cutoff")
             dataset = document.get("dataset")
@@ -1221,6 +1436,1171 @@ _MATH_AUCTION_READINESS_RE = re.compile(
 # In particular, it never sources the operator EnvironmentFile, never creates
 # the SQLite database, and never emits prompts, completions, wallet material,
 # or per-attempt identifiers.
+_CODE_SELECTOR_CROSSOVER_PROBE_SOURCE = r"""
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import urllib.parse
+
+SCHEMA_VERSION = 1
+CROSSOVER_ROOT = "/srv/reliquary-miner-pro/state/code-selector-crossover"
+CONTRACT_KIND = "reliquary_code_selector_crossover_contract"
+ASSIGNMENT_KIND = "reliquary_code_selector_crossover_pair_assignment"
+DECISION_KIND = "reliquary_code_selector_crossover_execution_decision"
+ASSIGNMENT_ALGORITHM = "sha256_canonical_json_first_byte_lsb_paired_ab_ba_v1"
+ASSIGNMENT_DOMAIN = "reliquary-miner-pro/code-selector-crossover/paired-ab-ba/v1"
+SCORE_APPLICATION_ID = 0x524B3253
+STATE_APPLICATION_ID = 0x52435352
+STATE_SCHEMA_VERSION = 1
+MAX_CONTRACT_BYTES = 64 * 1024
+MAX_RECORD_BYTES = 64 * 1024
+ENV_KEYS = (
+    "RELIQUARY_CODE_SELECTOR_CROSSOVER_CONTRACT_PATH",
+    "RELIQUARY_CODE_SELECTOR_CROSSOVER_CONTRACT_SHA256",
+    "RELIQUARY_CODE_SELECTOR_CROSSOVER_SCORE_INDEX_PATH",
+    "RELIQUARY_CODE_SELECTOR_CROSSOVER_STATE_PATH",
+)
+CONTRACT_KEYS = {
+    "assignment_algorithm", "assignment_domain", "assignment_unit",
+    "checkpoint_n", "checkpoint_repository", "checkpoint_revision",
+    "control_policy_id", "end_window", "environment", "experiment_id",
+    "kind", "miner_id", "miner_release_revision", "operator_id",
+    "public_source_revision", "runtime_profile_sha256", "schema_version",
+    "shard_id", "start_window", "topology_id",
+    "treatment_artifact_sha256", "treatment_policy_id",
+}
+ASSIGNMENT_KEYS = {
+    "assignment_algorithm", "assignment_material_sha256", "assignment_unit",
+    "block_start_window", "contract_sha256", "kind", "public_randomness",
+    "public_randomness_round", "randomness_window", "schema_version",
+    "sequence", "windows",
+}
+DECISION_KEYS = {
+    "assignment_sha256", "contract_sha256", "execution_arm",
+    "fallback_to_control", "itt_arm", "kind", "reason", "schema_version",
+    "validation_failure_codes", "validation_status", "window_n",
+}
+INDEX_METADATA_KEYS = {
+    "artifact_checksum", "artifact_manifest_file_sha256",
+    "artifact_model_version", "catboost_version", "checkpoint_n",
+    "checkpoint_revision", "content_digest", "dataset_manifest_sha256",
+    "environment", "exact_k2_model_file_sha256",
+    "exact_k2_validation_rows", "feature_index_content_digest",
+    "feature_index_file_sha256", "feature_vector_order", "index_kind",
+    "model_repository", "population_rows", "prompt_repository",
+    "prompt_revision", "public_source_revision", "rank_order", "row_count",
+    "schema_version", "score_encoding", "training_window_end",
+    "training_window_start",
+}
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+UNIT = re.compile(r"^[A-Za-z0-9_.@:-]{1,128}\.service$")
+TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$")
+
+
+def canonical_json(value):
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def unique_object(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate_json_key")
+        out[key] = value
+    return out
+
+
+def reject_constant(_value):
+    raise ValueError("nonfinite_json")
+
+
+def strict_json(payload, maximum):
+    if not isinstance(payload, bytes) or not payload or len(payload) > maximum:
+        raise ValueError("record_size")
+    value = json.loads(
+        payload.decode("utf-8", "strict"),
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+    if not isinstance(value, dict) or canonical_json(value) != payload:
+        raise ValueError("record_not_canonical")
+    return value
+
+
+def exact_int(value, *, minimum=0):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError("integer_invalid")
+    return value
+
+
+def exact_text(value, *, maximum=512, token=False):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+    ):
+        raise ValueError("text_invalid")
+    if token and TOKEN.fullmatch(value) is None:
+        raise ValueError("token_invalid")
+    return value
+
+
+def exact_sha(value, pattern=HEX64):
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        raise ValueError("digest_invalid")
+    return value
+
+
+def regular_file(path, *, maximum=None):
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("path_not_regular")
+    if before.st_size <= 0 or (maximum is not None and before.st_size > maximum):
+        raise ValueError("path_size")
+    return before
+
+
+def sha256_file(path):
+    before = regular_file(path)
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    after = os.lstat(path)
+    if (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
+    ) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+    ):
+        raise ValueError("path_changed")
+    return digest.hexdigest()
+
+
+def process_env(pid):
+    values = {}
+    try:
+        raw = open(f"/proc/{pid}/environ", "rb").read()
+        for item in raw.split(b"\0"):
+            key, separator, value = item.partition(b"=")
+            if not separator:
+                continue
+            decoded = key.decode("ascii", "strict")
+            if decoded in ENV_KEYS:
+                values[decoded] = value.decode("utf-8", "strict")
+    except (OSError, UnicodeError):
+        return {}
+    return values
+
+
+def main_pid(unit):
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "-p", "MainPID", "--value", unit],
+            capture_output=True,
+            text=True,
+            timeout=0.75,
+            check=False,
+        )
+        value = result.stdout.strip()
+        return int(value) if value.isdigit() else 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def readonly_uri(path, *, immutable=False):
+    suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+    return "file:" + urllib.parse.quote(path, safe="/") + suffix
+
+
+def validate_contract(path, expected_sha):
+    exact_sha(expected_sha)
+    expected_path = os.path.join(
+        CROSSOVER_ROOT, "contracts", expected_sha + ".json"
+    )
+    if path != expected_path or os.path.realpath(path) != path:
+        raise ValueError("contract_path")
+    info = regular_file(path, maximum=MAX_CONTRACT_BYTES)
+    with open(path, "rb") as handle:
+        payload = handle.read(MAX_CONTRACT_BYTES + 1)
+    after = os.lstat(path)
+    if (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+    ) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+    ):
+        raise ValueError("contract_changed")
+    if hashlib.sha256(payload).hexdigest() != expected_sha:
+        raise ValueError("contract_digest")
+    record = strict_json(payload, MAX_CONTRACT_BYTES)
+    if set(record) != CONTRACT_KEYS:
+        raise ValueError("contract_keys")
+    if (
+        record["schema_version"] != 1
+        or record["kind"] != CONTRACT_KIND
+        or record["assignment_algorithm"] != ASSIGNMENT_ALGORITHM
+        or record["assignment_domain"] != ASSIGNMENT_DOMAIN
+        or record["assignment_unit"] != "whole_window"
+        or record["environment"] != "opencodeinstruct"
+    ):
+        raise ValueError("contract_schema")
+    for field in (
+        "public_source_revision", "checkpoint_revision",
+        "miner_release_revision",
+    ):
+        exact_sha(record[field], HEX40)
+    for field in ("treatment_artifact_sha256", "runtime_profile_sha256"):
+        exact_sha(record[field])
+    for field in (
+        "checkpoint_repository", "control_policy_id", "experiment_id",
+        "miner_id", "operator_id", "shard_id", "topology_id",
+        "treatment_policy_id",
+    ):
+        exact_text(record[field], token=field != "checkpoint_repository")
+    if record["control_policy_id"] == record["treatment_policy_id"]:
+        raise ValueError("contract_arms")
+    exact_int(record["checkpoint_n"])
+    start = exact_int(record["start_window"], minimum=1)
+    end = exact_int(record["end_window"], minimum=1)
+    if end < start or (end - start + 1) % 2:
+        raise ValueError("contract_range")
+    return record
+
+
+def metadata_int(metadata, key, *, minimum):
+    value = metadata.get(key)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("index_metadata_integer") from None
+    if not isinstance(value, str) or str(parsed) != value or parsed < minimum:
+        raise ValueError("index_metadata_integer")
+    return parsed
+
+
+def validate_index(path, contract):
+    artifact_sha = contract["treatment_artifact_sha256"]
+    expected_path = os.path.join(
+        CROSSOVER_ROOT, "score-indexes", artifact_sha + ".sqlite3"
+    )
+    if path != expected_path or os.path.realpath(path) != path:
+        raise ValueError("index_path")
+    if sha256_file(path) != artifact_sha:
+        raise ValueError("index_digest")
+    connection = sqlite3.connect(
+        readonly_uri(path, immutable=True), uri=True, isolation_level=None
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        if int(connection.execute("PRAGMA application_id").fetchone()[0]) != SCORE_APPLICATION_ID:
+            raise ValueError("index_application_id")
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 1:
+            raise ValueError("index_schema_version")
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if tables != {"metadata", "prompt_scores"}:
+            raise ValueError("index_tables")
+        columns = {
+            table: tuple(
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(" + table + ")")
+            )
+            for table in tables
+        }
+        if columns != {
+            "metadata": ("key", "value"),
+            "prompt_scores": ("prompt_idx", "score"),
+        }:
+            raise ValueError("index_columns")
+        check = connection.execute("PRAGMA quick_check").fetchone()
+        if check is None or str(check[0]).lower() != "ok":
+            raise ValueError("index_integrity")
+        rows = connection.execute(
+            "SELECT key,value,typeof(key),typeof(value) FROM metadata ORDER BY key"
+        ).fetchall()
+        if any(row[2] != "text" or row[3] != "text" for row in rows):
+            raise ValueError("index_metadata_types")
+        metadata = {str(row[0]): str(row[1]) for row in rows}
+        if len(metadata) != len(rows) or set(metadata) != INDEX_METADATA_KEYS:
+            raise ValueError("index_metadata_keys")
+        if (
+            metadata["index_kind"] != "reliquary_code_exact_k2_score_index"
+            or metadata["schema_version"] != "1"
+            or metadata["environment"] != contract["environment"]
+            or metadata["public_source_revision"] != contract["public_source_revision"]
+            or metadata["model_repository"] != contract["checkpoint_repository"]
+            or metadata["checkpoint_revision"] != contract["checkpoint_revision"]
+            or metadata["checkpoint_n"] != str(contract["checkpoint_n"])
+            or metadata["artifact_model_version"] != "catboost_conditional_value_v2"
+            or metadata["rank_order"] != "score_desc_prompt_idx_asc"
+            or metadata["score_encoding"]
+            != "sqlite_real_ieee754_binary64_unquantized"
+        ):
+            raise ValueError("index_identity")
+        for key in (
+            "artifact_checksum", "artifact_manifest_file_sha256",
+            "content_digest", "dataset_manifest_sha256",
+            "exact_k2_model_file_sha256", "feature_index_content_digest",
+            "feature_index_file_sha256",
+        ):
+            exact_sha(metadata[key])
+        row_count = metadata_int(metadata, "row_count", minimum=1)
+        training_start = metadata_int(
+            metadata, "training_window_start", minimum=0
+        )
+        training_end = metadata_int(metadata, "training_window_end", minimum=0)
+        if training_end < training_start or training_end >= contract["start_window"]:
+            raise ValueError("index_training_range")
+        metadata_int(metadata, "population_rows", minimum=1)
+        metadata_int(metadata, "exact_k2_validation_rows", minimum=1)
+        stats = connection.execute(
+            "SELECT COUNT(*),MIN(prompt_idx),MAX(prompt_idx),"
+            "SUM(CASE WHEN typeof(score)!='real' OR score<0.0 OR score>1.0 "
+            "OR score!=score THEN 1 ELSE 0 END) FROM prompt_scores"
+        ).fetchone()
+        if (
+            stats is None
+            or int(stats[0] or 0) != row_count
+            or int(stats[1] if stats[1] is not None else -1) != 0
+            or int(stats[2] if stats[2] is not None else -1) != row_count - 1
+            or int(stats[3] or 0) != 0
+        ):
+            raise ValueError("index_coverage")
+        return {
+            "file_sha256": artifact_sha,
+            "row_count": row_count,
+            "content_digest": metadata["content_digest"],
+            "training_window_start": training_start,
+            "training_window_end": training_end,
+        }
+    finally:
+        connection.close()
+
+
+def validate_assignment(payload, record_sha, contract):
+    exact_sha(record_sha)
+    if hashlib.sha256(payload).hexdigest() != record_sha:
+        raise ValueError("assignment_digest")
+    record = strict_json(payload, MAX_RECORD_BYTES)
+    if set(record) != ASSIGNMENT_KEYS:
+        raise ValueError("assignment_keys")
+    if (
+        record["schema_version"] != 1
+        or record["kind"] != ASSIGNMENT_KIND
+        or record["assignment_algorithm"] != ASSIGNMENT_ALGORITHM
+        or record["assignment_unit"] != "whole_window"
+        or record["contract_sha256"] != contract["_sha256"]
+    ):
+        raise ValueError("assignment_schema")
+    block = exact_int(record["block_start_window"], minimum=1)
+    if (
+        block < contract["start_window"]
+        or block + 1 > contract["end_window"]
+        or (block - contract["start_window"]) % 2
+        or record["randomness_window"] != block
+    ):
+        raise ValueError("assignment_range")
+    exact_int(record["public_randomness_round"], minimum=1)
+    for field in (
+        "public_randomness", "assignment_material_sha256",
+    ):
+        exact_sha(record[field])
+    sequence = record["sequence"]
+    if sequence not in {"AB", "BA"}:
+        raise ValueError("assignment_sequence")
+    windows = record["windows"]
+    if not isinstance(windows, list) or len(windows) != 2:
+        raise ValueError("assignment_windows")
+    expected_arms = (
+        ("control", "treatment")
+        if sequence == "AB"
+        else ("treatment", "control")
+    )
+    clean_windows = []
+    for period, window in enumerate(windows):
+        if not isinstance(window, dict) or set(window) != {
+            "itt_arm", "period", "window_n"
+        }:
+            raise ValueError("assignment_window_keys")
+        if (
+            window["period"] != period
+            or window["window_n"] != block + period
+            or window["itt_arm"] != expected_arms[period]
+        ):
+            raise ValueError("assignment_window_identity")
+        clean_windows.append({
+            "window_n": window["window_n"],
+            "itt_arm": window["itt_arm"],
+        })
+    return {
+        "block_start_window": block,
+        "record_sha256": record_sha,
+        "sequence": sequence,
+        "public_randomness_round": record["public_randomness_round"],
+        "windows": clean_windows,
+    }, record
+
+
+def validate_decision(payload, record_sha, contract, assignment_record, assignment_sha):
+    exact_sha(record_sha)
+    if hashlib.sha256(payload).hexdigest() != record_sha:
+        raise ValueError("decision_digest")
+    record = strict_json(payload, MAX_RECORD_BYTES)
+    if set(record) != DECISION_KEYS:
+        raise ValueError("decision_keys")
+    if (
+        record["schema_version"] != 1
+        or record["kind"] != DECISION_KIND
+        or record["contract_sha256"] != contract["_sha256"]
+        or record["assignment_sha256"] != assignment_sha
+    ):
+        raise ValueError("decision_schema")
+    window_n = exact_int(record["window_n"], minimum=1)
+    assignment_arm = None
+    for window in assignment_record["windows"]:
+        if window["window_n"] == window_n:
+            assignment_arm = window["itt_arm"]
+    if assignment_arm is None or record["itt_arm"] != assignment_arm:
+        raise ValueError("decision_assignment")
+    itt = record["itt_arm"]
+    execution = record["execution_arm"]
+    status = record["validation_status"]
+    failures = record["validation_failure_codes"]
+    fallback = record["fallback_to_control"]
+    reason = record["reason"]
+    if (
+        itt not in {"control", "treatment"}
+        or execution not in {"control", "treatment"}
+        or status not in {"not_required", "passed", "failed"}
+        or not isinstance(failures, list)
+        or len(failures) > 32
+        or any(
+            not isinstance(item, str)
+            or TOKEN.fullmatch(item) is None
+            for item in failures
+        )
+        or len(set(failures)) != len(failures)
+        or not isinstance(fallback, bool)
+        or not isinstance(reason, str)
+        or TOKEN.fullmatch(reason) is None
+    ):
+        raise ValueError("decision_fields")
+    if itt == "control":
+        valid_semantics = (
+            execution == "control"
+            and status == "not_required"
+            and not failures
+            and fallback is False
+            and reason == "itt_control"
+        )
+    elif status == "passed":
+        valid_semantics = (
+            execution == "treatment"
+            and not failures
+            and fallback is False
+            and reason == "itt_treatment_validated"
+        )
+    else:
+        valid_semantics = (
+            execution == "control"
+            and status == "failed"
+            and bool(failures)
+            and fallback is True
+            and reason == "technical_validation_failed_control_fallback"
+        )
+    if not valid_semantics:
+        raise ValueError("decision_semantics")
+    return {
+        "window_n": window_n,
+        "record_sha256": record_sha,
+        "assignment_sha256": assignment_sha,
+        "itt_arm": itt,
+        "execution_arm": execution,
+        "validation_status": status,
+        "validation_failure_codes": failures,
+        "fallback_to_control": fallback,
+        "reason": reason,
+    }
+
+
+def state_columns(connection, table):
+    return tuple(
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(" + table + ")")
+    )
+
+
+def validate_state(path, contract):
+    expected_path = os.path.join(
+        CROSSOVER_ROOT, "state", contract["_sha256"] + ".sqlite3"
+    )
+    if path != expected_path or os.path.realpath(path) != path:
+        raise ValueError("state_path")
+    regular_file(path)
+    connection = sqlite3.connect(
+        readonly_uri(path), uri=True, isolation_level=None, timeout=2.0
+    )
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA busy_timeout=2000")
+        connection.execute("BEGIN")
+        application_id = int(
+            connection.execute("PRAGMA application_id").fetchone()[0]
+        )
+        user_version = int(
+            connection.execute("PRAGMA user_version").fetchone()[0]
+        )
+        if application_id != STATE_APPLICATION_ID:
+            raise ValueError("state_application_id")
+        if user_version != STATE_SCHEMA_VERSION:
+            raise ValueError("state_schema_version")
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if tables != {
+            "runtime_metadata", "pair_assignments", "window_decisions"
+        }:
+            raise ValueError("state_tables")
+        if (
+            state_columns(connection, "runtime_metadata") != ("key", "value")
+            or state_columns(connection, "pair_assignments")
+            != ("block_start_window", "record_sha256", "record_json")
+            or state_columns(connection, "window_decisions")
+            != (
+                "window_n", "block_start_window", "record_sha256",
+                "record_json",
+            )
+        ):
+            raise ValueError("state_columns")
+        check = connection.execute("PRAGMA quick_check").fetchone()
+        if check is None or str(check[0]).lower() != "ok":
+            raise ValueError("state_integrity")
+        metadata_rows = connection.execute(
+            "SELECT key,value,typeof(key),typeof(value) "
+            "FROM runtime_metadata ORDER BY key"
+        ).fetchall()
+        if (
+            metadata_rows != [
+                (
+                    "contract_sha256", contract["_sha256"],
+                    "text", "text",
+                )
+            ]
+        ):
+            raise ValueError("state_metadata")
+        latest_assignment_row = connection.execute(
+            "SELECT block_start_window,record_sha256,record_json "
+            "FROM pair_assignments ORDER BY block_start_window DESC LIMIT 1"
+        ).fetchone()
+        latest_assignment = None
+        if latest_assignment_row is not None:
+            payload = bytes(latest_assignment_row[2])
+            latest_assignment, assignment_record = validate_assignment(
+                payload, str(latest_assignment_row[1]), contract
+            )
+            if latest_assignment["block_start_window"] != int(
+                latest_assignment_row[0]
+            ):
+                raise ValueError("state_assignment_key")
+
+        latest_decision_row = connection.execute(
+            "SELECT window_n,block_start_window,record_sha256,record_json "
+            "FROM window_decisions ORDER BY window_n DESC LIMIT 1"
+        ).fetchone()
+        latest_decision = None
+        if latest_decision_row is not None:
+            assignment_row = connection.execute(
+                "SELECT record_sha256,record_json FROM pair_assignments "
+                "WHERE block_start_window=?",
+                (int(latest_decision_row[1]),),
+            ).fetchone()
+            if assignment_row is None:
+                raise ValueError("state_decision_assignment_missing")
+            assignment_sha = str(assignment_row[0])
+            decision_assignment, assignment_record = validate_assignment(
+                bytes(assignment_row[1]), assignment_sha, contract
+            )
+            if decision_assignment["block_start_window"] != int(
+                latest_decision_row[1]
+            ):
+                raise ValueError("state_decision_assignment_key")
+            latest_decision = validate_decision(
+                bytes(latest_decision_row[3]),
+                str(latest_decision_row[2]),
+                contract,
+                assignment_record,
+                assignment_sha,
+            )
+            if latest_decision["window_n"] != int(latest_decision_row[0]):
+                raise ValueError("state_decision_key")
+        connection.execute("COMMIT")
+        return {
+            "application_id": application_id,
+            "user_version": user_version,
+            "contract_sha256": contract["_sha256"],
+            "latest_assignment": latest_assignment,
+            "latest_decision": latest_decision,
+        }
+    finally:
+        connection.close()
+
+
+def fail(out, code):
+    out["valid"] = False
+    out["error"] = str(code or "invalid")[:128]
+    print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
+
+
+out = {
+    "schema_version": SCHEMA_VERSION,
+    "configured": False,
+    "valid": False,
+    "settings_process_bound": False,
+    "process_unit": "",
+    "process_pid": 0,
+    "lane": "",
+    "contract": {},
+    "score_index": {},
+    "state": {},
+    "error": "",
+}
+
+try:
+    raw_specs = json.loads(sys.argv[1])
+    if (
+        not isinstance(raw_specs, list)
+        or len(raw_specs) > 16
+        or any(
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or UNIT.fullmatch(item[0]) is None
+            or not isinstance(item[1], str)
+            or len(item[1]) > 1024
+            for item in raw_specs
+        )
+    ):
+        fail(out, "unit_specs_invalid")
+except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+    fail(out, "unit_specs_invalid")
+
+candidates = []
+partial = False
+for unit, _env_path in raw_specs:
+    pid = main_pid(unit)
+    live = process_env(pid) if pid > 0 else {}
+    present = {key: value for key, value in live.items() if value}
+    if present:
+        out["configured"] = True
+        if set(present) != set(ENV_KEYS):
+            partial = True
+        candidates.append((unit, pid, present))
+
+if partial or len(candidates) > 1:
+    fail(out, "process_activation_ambiguous")
+if not candidates:
+    out["valid"] = True
+    print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
+
+unit, pid, values = candidates[0]
+if pid <= 0 or set(values) != set(ENV_KEYS):
+    fail(out, "process_activation_incomplete")
+out["settings_process_bound"] = True
+out["process_unit"] = unit
+out["process_pid"] = pid
+out["lane"] = (
+    unit.rsplit("@", 1)[1][:-len(".service")]
+    if "@" in unit and unit.endswith(".service")
+    else ""
+)
+
+try:
+    contract_sha = values[
+        "RELIQUARY_CODE_SELECTOR_CROSSOVER_CONTRACT_SHA256"
+    ]
+    contract = validate_contract(
+        values["RELIQUARY_CODE_SELECTOR_CROSSOVER_CONTRACT_PATH"],
+        contract_sha,
+    )
+    contract["_sha256"] = contract_sha
+    index = validate_index(
+        values["RELIQUARY_CODE_SELECTOR_CROSSOVER_SCORE_INDEX_PATH"],
+        contract,
+    )
+    state = validate_state(
+        values["RELIQUARY_CODE_SELECTOR_CROSSOVER_STATE_PATH"],
+        contract,
+    )
+except (
+    OSError, sqlite3.Error, UnicodeError, ValueError, TypeError,
+    OverflowError, json.JSONDecodeError,
+) as exc:
+    fail(out, str(exc) or type(exc).__name__)
+
+out["contract"] = {
+    "sha256": contract_sha,
+    "experiment_id": contract["experiment_id"],
+    "control_policy_id": contract["control_policy_id"],
+    "treatment_policy_id": contract["treatment_policy_id"],
+    "treatment_artifact_sha256": contract["treatment_artifact_sha256"],
+    "public_source_revision": contract["public_source_revision"],
+    "checkpoint_repository": contract["checkpoint_repository"],
+    "checkpoint_revision": contract["checkpoint_revision"],
+    "checkpoint_n": contract["checkpoint_n"],
+    "runtime_profile_sha256": contract["runtime_profile_sha256"],
+    "miner_release_revision": contract["miner_release_revision"],
+    "start_window": contract["start_window"],
+    "end_window": contract["end_window"],
+    "environment": contract["environment"],
+}
+out["score_index"] = index
+out["state"] = state
+out["valid"] = True
+print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+""".strip()
+
+
+_CODE_OVERLAP_ABBA_PROBE_SOURCE = r"""
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import urllib.parse
+
+ROOT = "/srv/reliquary-miner-pro/state/code-overlap-abba"
+LEDGER = "/srv/reliquary-miner-pro/state/code-auction.sqlite3"
+ENV_KEYS = (
+    "RELIQUARY_CODE_OVERLAP_ABBA_CONTRACT_PATH",
+    "RELIQUARY_CODE_OVERLAP_ABBA_CONTRACT_SHA256",
+    "RELIQUARY_CODE_SELECTOR_SHARD_SLOT",
+    "RELIQUARY_CODE_SELECTOR_SHARD_COUNT",
+    "RELIQUARY_CODE_OUTCOME_LEDGER",
+)
+CONTRACT_KEYS = {
+    "assignment_algorithm", "assignment_domain", "assignment_unit",
+    "checkpoint_n", "checkpoint_repository", "checkpoint_revision",
+    "control_variant", "end_window", "environment", "experiment_id",
+    "feature_index_content_digest", "feature_index_file_sha256",
+    "finalized_at_window", "kind", "miner_pair_id",
+    "miner_release_revision", "operator_id", "period0_treatment_slot",
+    "public_source_revision", "runtime_profile_sha256", "schema_version",
+    "selector_policy_id", "selector_policy_version", "selector_strategy",
+    "shard_count", "start_window", "topology_id", "treatment_variant",
+}
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+UNIT = re.compile(r"^[A-Za-z0-9_.@:-]{1,128}\.service$")
+
+
+def canonical(value):
+    return json.dumps(
+        value, allow_nan=False, ensure_ascii=True,
+        separators=(",", ":"), sort_keys=True,
+    ).encode()
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_json_key")
+        result[key] = value
+    return result
+
+
+def process_env(pid):
+    values = {}
+    try:
+        payload = open(f"/proc/{pid}/environ", "rb").read()
+        for item in payload.split(b"\0"):
+            key, separator, value = item.partition(b"=")
+            if separator and key.decode("ascii", "strict") in ENV_KEYS:
+                values[key.decode()] = value.decode("utf-8", "strict")
+    except (OSError, UnicodeError):
+        return None
+    return values
+
+
+def main_pid(unit):
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "-p", "MainPID", "--value", unit],
+            capture_output=True, text=True, timeout=0.75, check=False,
+        )
+        value = result.stdout.strip()
+        return int(value) if value.isdigit() else 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def fail(out, reason):
+    out["error"] = str(reason or "invalid")[:128]
+    print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
+
+
+def regular(path, maximum=0):
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("path_not_regular")
+    if info.st_size <= 0 or (maximum and info.st_size > maximum):
+        raise ValueError("path_size")
+    return info
+
+
+def load_contract(path, digest):
+    if HEX64.fullmatch(digest or "") is None:
+        raise ValueError("contract_digest")
+    expected = os.path.join(ROOT, "contracts", digest + ".json")
+    if path != expected or os.path.realpath(path) != path:
+        raise ValueError("contract_path")
+    before = regular(path, 1024 * 1024)
+    payload = open(path, "rb").read()
+    after = os.lstat(path)
+    if (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
+    ) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+    ):
+        raise ValueError("contract_changed")
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError("contract_digest")
+    record = json.loads(
+        payload.decode("utf-8", "strict"),
+        object_pairs_hook=unique,
+        parse_constant=lambda _value: (_ for _ in ()).throw(
+            ValueError("nonfinite_json")
+        ),
+    )
+    if (
+        not isinstance(record, dict)
+        or set(record) != CONTRACT_KEYS
+        or canonical(record) != payload
+        or record["schema_version"] != 1
+        or record["kind"] != "reliquary_code_overlap_abba_contract"
+        or record["assignment_algorithm"]
+        != "period0_slot_complementary_two_shard_ab_ba_v1"
+        or record["assignment_domain"]
+        != "reliquary-miner-pro/code-overlap-abba/v1"
+        or record["assignment_unit"] != "window_shard"
+        or record["control_variant"] != "overlap_first_disabled"
+        or record["treatment_variant"] != "overlap_first_enabled"
+        or record["environment"] != "opencodeinstruct"
+        or record["selector_strategy"] != "arithmetic"
+        or type(record["shard_count"]) is not int
+        or record["shard_count"] != 2
+        or type(record["period0_treatment_slot"]) is not int
+        or record["period0_treatment_slot"] not in {0, 1}
+    ):
+        raise ValueError("contract_schema")
+    for field in (
+        "public_source_revision", "checkpoint_revision",
+        "miner_release_revision",
+    ):
+        if (
+            not isinstance(record[field], str)
+            or HEX40.fullmatch(record[field]) is None
+        ):
+            raise ValueError("contract_identity")
+    for field in (
+        "feature_index_content_digest", "feature_index_file_sha256",
+        "runtime_profile_sha256",
+    ):
+        if (
+            not isinstance(record[field], str)
+            or HEX64.fullmatch(record[field]) is None
+        ):
+            raise ValueError("contract_identity")
+    for field in (
+        "checkpoint_n", "finalized_at_window", "selector_policy_version",
+        "start_window", "end_window",
+    ):
+        if type(record[field]) is not int or record[field] < 0:
+            raise ValueError("contract_range")
+    if (
+        record["start_window"] <= record["finalized_at_window"]
+        or record["end_window"] < record["start_window"]
+        or (record["end_window"] - record["start_window"] + 1) % 2
+    ):
+        raise ValueError("contract_range")
+    return record
+
+
+def clean_attempt(row, contract, digest, lane):
+    if (
+        row["model_repository"] != contract["checkpoint_repository"]
+        or row["checkpoint_revision"] != contract["checkpoint_revision"]
+        or row["checkpoint_n"] != contract["checkpoint_n"]
+        or row["public_source_revision"] != contract["public_source_revision"]
+        or row["runtime_profile_hash"] != contract["runtime_profile_sha256"]
+        or row["environment"] != contract["environment"]
+        or type(row["window_n"]) is not int
+        or not contract["start_window"] <= row["window_n"] <= contract["end_window"]
+        or HEX64.fullmatch(str(row["assignment_digest"])) is None
+        or row["pair_period"] not in {0, 1}
+        or row["itt_arm"] not in {"control", "treatment"}
+        or row["execution_arm"] not in {"control", "treatment"}
+        or row["selector_policy"] not in {"exploit", "explore"}
+        or type(row["overlap_candidate_count"]) is not int
+        or row["overlap_candidate_count"] < 0
+        or row["selected_overlap"] not in {0, 1}
+        or row["activated"] not in {0, 1}
+        or not isinstance(row["fallback_reason"], str)
+        or len(row["fallback_reason"]) > 256
+        or any(
+            ord(character) < 0x20 or ord(character) > 0x7E
+            for character in row["fallback_reason"]
+        )
+        or not math.isfinite(float(row["assigned_at"]))
+    ):
+        raise ValueError("assignment_identity")
+    offset = row["window_n"] - contract["start_window"]
+    treatment_slot = contract["period0_treatment_slot"] ^ (offset % 2)
+    expected_arm = (
+        "treatment" if lane["shard_slot"] == treatment_slot else "control"
+    )
+    if (
+        row["pair_index"] != offset // 2
+        or row["pair_period"] != offset % 2
+        or row["itt_arm"] != expected_arm
+        or (expected_arm == "control" and row["execution_arm"] != "control")
+    ):
+        raise ValueError("assignment_semantics")
+    expected_digest = hashlib.sha256(canonical({
+        "assignment_algorithm": "period0_slot_complementary_two_shard_ab_ba_v1",
+        "assignment_unit": "window_shard",
+        "contract_sha256": digest,
+        "inside_experiment": True,
+        "itt_arm": expected_arm,
+        "kind": "reliquary_code_overlap_abba_assignment",
+        "pair_index": offset // 2,
+        "period": offset % 2,
+        "reason": (
+            "assigned_treatment"
+            if expected_arm == "treatment"
+            else "assigned_control"
+        ),
+        "schema_version": 1,
+        "shard_slot": lane["shard_slot"],
+        "treatment_slot": treatment_slot,
+        "window_n": row["window_n"],
+    })).hexdigest()
+    if row["assignment_digest"] != expected_digest:
+        raise ValueError("assignment_digest")
+    activated = bool(
+        expected_arm == "treatment"
+        and row["execution_arm"] == "treatment"
+        and row["selector_policy"] == "exploit"
+        and row["overlap_candidate_count"] > 0
+        and bool(row["selected_overlap"])
+        and row["fallback_reason"] == ""
+    )
+    if bool(row["activated"]) != activated:
+        raise ValueError("assignment_activation")
+    return {
+        "activated": activated,
+        "assigned_at": float(row["assigned_at"]),
+        "assignment_sha256": row["assignment_digest"],
+        "execution_arm": row["execution_arm"],
+        "fallback_reason": row["fallback_reason"],
+        "itt_arm": row["itt_arm"],
+        "overlap_candidate_count": row["overlap_candidate_count"],
+        "pair_index": row["pair_index"],
+        "period": row["pair_period"],
+        "selected_overlap": bool(row["selected_overlap"]),
+        "selector_policy": row["selector_policy"],
+        "treatment_slot": treatment_slot,
+        "window_n": row["window_n"],
+    }
+
+
+def latest_window(connection, contract, digest, lane):
+    query = (
+        "SELECT assigned_at,model_repository,checkpoint_revision,checkpoint_n,"
+        "public_source_revision,runtime_profile_hash,environment,window_n,"
+        "assignment_digest,pair_index,pair_period,itt_arm,execution_arm,"
+        "selector_policy,overlap_candidate_count,selected_overlap,"
+        "activated,fallback_reason FROM selector_start_assignments "
+        "WHERE contract_digest=? AND lane=? AND shard_slot=? AND shard_count=2 "
+        "AND window_n=(SELECT MAX(window_n) FROM selector_start_assignments "
+        "WHERE contract_digest=? AND lane=? AND shard_slot=? AND shard_count=2) "
+        "ORDER BY window_n DESC,assigned_at DESC,attempt_key DESC LIMIT 257"
+    )
+    identity = (digest, lane["lane"], lane["shard_slot"])
+    rows = connection.execute(query, identity + identity).fetchall()
+    if not rows:
+        return None
+    if len(rows) > 256:
+        raise ValueError("assignment_window_too_large")
+    attempts = [clean_attempt(row, contract, digest, lane) for row in rows]
+    fallback_counts = {}
+    for attempt in attempts:
+        reason = attempt["fallback_reason"] or "none"
+        fallback_counts[reason] = fallback_counts.get(reason, 0) + 1
+    return {
+        "activation_count": sum(attempt["activated"] for attempt in attempts),
+        "attempt_count": len(attempts),
+        "fallback_counts": dict(sorted(fallback_counts.items())),
+        "latest_attempt": attempts[0],
+        "selected_overlap_count": sum(
+            attempt["selected_overlap"] for attempt in attempts
+        ),
+        "window_n": attempts[0]["window_n"],
+    }
+
+
+out = {
+    "schema_version": 1, "configured": False, "valid": False,
+    "settings_process_bound": False, "contract": {}, "lanes": [], "error": "",
+}
+try:
+    specs = json.loads(sys.argv[1])
+    if (
+        not isinstance(specs, list)
+        or len(specs) > 16
+        or any(
+            not isinstance(item, list) or len(item) != 2
+            or not isinstance(item[0], str) or UNIT.fullmatch(item[0]) is None
+            for item in specs
+        )
+    ):
+        fail(out, "unit_specs_invalid")
+except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+    fail(out, "unit_specs_invalid")
+
+configured = []
+for unit, _env_path in specs:
+    pid = main_pid(unit)
+    if pid <= 0:
+        out["configured"] = True
+        fail(out, "process_identity_unavailable")
+    values = process_env(pid)
+    if values is None:
+        out["configured"] = True
+        fail(out, "process_environment_unavailable")
+    present = {
+        key for key in ENV_KEYS[:2] if str(values.get(key) or "")
+    }
+    if not present:
+        continue
+    out["configured"] = True
+    if present != set(ENV_KEYS[:2]) or any(not values.get(key) for key in ENV_KEYS):
+        fail(out, "process_activation_incomplete")
+    try:
+        slot = int(values["RELIQUARY_CODE_SELECTOR_SHARD_SLOT"])
+        count = int(values["RELIQUARY_CODE_SELECTOR_SHARD_COUNT"])
+    except ValueError:
+        fail(out, "process_shard_invalid")
+    lane = unit.rsplit("@", 1)[-1].removesuffix(".service")
+    if pid <= 0 or slot not in {0, 1} or count != 2 or not lane:
+        fail(out, "process_identity_invalid")
+    configured.append({
+        "lane": lane, "process_pid": pid, "process_unit": unit,
+        "shard_count": count, "shard_slot": slot, "values": values,
+    })
+
+if not out["configured"]:
+    out["valid"] = True
+    print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
+if (
+    len(configured) != 2
+    or {lane["shard_slot"] for lane in configured} != {0, 1}
+    or any(
+        lane["values"][key] != configured[0]["values"][key]
+        for lane in configured[1:]
+        for key in (ENV_KEYS[0], ENV_KEYS[1], ENV_KEYS[4])
+    )
+):
+    fail(out, "process_pair_invalid")
+
+values = configured[0]["values"]
+try:
+    contract = load_contract(values[ENV_KEYS[0]], values[ENV_KEYS[1]])
+    ledger_path = values[ENV_KEYS[4]]
+    if ledger_path != LEDGER or os.path.realpath(ledger_path) != ledger_path:
+        raise ValueError("ledger_path")
+    regular(ledger_path)
+    connection = sqlite3.connect(
+        "file:" + urllib.parse.quote(ledger_path, safe="/") + "?mode=ro",
+        uri=True, isolation_level=None, timeout=2.0,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        if (
+            int(connection.execute("PRAGMA application_id").fetchone()[0])
+            != 1380139340
+            or int(connection.execute("PRAGMA user_version").fetchone()[0]) != 1
+        ):
+            raise ValueError("ledger_identity")
+        for lane in configured:
+            lane["latest_window"] = latest_window(
+                connection, contract, values[ENV_KEYS[1]], lane
+            )
+    finally:
+        connection.close()
+except (
+    OSError, sqlite3.Error, UnicodeError, ValueError, TypeError,
+    OverflowError, json.JSONDecodeError,
+) as exc:
+    fail(out, str(exc) or type(exc).__name__)
+
+out["contract"] = {
+    key: contract[key] for key in (
+        "checkpoint_n", "checkpoint_repository", "checkpoint_revision",
+        "end_window", "experiment_id", "feature_index_content_digest",
+        "feature_index_file_sha256", "miner_release_revision",
+        "period0_treatment_slot", "public_source_revision",
+        "runtime_profile_sha256", "selector_policy_id",
+        "selector_policy_version", "start_window",
+    )
+}
+out["contract"]["sha256"] = values[ENV_KEYS[1]]
+out["lanes"] = [
+    {key: lane[key] for key in (
+        "lane", "latest_window", "process_pid", "process_unit",
+        "shard_count", "shard_slot",
+    )}
+    for lane in sorted(configured, key=lambda row: row["shard_slot"])
+]
+out["settings_process_bound"] = True
+out["valid"] = True
+print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+""".strip()
+
+
 _CODE_AUCTION_READINESS_PROBE_SOURCE = r"""
 import json
 import os
@@ -1766,6 +3146,7 @@ if ledger_path:
                         "accepted_into_pool",
                         "selected_for_batch",
                         "rewarded",
+                        "reason_code",
                     }
                     <= events_columns
                 )
@@ -1850,7 +3231,30 @@ if ledger_path:
                                         CASE WHEN stage='terminal_rejected'
                                             THEN 1 ELSE 0 END AS terminal_rejected,
                                         CASE WHEN stage='terminal_unresolved'
-                                            THEN 1 ELSE 0 END AS terminal_unresolved
+                                            THEN 1 ELSE 0 END AS terminal_unresolved,
+                                        0 AS definitely_pre_network_expiry,
+                                        CASE WHEN stage IN (
+                                                'precommit_sent',
+                                                'receipt_accepted',
+                                                'reveal_sent',
+                                                'immediate_response',
+                                                'pool_accepted',
+                                                'pool_rejected',
+                                                'ranked',
+                                                'validator_proof_attempted',
+                                                'validator_proof_passed',
+                                                'validator_proof_failed',
+                                                'selected',
+                                                'not_selected',
+                                                'rewarded',
+                                                'not_rewarded',
+                                                'terminal_rejected'
+                                            )
+                                              OR http_provisional=1
+                                              OR accepted_into_pool IS NOT NULL
+                                              OR selected IS NOT NULL
+                                              OR rewarded IS NOT NULL
+                                            THEN 1 ELSE 0 END AS network_stage
                                     FROM terminal_events
                                     WHERE model_repository=?
                                       AND checkpoint_revision=?
@@ -1881,7 +3285,25 @@ if ledger_path:
                                             THEN 1 ELSE 0 END AS rewarded,
                                         0 AS terminal_rejected,
                                         CASE WHEN lifecycle='transport_error'
-                                            THEN 1 ELSE 0 END AS terminal_unresolved
+                                            THEN 1 ELSE 0 END AS terminal_unresolved,
+                                        CASE WHEN lifecycle='transport_error'
+                                                  AND reason_code=
+                                                      '_DrandSendTicketExpired'
+                                            THEN 1 ELSE 0 END
+                                            AS definitely_pre_network_expiry,
+                                        CASE WHEN lifecycle IN (
+                                                'precommit_sent',
+                                                'receipt_accepted',
+                                                'reveal_sent',
+                                                'immediate',
+                                                'pool_admission',
+                                                'auction_final',
+                                                'terminal_rejected'
+                                            )
+                                              OR accepted_into_pool IS NOT NULL
+                                              OR selected_for_batch IS NOT NULL
+                                              OR rewarded IS NOT NULL
+                                            THEN 1 ELSE 0 END AS network_stage
                                     FROM events
                                     WHERE model_repository=?
                                       AND checkpoint_revision=?
@@ -1899,7 +3321,10 @@ if ledger_path:
                                         MAX(selected) AS selected,
                                         MAX(rewarded) AS rewarded,
                                         MAX(terminal_rejected) AS terminal_rejected,
-                                        MAX(terminal_unresolved) AS terminal_unresolved
+                                        MAX(terminal_unresolved) AS terminal_unresolved,
+                                        MAX(definitely_pre_network_expiry)
+                                            AS definitely_pre_network_expiry,
+                                        MAX(network_stage) AS network_stage
                                     FROM metric_rows
                                     WHERE evidence_key IS NOT NULL
                                     GROUP BY evidence_key
@@ -1913,7 +3338,17 @@ if ledger_path:
                                     COALESCE(SUM(selected), 0),
                                     COALESCE(SUM(rewarded), 0),
                                     COALESCE(SUM(terminal_rejected), 0),
-                                    COALESCE(SUM(terminal_unresolved), 0)
+                                    COALESCE(SUM(
+                                        CASE
+                                            WHEN terminal_unresolved=1
+                                              AND NOT (
+                                                definitely_pre_network_expiry=1
+                                                AND network_stage=0
+                                              )
+                                            THEN 1
+                                            ELSE 0
+                                        END
+                                    ), 0)
                                 FROM metric_rollup
                             '''
                             for partition_row in ledger["partitions"]:
@@ -1967,6 +3402,674 @@ out["ledger"] = ledger
 
 print(json.dumps(out, sort_keys=True, separators=(",", ":")))
 """.strip()
+
+
+def _parse_code_selector_crossover_probe(
+    lines: list[str],
+) -> dict[str, Any]:
+    """Parse only the bounded, non-secret crossover projection.
+
+    The remote source does the expensive artifact/state validation. This
+    second boundary deliberately rebuilds a fixed output schema rather than
+    forwarding arbitrary JSON into HTTP exports.
+    """
+    if not lines:
+        return {}
+    encoded = str(lines[0] or "").encode("utf-8", "replace")
+    if len(encoded) > 65_536:
+        return {}
+    try:
+        raw = json.loads(encoded.decode("utf-8", "strict") or "{}")
+    except (UnicodeError, ValueError, OverflowError, json.JSONDecodeError):
+        return {}
+    expected_root = {
+        "schema_version",
+        "configured",
+        "valid",
+        "settings_process_bound",
+        "process_unit",
+        "process_pid",
+        "lane",
+        "contract",
+        "score_index",
+        "state",
+        "error",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_root:
+        return {}
+    if (
+        type(raw.get("schema_version")) is not int
+        or raw["schema_version"] != 1
+        or type(raw.get("configured")) is not bool
+        or type(raw.get("valid")) is not bool
+        or type(raw.get("settings_process_bound")) is not bool
+    ):
+        return {}
+
+    def bounded_text(value: Any, limit: int) -> str | None:
+        if not isinstance(value, str) or len(value) > limit:
+            return None
+        if any(ord(character) < 0x20 for character in value):
+            return None
+        return value
+
+    def exact_int(value: Any, minimum: int = 0) -> int | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < minimum
+            or value > 2**63 - 1
+        ):
+            return None
+        return value
+
+    def exact_sha(value: Any, length: int = 64) -> str | None:
+        if (
+            not isinstance(value, str)
+            or len(value) != length
+            or re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None
+        ):
+            return None
+        return value
+
+    configured = raw["configured"]
+    valid = raw["valid"]
+    error = bounded_text(raw.get("error"), 128)
+    if error is None:
+        return {}
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "configured": configured,
+        "valid": valid,
+        "settings_process_bound": raw["settings_process_bound"],
+        "process_unit": "",
+        "process_pid": 0,
+        "lane": "",
+        "contract": {},
+        "score_index": {},
+        "state": {},
+        "error": error,
+    }
+    if not configured:
+        # Absence is a valid control-only posture; no process or artifact facts
+        # are meaningful in this branch.
+        if not valid or raw["settings_process_bound"] or error:
+            return {}
+        return base
+
+    process_unit = bounded_text(raw.get("process_unit"), 128)
+    process_pid = exact_int(raw.get("process_pid"), 1)
+    lane = bounded_text(raw.get("lane"), 128)
+    if (
+        process_unit is None
+        or process_pid is None
+        or lane is None
+        or not process_unit
+        or _SYSTEMD_UNIT_RE.fullmatch(process_unit) is None
+    ):
+        return {}
+    base.update(
+        {
+            "process_unit": process_unit,
+            "process_pid": process_pid,
+            "lane": lane,
+        }
+    )
+    if not valid:
+        # Preserve the fact that a live process requested crossover activation,
+        # but never forward partially validated artifacts or decisions.
+        if not error:
+            return {}
+        return base
+    if error or not raw["settings_process_bound"]:
+        return {}
+
+    contract_raw = raw.get("contract")
+    expected_contract = {
+        "sha256",
+        "experiment_id",
+        "control_policy_id",
+        "treatment_policy_id",
+        "treatment_artifact_sha256",
+        "public_source_revision",
+        "checkpoint_repository",
+        "checkpoint_revision",
+        "checkpoint_n",
+        "runtime_profile_sha256",
+        "miner_release_revision",
+        "start_window",
+        "end_window",
+        "environment",
+    }
+    if not isinstance(contract_raw, dict) or set(contract_raw) != expected_contract:
+        return {}
+    contract: dict[str, Any] = {}
+    for key, limit in (
+        ("experiment_id", 256),
+        ("control_policy_id", 256),
+        ("treatment_policy_id", 256),
+        ("checkpoint_repository", 512),
+        ("environment", 128),
+    ):
+        value = bounded_text(contract_raw.get(key), limit)
+        if value is None or not value:
+            return {}
+        contract[key] = value
+    for key in (
+        "sha256",
+        "treatment_artifact_sha256",
+        "runtime_profile_sha256",
+    ):
+        value = exact_sha(contract_raw.get(key))
+        if value is None:
+            return {}
+        contract[key] = value
+    for key in (
+        "public_source_revision",
+        "checkpoint_revision",
+        "miner_release_revision",
+    ):
+        value = exact_sha(contract_raw.get(key), 40)
+        if value is None:
+            return {}
+        contract[key] = value
+    for key, minimum in (
+        ("checkpoint_n", 0),
+        ("start_window", 1),
+        ("end_window", 1),
+    ):
+        value = exact_int(contract_raw.get(key), minimum)
+        if value is None:
+            return {}
+        contract[key] = value
+    if (
+        contract["environment"] != "opencodeinstruct"
+        or contract["end_window"] < contract["start_window"]
+        or (contract["end_window"] - contract["start_window"] + 1) % 2
+    ):
+        return {}
+
+    index_raw = raw.get("score_index")
+    expected_index = {
+        "file_sha256",
+        "row_count",
+        "content_digest",
+        "training_window_start",
+        "training_window_end",
+    }
+    if not isinstance(index_raw, dict) or set(index_raw) != expected_index:
+        return {}
+    index_sha = exact_sha(index_raw.get("file_sha256"))
+    content_digest = exact_sha(index_raw.get("content_digest"))
+    row_count = exact_int(index_raw.get("row_count"), 1)
+    training_start = exact_int(index_raw.get("training_window_start"), 0)
+    training_end = exact_int(index_raw.get("training_window_end"), 0)
+    if (
+        index_sha is None
+        or content_digest is None
+        or row_count is None
+        or training_start is None
+        or training_end is None
+        or index_sha != contract["treatment_artifact_sha256"]
+        or training_end < training_start
+        or training_end >= contract["start_window"]
+    ):
+        return {}
+    score_index = {
+        "file_sha256": index_sha,
+        "row_count": row_count,
+        "content_digest": content_digest,
+        "training_window_start": training_start,
+        "training_window_end": training_end,
+    }
+
+    def assignment(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        expected = {
+            "block_start_window",
+            "record_sha256",
+            "sequence",
+            "public_randomness_round",
+            "windows",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("assignment")
+        block = exact_int(value.get("block_start_window"), 1)
+        digest = exact_sha(value.get("record_sha256"))
+        sequence = bounded_text(value.get("sequence"), 2)
+        round_n = exact_int(value.get("public_randomness_round"), 1)
+        windows = value.get("windows")
+        if (
+            block is None
+            or digest is None
+            or sequence not in {"AB", "BA"}
+            or round_n is None
+            or not isinstance(windows, list)
+            or len(windows) != 2
+        ):
+            raise ValueError("assignment")
+        clean_windows = []
+        for period, row in enumerate(windows):
+            if not isinstance(row, dict) or set(row) != {"window_n", "itt_arm"}:
+                raise ValueError("assignment")
+            window_n = exact_int(row.get("window_n"), 1)
+            arm = row.get("itt_arm")
+            if (
+                window_n != block + period
+                or arm not in {"control", "treatment"}
+            ):
+                raise ValueError("assignment")
+            clean_windows.append({"window_n": window_n, "itt_arm": arm})
+        return {
+            "block_start_window": block,
+            "record_sha256": digest,
+            "sequence": sequence,
+            "public_randomness_round": round_n,
+            "windows": clean_windows,
+        }
+
+    def decision(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        expected = {
+            "window_n",
+            "record_sha256",
+            "assignment_sha256",
+            "itt_arm",
+            "execution_arm",
+            "validation_status",
+            "validation_failure_codes",
+            "fallback_to_control",
+            "reason",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("decision")
+        window_n = exact_int(value.get("window_n"), 1)
+        record_sha = exact_sha(value.get("record_sha256"))
+        assignment_sha = exact_sha(value.get("assignment_sha256"))
+        itt = value.get("itt_arm")
+        execution = value.get("execution_arm")
+        status = value.get("validation_status")
+        failures = value.get("validation_failure_codes")
+        fallback = value.get("fallback_to_control")
+        reason = bounded_text(value.get("reason"), 256)
+        if (
+            window_n is None
+            or record_sha is None
+            or assignment_sha is None
+            or itt not in {"control", "treatment"}
+            or execution not in {"control", "treatment"}
+            or status not in {"not_required", "passed", "failed"}
+            or not isinstance(failures, list)
+            or len(failures) > 32
+            or any(
+                bounded_text(item, 256) is None or not item for item in failures
+            )
+            or len(set(failures)) != len(failures)
+            or not isinstance(fallback, bool)
+            or reason is None
+            or not reason
+        ):
+            raise ValueError("decision")
+        return {
+            "window_n": window_n,
+            "record_sha256": record_sha,
+            "assignment_sha256": assignment_sha,
+            "itt_arm": itt,
+            "execution_arm": execution,
+            "validation_status": status,
+            "validation_failure_codes": list(failures),
+            "fallback_to_control": fallback,
+            "reason": reason,
+        }
+
+    state_raw = raw.get("state")
+    expected_state = {
+        "application_id",
+        "user_version",
+        "contract_sha256",
+        "latest_assignment",
+        "latest_decision",
+    }
+    if not isinstance(state_raw, dict) or set(state_raw) != expected_state:
+        return {}
+    application_id = exact_int(state_raw.get("application_id"), 1)
+    user_version = exact_int(state_raw.get("user_version"), 1)
+    state_contract = exact_sha(state_raw.get("contract_sha256"))
+    try:
+        latest_assignment = assignment(state_raw.get("latest_assignment"))
+        latest_decision = decision(state_raw.get("latest_decision"))
+    except ValueError:
+        return {}
+    if (
+        application_id != 0x52435352
+        or user_version != 1
+        or state_contract != contract["sha256"]
+    ):
+        return {}
+    if latest_decision is not None:
+        if (
+            latest_decision["window_n"] < contract["start_window"]
+            or latest_decision["window_n"] > contract["end_window"]
+        ):
+            return {}
+    state = {
+        "application_id": application_id,
+        "user_version": user_version,
+        "contract_sha256": state_contract,
+        "latest_assignment": latest_assignment,
+        "latest_decision": latest_decision,
+    }
+    base.update(
+        {
+            "contract": contract,
+            "score_index": score_index,
+            "state": state,
+        }
+    )
+    return base
+
+
+def _parse_code_overlap_abba_probe(lines: list[str]) -> dict[str, Any]:
+    """Whitelist the bounded process/contract/assignment projection."""
+    if not lines:
+        return {}
+    encoded = str(lines[0] or "").encode("utf-8", "replace")
+    if len(encoded) > 65_536:
+        return {}
+    try:
+        raw = json.loads(encoded.decode("utf-8", "strict") or "{}")
+    except (UnicodeError, ValueError, OverflowError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema_version", "configured", "valid", "settings_process_bound",
+        "contract", "lanes", "error",
+    }:
+        return {}
+    if (
+        type(raw.get("schema_version")) is not int
+        or raw["schema_version"] != 1
+        or type(raw.get("configured")) is not bool
+        or type(raw.get("valid")) is not bool
+        or type(raw.get("settings_process_bound")) is not bool
+        or not isinstance(raw.get("error"), str)
+        or len(raw["error"]) > 128
+    ):
+        return {}
+    base = {
+        "schema_version": 1,
+        "configured": raw["configured"],
+        "valid": raw["valid"],
+        "settings_process_bound": raw["settings_process_bound"],
+        "contract": {},
+        "lanes": [],
+        "error": raw["error"],
+    }
+    if not raw["configured"]:
+        return (
+            base
+            if raw["valid"]
+            and not raw["settings_process_bound"]
+            and raw["contract"] == {}
+            and raw["lanes"] == []
+            and not raw["error"]
+            else {}
+        )
+    if not raw["valid"]:
+        return (
+            base
+            if not raw["settings_process_bound"]
+            and raw["contract"] == {}
+            and raw["lanes"] == []
+            and bool(raw["error"])
+            else {}
+        )
+    if raw["error"] or not raw["settings_process_bound"]:
+        return {}
+
+    sha40 = re.compile(r"^[0-9a-f]{40}$")
+    sha64 = re.compile(r"^[0-9a-f]{64}$")
+    contract = raw.get("contract")
+    if not isinstance(contract, dict) or set(contract) != {
+        "checkpoint_n", "checkpoint_repository", "checkpoint_revision",
+        "end_window", "experiment_id", "feature_index_content_digest",
+        "feature_index_file_sha256", "miner_release_revision",
+        "period0_treatment_slot", "public_source_revision",
+        "runtime_profile_sha256", "selector_policy_id",
+        "selector_policy_version", "sha256", "start_window",
+    }:
+        return {}
+    for key in (
+        "checkpoint_repository", "experiment_id", "selector_policy_id",
+    ):
+        if (
+            not isinstance(contract.get(key), str)
+            or not contract[key]
+            or len(contract[key]) > 512
+        ):
+            return {}
+    for key in (
+        "feature_index_content_digest", "feature_index_file_sha256",
+        "runtime_profile_sha256", "sha256",
+    ):
+        if not isinstance(contract.get(key), str) or not sha64.fullmatch(contract[key]):
+            return {}
+    for key in (
+        "checkpoint_revision", "miner_release_revision",
+        "public_source_revision",
+    ):
+        if not isinstance(contract.get(key), str) or not sha40.fullmatch(contract[key]):
+            return {}
+    for key in (
+        "checkpoint_n", "end_window", "period0_treatment_slot",
+        "selector_policy_version", "start_window",
+    ):
+        if type(contract.get(key)) is not int or contract[key] < 0:
+            return {}
+    if (
+        contract["period0_treatment_slot"] not in {0, 1}
+        or contract["start_window"] <= 0
+        or contract["end_window"] < contract["start_window"]
+        or (contract["end_window"] - contract["start_window"] + 1) % 2
+    ):
+        return {}
+
+    clean_lanes = []
+    lanes = raw.get("lanes")
+    if not isinstance(lanes, list) or len(lanes) != 2:
+        return {}
+    for lane in lanes:
+        if not isinstance(lane, dict) or set(lane) != {
+            "lane", "latest_window", "process_pid", "process_unit",
+            "shard_count", "shard_slot",
+        }:
+            return {}
+        if (
+            not isinstance(lane.get("lane"), str)
+            or not lane["lane"]
+            or not isinstance(lane.get("process_unit"), str)
+            or _SYSTEMD_UNIT_RE.fullmatch(lane["process_unit"]) is None
+            or type(lane.get("process_pid")) is not int
+            or lane["process_pid"] <= 0
+            or type(lane.get("shard_slot")) is not int
+            or lane["shard_slot"] not in {0, 1}
+            or type(lane.get("shard_count")) is not int
+            or lane["shard_count"] != 2
+            or lane["lane"]
+            != lane["process_unit"].rsplit("@", 1)[-1].removesuffix(
+                ".service"
+            )
+        ):
+            return {}
+
+        latest_window = lane.get("latest_window")
+        if latest_window is not None:
+            if not isinstance(latest_window, dict) or set(latest_window) != {
+                "activation_count", "attempt_count", "fallback_counts",
+                "latest_attempt", "selected_overlap_count", "window_n",
+            }:
+                return {}
+            activation_count = latest_window.get("activation_count")
+            attempt_count = latest_window.get("attempt_count")
+            selected_overlap_count = latest_window.get(
+                "selected_overlap_count"
+            )
+            window_n = latest_window.get("window_n")
+            fallback_counts = latest_window.get("fallback_counts")
+            latest = latest_window.get("latest_attempt")
+            if (
+                type(activation_count) is not int
+                or activation_count < 0
+                or type(attempt_count) is not int
+                or not 1 <= attempt_count <= 256
+                or activation_count > attempt_count
+                or type(selected_overlap_count) is not int
+                or not 0 <= selected_overlap_count <= attempt_count
+                or type(window_n) is not int
+                or not contract["start_window"]
+                <= window_n
+                <= contract["end_window"]
+                or not isinstance(fallback_counts, dict)
+                or not 1 <= len(fallback_counts) <= 256
+                or not isinstance(latest, dict)
+            ):
+                return {}
+            fallback_total = 0
+            for reason, count in fallback_counts.items():
+                if (
+                    not isinstance(reason, str)
+                    or not reason
+                    or len(reason) > 256
+                    or any(
+                        ord(character) < 0x20 or ord(character) > 0x7E
+                        for character in reason
+                    )
+                    or type(count) is not int
+                    or count <= 0
+                ):
+                    return {}
+                fallback_total += count
+            if fallback_total != attempt_count:
+                return {}
+            if set(latest) != {
+                "activated", "assigned_at", "assignment_sha256",
+                "execution_arm", "fallback_reason", "itt_arm", "pair_index",
+                "overlap_candidate_count", "period", "selected_overlap",
+                "selector_policy", "treatment_slot", "window_n",
+            }:
+                return {}
+            if (
+                type(latest.get("activated")) is not bool
+                or not isinstance(latest.get("assigned_at"), (int, float))
+                or isinstance(latest["assigned_at"], bool)
+                or not math.isfinite(float(latest["assigned_at"]))
+                or not isinstance(latest.get("assignment_sha256"), str)
+                or not sha64.fullmatch(latest["assignment_sha256"])
+                or latest.get("execution_arm") not in {"control", "treatment"}
+                or latest.get("itt_arm") not in {"control", "treatment"}
+                or not isinstance(latest.get("fallback_reason"), str)
+                or len(latest["fallback_reason"]) > 256
+                or any(
+                    ord(character) < 0x20 or ord(character) > 0x7E
+                    for character in latest["fallback_reason"]
+                )
+                or type(latest.get("overlap_candidate_count")) is not int
+                or latest["overlap_candidate_count"] < 0
+                or type(latest.get("pair_index")) is not int
+                or latest["pair_index"] < 0
+                or type(latest.get("period")) is not int
+                or latest["period"] not in {0, 1}
+                or type(latest.get("selected_overlap")) is not bool
+                or latest.get("selector_policy") not in {"exploit", "explore"}
+                or type(latest.get("treatment_slot")) is not int
+                or latest["treatment_slot"] not in {0, 1}
+                or type(latest.get("window_n")) is not int
+                or latest["window_n"] != window_n
+            ):
+                return {}
+            offset = latest["window_n"] - contract["start_window"]
+            expected_slot = contract["period0_treatment_slot"] ^ (offset % 2)
+            expected_arm = (
+                "treatment"
+                if lane["shard_slot"] == expected_slot
+                else "control"
+            )
+            expected_assignment_sha = hashlib.sha256(
+                json.dumps(
+                    {
+                        "assignment_algorithm":
+                            "period0_slot_complementary_two_shard_ab_ba_v1",
+                        "assignment_unit": "window_shard",
+                        "contract_sha256": contract["sha256"],
+                        "inside_experiment": True,
+                        "itt_arm": expected_arm,
+                        "kind":
+                            "reliquary_code_overlap_abba_assignment",
+                        "pair_index": offset // 2,
+                        "period": offset % 2,
+                        "reason": (
+                            "assigned_treatment"
+                            if expected_arm == "treatment"
+                            else "assigned_control"
+                        ),
+                        "schema_version": 1,
+                        "shard_slot": lane["shard_slot"],
+                        "treatment_slot": expected_slot,
+                        "window_n": latest["window_n"],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                offset < 0
+                or latest["window_n"] > contract["end_window"]
+                or latest["pair_index"] != offset // 2
+                or latest["period"] != offset % 2
+                or latest["treatment_slot"] != expected_slot
+                or latest["itt_arm"] != expected_arm
+                or latest["assignment_sha256"] != expected_assignment_sha
+                or (
+                    expected_arm == "control"
+                    and latest["execution_arm"] != "control"
+                )
+                or (
+                    latest["activated"]
+                    != (
+                        expected_arm == "treatment"
+                        and latest["execution_arm"] == "treatment"
+                        and latest["selector_policy"] == "exploit"
+                        and latest["overlap_candidate_count"] > 0
+                        and latest["selected_overlap"]
+                        and latest["fallback_reason"] == ""
+                    )
+                )
+                or int(latest["activated"]) > activation_count
+                or int(latest["selected_overlap"]) > selected_overlap_count
+                or fallback_counts.get(
+                    latest["fallback_reason"] or "none", 0
+                ) < 1
+            ):
+                return {}
+            latest_window = {
+                "activation_count": activation_count,
+                "attempt_count": attempt_count,
+                "fallback_counts": dict(fallback_counts),
+                "latest_attempt": dict(latest),
+                "selected_overlap_count": selected_overlap_count,
+                "window_n": window_n,
+            }
+        clean_lanes.append({**lane, "latest_window": latest_window})
+    clean_lanes.sort(key=lambda lane: lane["shard_slot"])
+    if (
+        {lane["shard_slot"] for lane in clean_lanes} != {0, 1}
+        or len({lane["process_unit"] for lane in clean_lanes}) != 2
+        or len({lane["process_pid"] for lane in clean_lanes}) != 2
+    ):
+        return {}
+    return {**base, "contract": dict(contract), "lanes": clean_lanes}
 
 
 def _parse_code_auction_probe(lines: list[str]) -> dict[str, Any]:
@@ -2432,6 +4535,59 @@ def _canonical_systemd_unit(unit: str) -> str:
     return value if value.endswith(".service") else f"{value}.service"
 
 
+_DYNAMIC_CERTIFICATION_TOKENS = (
+    "--submit-disabled",
+    "certif",
+    "capture",
+    "benchmark",
+    "-proof-",
+    "-download",
+    "materialize",
+    "alias-verify",
+    "-validation-",
+    "preflight",
+    "postprocess",
+)
+_DYNAMIC_GENERATOR_TOKENS = ("generator", " generator.server")
+_DYNAMIC_CONTROLLER_UNIT_TOKENS = ("canary",)
+_DYNAMIC_CONTROLLER_UNIT_SUFFIXES = ("-mine.service", "@mine.service")
+_DYNAMIC_CONTROLLER_LANE_TOKENS = ("code", "math", "miner-pro")
+_DYNAMIC_SUPPORT_TOKENS = (
+    "grader",
+    "tunnel",
+    "sentinel",
+    "watchdog",
+    "chrony",
+    "fail-closed",
+    "fence",
+    "dashboard",
+    "r2-sync",
+    "memory",
+    "coordinator",
+)
+
+
+def _classify_dynamic_service_role(unit: str, command: str) -> str:
+    """Classify one discovered service using the exact remote-probe contract."""
+    lowered_unit = unit.lower()
+    combined = lowered_unit + " " + command.lower()
+    if any(token in combined for token in _DYNAMIC_CERTIFICATION_TOKENS):
+        return "certification"
+    if any(token in combined for token in _DYNAMIC_GENERATOR_TOKENS):
+        return "wallet_free_generator"
+    if (
+        any(token in lowered_unit for token in _DYNAMIC_CONTROLLER_UNIT_TOKENS)
+        or any(
+            lowered_unit.endswith(suffix)
+            for suffix in _DYNAMIC_CONTROLLER_UNIT_SUFFIXES
+        )
+    ) and any(token in lowered_unit for token in _DYNAMIC_CONTROLLER_LANE_TOKENS):
+        return "mining_controller"
+    if any(token in combined for token in _DYNAMIC_SUPPORT_TOKENS):
+        return "support"
+    return "unknown"
+
+
 def _unit_lane(unit: str) -> str:
     canonical = _canonical_systemd_unit(unit)
     if "@" in canonical:
@@ -2454,6 +4610,248 @@ def _configured_unit_specs(state: BoxState) -> list[tuple[str, str]]:
         seen.add(canonical)
         specs.append((canonical, str(env_file or "")))
     return specs
+
+
+def _configured_controller_config_path(
+    state: BoxState,
+    unit: str,
+) -> str:
+    """Return the declared controller TOML for one exact allowed unit."""
+    canonical = _canonical_systemd_unit(unit)
+    matches = [
+        str(path or "")
+        for configured_unit, path in state.unit_controller_config_paths
+        if _canonical_systemd_unit(configured_unit) == canonical
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"duplicate controller config path: {canonical}")
+    return matches[0] if matches else ""
+
+
+def _refresh_active_unit_registry(state: BoxState) -> bool:
+    """Load one root-owned checkpoint-independent controller registry.
+
+    The registry is deployment authority, not service discovery.  Its three
+    content digests are checked on the miner host before any unit or telemetry
+    path can replace the static rollback configuration.
+    """
+
+    path = str(state.active_unit_registry_path or "")
+    if not path:
+        state.active_unit_registry = {}
+        return True
+    command = " ".join(("sudo -n python3 -", shlex.quote(path))) + """ <<'PYREGISTRY'
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import subprocess
+import sys
+
+path = sys.argv[1]
+required_top = {'schema_version', 'generated_at', 'active', 'rollback'}
+required_entry = {
+    'unit', 'mode', 'controller_config_path', 'telemetry_path',
+    'runtime_manifest_path', 'checkpoint_revision', 'source_revision',
+    'unit_fragment_sha256', 'controller_config_sha256',
+    'runtime_manifest_sha256',
+}
+hex64 = re.compile(r'[0-9a-f]{64}')
+hex40 = re.compile(r'[0-9a-f]{40}')
+unit_re = re.compile(r'[A-Za-z0-9_.@:-]+\\.service')
+
+def digest_file(filename, *, limit):
+    st = os.stat(filename, follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+        raise ValueError('attested file is not a bounded regular file')
+    digest = hashlib.sha256()
+    with open(filename, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+def digest_systemctl_cat(unit, *, limit):
+    '''Hash systemd's canonical unit projection, including source headers.
+
+    Some deployment writers intentionally bind ``systemctl cat`` instead of
+    the raw ``FragmentPath``.  For transient units those byte streams differ
+    only because ``systemctl cat`` prepends the fragment path header.  Keeping
+    this as an exact-byte fallback accepts that documented canonicalization
+    without turning a genuine fragment mutation into a soft warning.
+    '''
+    rendered = subprocess.run(
+        ['systemctl', 'cat', '--no-pager', unit],
+        capture_output=True, timeout=4, check=False,
+    )
+    payload = rendered.stdout
+    if rendered.returncode != 0 or not payload or len(payload) > limit:
+        return ''
+    return hashlib.sha256(payload).hexdigest()
+
+def normalize_entry(raw, *, require_live_fragment):
+    if not isinstance(raw, dict) or set(raw) != required_entry:
+        raise ValueError('registry entry schema mismatch')
+    entry = {key: str(value or '') for key, value in raw.items()}
+    if not unit_re.fullmatch(entry['unit']):
+        raise ValueError('registry unit is invalid')
+    if entry['mode'] not in {
+        'certifying', 'canary', 'mine', 'fenced', 'stalled', 'idle'
+    }:
+        raise ValueError('registry mode is invalid')
+    for name in (
+        'controller_config_path', 'telemetry_path', 'runtime_manifest_path'
+    ):
+        value = entry[name]
+        if not os.path.isabs(value) or '\\x00' in value:
+            raise ValueError(f'registry {name} is not absolute')
+    for name in (
+        'unit_fragment_sha256', 'controller_config_sha256',
+        'runtime_manifest_sha256'
+    ):
+        if not hex64.fullmatch(entry[name]):
+            raise ValueError(f'registry {name} is invalid')
+    for name in ('checkpoint_revision', 'source_revision'):
+        if not hex40.fullmatch(entry[name]):
+            raise ValueError(f'registry {name} is invalid')
+    controller_digest = digest_file(entry['controller_config_path'], limit=1024 * 1024)
+    runtime_digest = digest_file(entry['runtime_manifest_path'], limit=4 * 1024 * 1024)
+    if controller_digest != entry['controller_config_sha256']:
+        raise ValueError('controller config digest mismatch')
+    if runtime_digest != entry['runtime_manifest_sha256']:
+        raise ValueError('runtime manifest digest mismatch')
+    show = subprocess.run(
+        ['systemctl', 'show', entry['unit'], '--property=FragmentPath'],
+        capture_output=True, text=True, timeout=4, check=False,
+    )
+    fragment = ''
+    for line in show.stdout.splitlines():
+        if line.startswith('FragmentPath='):
+            fragment = line.split('=', 1)[1]
+    fragment_verification = 'unloaded'
+    if fragment:
+        raw_digest = digest_file(fragment, limit=1024 * 1024)
+        if raw_digest == entry['unit_fragment_sha256']:
+            fragment_verification = 'raw_fragment'
+        elif (
+            digest_systemctl_cat(entry['unit'], limit=1024 * 1024)
+            == entry['unit_fragment_sha256']
+        ):
+            fragment_verification = 'systemctl_cat'
+        else:
+            raise ValueError('systemd unit fragment digest mismatch')
+    elif require_live_fragment:
+        raise ValueError('systemd unit fragment digest mismatch')
+    return entry, fragment_verification
+
+root_st = os.stat(path, follow_symlinks=False)
+if (
+    not stat.S_ISREG(root_st.st_mode)
+    or root_st.st_uid != 0
+    or root_st.st_mode & 0o022
+    or root_st.st_size > 65536
+):
+    raise ValueError('registry must be root-owned, bounded and non-writable')
+with open(path, encoding='utf-8') as handle:
+    raw = json.load(handle)
+if not isinstance(raw, dict) or set(raw) != required_top:
+    raise ValueError('registry top-level schema mismatch')
+if raw['schema_version'] != 1:
+    raise ValueError('registry schema version is unsupported')
+generated_at = float(raw['generated_at'])
+if not math.isfinite(generated_at) or generated_at <= 0:
+    raise ValueError('registry generated_at is invalid')
+if not isinstance(raw['rollback'], list) or len(raw['rollback']) > 8:
+    raise ValueError('registry rollback set is invalid')
+normalized = [normalize_entry(raw['active'], require_live_fragment=True)]
+normalized.extend(
+    normalize_entry(item, require_live_fragment=False)
+    for item in raw['rollback']
+)
+entries = [entry for entry, _verification in normalized]
+units = [entry['unit'] for entry in entries]
+if len(units) != len(set(units)):
+    raise ValueError('registry units are duplicated')
+print(json.dumps({
+    'schema_version': 1,
+    'generated_at': generated_at,
+    'registry_sha256': digest_file(path, limit=65536),
+    'active': entries[0],
+    'rollback': entries[1:],
+    'fragment_verification': {
+        entry['unit']: verification
+        for entry, verification in normalized
+    },
+}, separators=(',', ':'), sort_keys=True))
+PYREGISTRY"""
+    rc, out, err = ssh_run(state.alias, command, timeout_s=12)
+    if rc != 0 or not out.strip():
+        state.active_unit_registry = {
+            "path": path,
+            "error": str(err or f"rc={rc}")[:160],
+        }
+        state.unit_resolution_error = "active_unit_registry_invalid"
+        return False
+    try:
+        registry = json.loads(out.strip().splitlines()[-1])
+        active = registry["active"]
+        rollback = registry["rollback"]
+        entries = [active, *rollback]
+        state.active_unit_registry = {
+            **registry,
+            "path": path,
+            "error": "",
+        }
+        state.unit = str(active["unit"])
+        state.unit_candidates = tuple(
+            (str(entry["unit"]), "") for entry in entries
+        )
+        state.unit_controller_config_paths = tuple(
+            (str(entry["unit"]), str(entry["controller_config_path"]))
+            for entry in entries
+        )
+        state.coordinated_units = ()
+        state.host_unit_allowlist = tuple(
+            str(entry["unit"]) for entry in entries
+        )
+        state.standalone_telemetry_path = str(active["telemetry_path"])
+        state.standalone_runtime_manifest_path = str(
+            active["runtime_manifest_path"]
+        )
+        return True
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        state.active_unit_registry = {
+            "path": path,
+            "error": str(exc)[:160],
+        }
+        state.unit_resolution_error = "active_unit_registry_invalid"
+        return False
+
+
+def _select_active_unit_registry_entry(state: BoxState, unit: str) -> bool:
+    """Bind dynamic telemetry paths to the exact selected registry unit."""
+
+    if not state.active_unit_registry_path:
+        return True
+    registry = state.active_unit_registry
+    entries = [registry.get("active"), *list(registry.get("rollback") or [])]
+    matches = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and _canonical_systemd_unit(str(entry.get("unit") or ""))
+        == _canonical_systemd_unit(unit)
+    ]
+    if len(matches) != 1:
+        state.unit_resolution_error = "active_unit_registry_unit_mismatch"
+        return False
+    selected = matches[0]
+    state.standalone_telemetry_path = str(selected["telemetry_path"])
+    state.standalone_runtime_manifest_path = str(
+        selected["runtime_manifest_path"]
+    )
+    return True
 
 
 def resolve_box_env_file(state: BoxState, unit: str | None = None) -> str:
@@ -2496,6 +4894,8 @@ def _clear_current_lane_telemetry(state: BoxState) -> None:
     state.active_lane = ""
     state.active_units = []
     state.active_lanes = []
+    state.coordinated_unit_statuses = []
+    state.service_inventory = []
     state.active_environment = ""
     state.active_pid = 0
     state.env_file_ok = False
@@ -2539,8 +4939,24 @@ def _clear_current_lane_telemetry(state: BoxState) -> None:
     state.miner_unit_enablement = ""
     state.runtime_profile_hash = ""
     state.code_auction_probe = {}
+    state.code_selector_crossover_probe = {}
+    state.code_overlap_abba_probe = {}
+    state.standalone_telemetry = {}
+    state.standalone_generated_at = 0.0
+    state.standalone_age_s = -1.0
+    state.standalone_fresh = False
+    state.standalone_error = ""
+    state.standalone_controller_mode = ""
+    state.standalone_controller_config_path = ""
+    state.standalone_active_runtime_manifest_path = ""
+    state.standalone_active_ledger_path = ""
+    state.standalone_supervisor = {}
+    state.standalone_progress_age_s = -1.0
+    state.standalone_certification = {}
+    state.runtime_components = []
     state.miner_source_revision = ""
     state.reliquary_source_revision = ""
+    state.observed_validator_image_revision = ""
     state.source_manifest_provisioned_ok = False
     state.provisioned_model_kind = ""
     state.provisioned_checkpoint_n = -1
@@ -2608,6 +5024,8 @@ def _resolve_allowed_active_unit(state: BoxState) -> tuple[str, str] | None:
     state.active_lane = ""
     state.active_units = []
     state.active_lanes = []
+    state.coordinated_unit_statuses = []
+    state.service_inventory = []
     state.active_environment = ""
     state.active_pid = 0
     state.unexpected_active_units = []
@@ -2644,9 +5062,17 @@ def _resolve_allowed_active_unit(state: BoxState) -> tuple[str, str] | None:
         "collectable": collectable,
         "host_allowed": host_allowed,
         "coordinated": coordinated,
+        "certification_tokens": _DYNAMIC_CERTIFICATION_TOKENS,
+        "generator_tokens": _DYNAMIC_GENERATOR_TOKENS,
+        "controller_unit_tokens": _DYNAMIC_CONTROLLER_UNIT_TOKENS,
+        "controller_unit_suffixes": _DYNAMIC_CONTROLLER_UNIT_SUFFIXES,
+        "controller_lane_tokens": _DYNAMIC_CONTROLLER_LANE_TOKENS,
+        "support_tokens": _DYNAMIC_SUPPORT_TOKENS,
     }))
     command = f"""python3 - {payload} <<'PYUNIT'
+import hashlib
 import json
+import os
 import subprocess
 import sys
 
@@ -2654,7 +5080,8 @@ config = json.loads(sys.argv[1])
 collectable = set(config['collectable'])
 collectable_order = list(config['collectable'])
 allowed = list(config['host_allowed'])
-coordinated = set(config['coordinated'])
+coordinated_order = list(config['coordinated'])
+coordinated = set(coordinated_order)
 
 def properties(unit):
     proc = subprocess.run(
@@ -2662,7 +5089,9 @@ def properties(unit):
             'systemctl', 'show', unit,
             '--property=LoadState', '--property=ActiveState',
             '--property=SubState', '--property=MainPID',
-            '--property=NRestarts',
+            '--property=NRestarts', '--property=InvocationID',
+            '--property=ExecStart', '--property=FragmentPath',
+            '--property=User',
         ],
         capture_output=True, text=True, timeout=4, check=False,
     )
@@ -2678,6 +5107,66 @@ def properties(unit):
         'sub_state': values.get('SubState', ''),
         'pid': int(values.get('MainPID') or 0),
         'restarts': int(values.get('NRestarts') or 0),
+        'invocation_id': values.get('InvocationID', ''),
+        'exec_start': values.get('ExecStart', ''),
+        'fragment_path': values.get('FragmentPath', ''),
+        'user': values.get('User', ''),
+    }}
+
+def digest_text(value):
+    return hashlib.sha256(value.encode('utf-8', 'replace')).hexdigest()
+
+def fragment_digest(path):
+    try:
+        if not path or not os.path.isabs(path):
+            return ''
+        with open(path, 'rb') as handle:
+            payload = handle.read(1048577)
+        if len(payload) > 1048576:
+            return ''
+        return hashlib.sha256(payload).hexdigest()
+    except (OSError, ValueError):
+        return ''
+
+def service_role(row):
+    unit = row['unit'].lower()
+    command = row['exec_start'].lower()
+    combined = unit + ' ' + command
+    if any(token in combined for token in config['certification_tokens']):
+        return 'certification'
+    if any(token in combined for token in config['generator_tokens']):
+        return 'wallet_free_generator'
+    if (
+        (
+            any(token in unit for token in config['controller_unit_tokens'])
+            or any(
+                unit.endswith(suffix)
+                for suffix in config['controller_unit_suffixes']
+            )
+        )
+        and any(token in unit for token in config['controller_lane_tokens'])
+    ):
+        return 'mining_controller'
+    if any(token in combined for token in config['support_tokens']):
+        return 'support'
+    return 'unknown'
+
+def inventory_row(row):
+    command = row.pop('exec_start', '')
+    fragment = row.pop('fragment_path', '')
+    role = service_role({{**row, 'exec_start': command}})
+    return {{
+        'unit': row['unit'],
+        'active_state': row['active_state'],
+        'sub_state': row['sub_state'],
+        'pid': row['pid'],
+        'restarts': row['restarts'],
+        'invocation_id': row.get('invocation_id', ''),
+        'service_user': row.get('user', ''),
+        'role': role,
+        'submit_disabled': '--submit-disabled' in command,
+        'exec_start_sha256': digest_text(command) if command else '',
+        'fragment_sha256': fragment_digest(fragment),
     }}
 
 def is_selectable(row):
@@ -2702,26 +5191,25 @@ contenders = [
     if row['unit'] in collectable and is_contender(row)
 ]
 unexpected = []
-if any(
-    unit == 'reliquary-miner-pro.service'
-    or unit.startswith('reliquary-miner-pro@')
-    for unit in allowed
-):
-    proc = subprocess.run(
-        [
-            'systemctl', 'list-units', '--type=service', '--all',
-            '--no-legend', '--plain', 'reliquary-miner-pro.service',
-            'reliquary-miner-pro@*.service',
-        ],
-        capture_output=True, text=True, timeout=4, check=False,
-    )
-    observed = sorted({{
-        line.split()[0] for line in proc.stdout.splitlines() if line.split()
-    }}.difference(allowed))
-    unexpected = sorted(
-        row['unit'] for row in (properties(unit) for unit in observed)
-        if is_contender(row)
-    )
+proc = subprocess.run(
+    [
+        'systemctl', 'list-units', '--type=service', '--all',
+        '--no-legend', '--plain', 'reliquary*.service',
+    ],
+    capture_output=True, text=True, timeout=4, check=False,
+)
+observed_units = sorted({{
+    line.split()[0] for line in proc.stdout.splitlines()
+    if line.split() and line.split()[0].startswith('reliquary')
+}})
+observed_rows = [properties(unit) for unit in observed_units]
+inventory = [inventory_row(dict(row)) for row in observed_rows if is_contender(row)]
+unexpected = sorted(
+    row['unit'] for row in inventory
+    if row['role'] == 'mining_controller'
+    and row['unit'] not in allowed
+    and (row['pid'] > 0 or row['sub_state'] == 'running')
+)
 
 error = ''
 if unexpected:
@@ -2738,9 +5226,15 @@ primary = next(
     (active_by_unit[unit] for unit in collectable_order if unit in active_by_unit),
     None,
 )
+rows_by_unit = {{row['unit']: row for row in rows}}
 print(json.dumps({{
     'active': primary,
     'active_units': active,
+    'coordinated_unit_statuses': [
+        rows_by_unit[unit] for unit in coordinated_order
+        if unit in rows_by_unit
+    ],
+    'service_inventory': inventory,
     'candidates': rows,
     'unexpected': unexpected,
     'error': error,
@@ -2755,6 +5249,85 @@ PYUNIT"""
         state.unexpected_active_units = [
             str(unit) for unit in result.get("unexpected", [])
         ]
+        inventory_rows = result.get("service_inventory")
+        if inventory_rows is None:
+            inventory_rows = []
+        if not isinstance(inventory_rows, list):
+            raise ValueError("service inventory missing")
+        parsed_inventory: list[dict[str, object]] = []
+        for raw_service in inventory_rows[:128]:
+            if not isinstance(raw_service, dict):
+                raise ValueError("service inventory row is not an object")
+            unit = _canonical_systemd_unit(str(raw_service.get("unit") or ""))
+            role = str(raw_service.get("role") or "")
+            if role not in {
+                "mining_controller",
+                "wallet_free_generator",
+                "certification",
+                "support",
+                "unknown",
+            }:
+                raise ValueError("service inventory role is invalid")
+            pid = int(raw_service.get("pid") or 0)
+            restarts = int(raw_service.get("restarts") or 0)
+            if pid < 0 or restarts < 0:
+                raise ValueError("service inventory counter is negative")
+            digests: dict[str, str] = {}
+            for name in ("exec_start_sha256", "fragment_sha256"):
+                value = str(raw_service.get(name) or "").lower()
+                if value and re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                    raise ValueError("service inventory digest is invalid")
+                digests[name] = value
+            parsed_inventory.append({
+                "unit": unit,
+                "active_state": str(raw_service.get("active_state") or "")[:32],
+                "sub_state": str(raw_service.get("sub_state") or "")[:32],
+                "pid": pid,
+                "restarts": restarts,
+                "invocation_id": str(
+                    raw_service.get("invocation_id") or ""
+                )[:128],
+                "service_user": str(raw_service.get("service_user") or "")[:128],
+                "role": role,
+                "submit_disabled": raw_service.get("submit_disabled") is True,
+                **digests,
+            })
+        state.service_inventory = parsed_inventory
+        if coordinated:
+            status_rows = result.get("coordinated_unit_statuses")
+            if not isinstance(status_rows, list):
+                raise ValueError("coordinated unit statuses missing")
+            status_by_unit: dict[str, dict[str, object]] = {}
+            for raw_status in status_rows:
+                if not isinstance(raw_status, dict):
+                    raise ValueError("coordinated unit status is not an object")
+                status_unit = _canonical_systemd_unit(
+                    str(raw_status.get("unit") or "")
+                )
+                if status_unit in status_by_unit:
+                    raise ValueError("duplicate coordinated unit status")
+                pid = int(raw_status.get("pid") or 0)
+                restarts = int(raw_status.get("restarts") or 0)
+                if pid < 0 or restarts < 0:
+                    raise ValueError("negative coordinated unit counter")
+                status_by_unit[status_unit] = {
+                    "unit": status_unit,
+                    "active_state": str(
+                        raw_status.get("active_state") or ""
+                    )[:32],
+                    "sub_state": str(raw_status.get("sub_state") or "")[:32],
+                    "pid": pid,
+                    "restarts": restarts,
+                }
+            if set(status_by_unit) != set(coordinated):
+                raise ValueError("incomplete coordinated unit statuses")
+            state.coordinated_unit_statuses = [
+                status_by_unit[unit] for unit in coordinated
+            ]
+            state.restart_count = sum(
+                int(row["restarts"])
+                for row in state.coordinated_unit_statuses
+            )
         error = str(result.get("error") or "")
         active = result.get("active")
         if error or not isinstance(active, dict):
@@ -2778,7 +5351,8 @@ PYUNIT"""
         state.active_units = active_units
         state.active_lanes = [_unit_lane(unit) for unit in active_units]
         state.active_pid = int(active.get("pid") or 0)
-        state.restart_count = int(active.get("restarts") or 0)
+        if not state.coordinated_unit_statuses:
+            state.restart_count = int(active.get("restarts") or 0)
         state.unit_resolution_error = ""
         return active_unit, env_by_unit.get(active_unit, "")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -2810,6 +5384,28 @@ def ssh_run(alias: str, cmd: str, timeout_s: int = 8) -> tuple[int, str, str]:
             full, capture_output=True, text=True,
             timeout=timeout_s,
         )
+        # A long-lived OpenSSH mux can occasionally reject a new channel on
+        # macOS with ``sendmsg(2): Message too long``.  That is a local
+        # control-socket failure, not a remote miner failure.  Retry the same
+        # read-only probe once over a fresh direct connection so the dashboard
+        # does not paint a healthy lane stale until the master expires.
+        if r.returncode != 0 and (
+            "mux_client_request_session" in r.stderr
+            or "sendmsg(2): Message too long" in r.stderr
+        ):
+            direct = list(full)
+            for old, new in (
+                ("ControlMaster=auto", "ControlMaster=no"),
+                ("ControlPersist=120", "ControlPersist=no"),
+                ("ControlPath=~/.ssh/reliquary-fleet-%C", "ControlPath=none"),
+            ):
+                direct[direct.index(old)] = new
+            r = subprocess.run(
+                direct,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
@@ -2869,6 +5465,7 @@ def _collect_lab_in_place(state: LabState) -> None:
             "artifact_decision_reason",
             "artifact_payout_profile",
             "artifact_economic_target",
+            "artifact_objective",
             "artifact_activation_blocker",
             "artifact_error",
             "error",
@@ -2908,6 +5505,27 @@ def _collect_lab_in_place(state: LabState) -> None:
             setattr(state, field_name, int(payload.get(field_name) or 0))
         state.gpu_total_mb = max(1, state.gpu_total_mb)
         state.last_attempt_at = float(payload.get("last_attempt_at") or 0.0)
+        online_activation_allowed = payload.get(
+            "artifact_online_activation_allowed"
+        )
+        if (
+            online_activation_allowed is not None
+            and not isinstance(online_activation_allowed, bool)
+        ):
+            raise ValueError(
+                "artifact online activation policy is not boolean"
+            )
+        state.artifact_online_activation_allowed = (
+            online_activation_allowed
+        )
+        for field_name in (
+            "artifact_expires_after_window",
+            "artifact_exploration_bps",
+        ):
+            value = payload.get(field_name)
+            if isinstance(value, bool):
+                raise ValueError(f"{field_name} is not an integer")
+            setattr(state, field_name, None if value is None else int(value))
         for field_name in (
             "submit_disabled_attested",
             "lane_start_disarmed",
@@ -2967,6 +5585,4161 @@ def collect_lab(state: LabState) -> None:
     state.__dict__ = snapshot.__dict__
 
 
+_COMPONENT_PROBE_SOURCE = r'''import glob
+import hashlib
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+
+config = json.loads(sys.argv[1])
+result = {"schema_version": 1, "error": "", "evidence_error": ""}
+
+
+def regular_json(path, *, max_bytes=1024 * 1024):
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("not_regular:" + path)
+    if before.st_size <= 0 or before.st_size > max_bytes:
+        raise ValueError("size:" + path)
+    if stat.S_IMODE(before.st_mode) & 0o022:
+        raise ValueError("mutable:" + path)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        raw = os.read(descriptor, max_bytes + 1)
+    finally:
+        os.close(descriptor)
+    if (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+    ) != (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ):
+        raise ValueError("changed:" + path)
+    if not raw or len(raw) > max_bytes:
+        raise ValueError("size:" + path)
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("not_object:" + path)
+    return value, hashlib.sha256(raw).hexdigest(), before.st_mtime
+
+
+def unit_state(unit):
+    proc = subprocess.run(
+        [
+            "systemctl", "show", unit,
+            "--property=ActiveState,SubState,UnitFileState,MainPID,NRestarts,"
+            "User,ProtectHome,ExecStart,Environment",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=6,
+        check=False,
+    )
+    values = {}
+    for raw in proc.stdout.splitlines():
+        if "=" in raw:
+            key, value = raw.split("=", 1)
+            values[key] = value
+    return {
+        "active_state": values.get("ActiveState") or "unknown",
+        "sub_state": values.get("SubState") or "unknown",
+        "enablement": values.get("UnitFileState") or "unknown",
+        "pid": int(values.get("MainPID") or 0),
+        "restarts": int(values.get("NRestarts") or 0),
+        "user": values.get("User") or "",
+        "protect_home": values.get("ProtectHome") or "",
+        "exec_start": values.get("ExecStart") or "",
+        "environment": values.get("Environment") or "",
+    }
+
+
+def assignments(path):
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("config_not_regular")
+    if before.st_size <= 0 or before.st_size > 1024 * 1024:
+        raise ValueError("config_size")
+    if stat.S_IMODE(before.st_mode) & 0o022:
+        raise ValueError("config_mutable")
+    values = {}
+    with open(path, "r", encoding="utf-8", errors="strict") as handle:
+        for raw in handle:
+            line = raw.split("#", 1)[0].strip()
+            if not line or line.startswith("[") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip().lower()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def process_argv(pid):
+    with open("/proc/" + str(pid) + "/cmdline", "rb") as handle:
+        return [
+            item.decode("utf-8")
+            for item in handle.read(64 * 1024).split(b"\0")
+            if item
+        ]
+
+
+def active_service_units():
+    listed = subprocess.run(
+        [
+            "systemctl", "list-units", "--type=service", "--state=running",
+            "--no-legend", "--no-pager",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=6,
+        check=False,
+    )
+    units = []
+    for raw in listed.stdout.splitlines():
+        fields = raw.split()
+        if fields and re.fullmatch(r"[A-Za-z0-9_.@:-]+\.service", fields[0]):
+            units.append(fields[0])
+    return sorted(set(units))
+
+
+def dynamic_component(expected, *, gpu_uuid):
+    required = {
+        "role", "component_id", "manifest_path", "manifest_file_sha256",
+        "runtime_payload_sha256", "runtime_profile_sha256",
+        "miner_source_revision", "validator_source_revision",
+        "checkpoint_revision", "controller_manifest_path",
+    }
+    if not isinstance(expected, dict) or set(expected) != required:
+        raise ValueError("controller_component_schema")
+    for name in (
+        "manifest_file_sha256", "runtime_payload_sha256",
+        "runtime_profile_sha256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(expected[name])):
+            raise ValueError("controller_component_" + name)
+    for name in (
+        "miner_source_revision", "validator_source_revision",
+        "checkpoint_revision",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}", str(expected[name])):
+            raise ValueError("controller_component_" + name)
+    if expected["role"] != config["role"] or not str(
+        expected["manifest_path"]
+    ).startswith("/"):
+        raise ValueError("controller_component_identity")
+    if not str(expected["controller_manifest_path"]).startswith("/"):
+        raise ValueError("controller_component_controller_manifest")
+    normalize_uuid = lambda value: str(value).removeprefix("GPU-").lower()
+    if normalize_uuid(expected["component_id"]) != normalize_uuid(gpu_uuid):
+        raise ValueError("controller_component_gpu")
+
+    matches = []
+    running_units = active_service_units()
+    for unit in running_units:
+        row = unit_state(unit)
+        if row["active_state"] != "active" or row["sub_state"] != "running":
+            continue
+        try:
+            argv = process_argv(row["pid"])
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if "reliquary_miner_pro_code.generator.server" not in argv:
+            continue
+        positions = [index for index, value in enumerate(argv) if value == "--config"]
+        if len(positions) != 1 or positions[0] + 1 >= len(argv):
+            continue
+        config_path = argv[positions[0] + 1]
+        if not config_path.startswith("/"):
+            continue
+        try:
+            configured = assignments(config_path)
+            manifest_path = configured.get("runtime_manifest", "")
+            manifest, manifest_sha, _manifest_mtime = regular_json(manifest_path)
+            identity = manifest.get("identity")
+            if not isinstance(identity, dict):
+                continue
+            profile_matches = []
+            for profile_path in glob.glob(
+                os.path.join(os.path.dirname(manifest_path), "*.json")
+            ):
+                try:
+                    profile, profile_sha, _profile_mtime = regular_json(profile_path)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    profile.get("schema_version") == 1
+                    and profile.get("role") == expected["role"]
+                    and profile.get("manifest_sha256")
+                    == expected["runtime_payload_sha256"]
+                    and profile.get("source_revision")
+                    == expected["validator_source_revision"]
+                    and profile.get("checkpoint_revision")
+                    == expected["checkpoint_revision"]
+                    and normalize_uuid(profile.get("gpu_uuid"))
+                    == normalize_uuid(expected["component_id"])
+                ):
+                    profile_matches.append((profile_path, profile_sha))
+            environment = row.get("environment", "")
+            if (
+                manifest_sha != expected["manifest_file_sha256"]
+                or manifest.get("schema_version") != 5
+                or manifest.get("component_role") != expected["role"]
+                or manifest.get("miner_source_revision")
+                != expected["miner_source_revision"]
+                or identity.get("validator_source_revision")
+                != expected["validator_source_revision"]
+                or identity.get("checkpoint_revision")
+                != expected["checkpoint_revision"]
+                or configured.get("runtime_profile_sha256")
+                != expected["runtime_profile_sha256"]
+                or configured.get("gpu_uuid")
+                != expected["component_id"]
+                or len(profile_matches) != 1
+                or (
+                    "RELIQUARY_CODE_RUNTIME_MANIFEST=" + manifest_path
+                    not in environment
+                )
+            ):
+                continue
+            matches.append({
+                "unit": unit,
+                "row": row,
+                "config_path": config_path,
+                "configured": configured,
+                "manifest_path": manifest_path,
+                "profile_path": profile_matches[0][0],
+            })
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    if len(matches) != 1:
+        raise ValueError("controller_component_generator_" + str(len(matches)))
+    selected = matches[0]
+    configured = selected["configured"]
+    if configured.get("listen_host") != "127.0.0.1":
+        raise ValueError("controller_component_listen_host")
+    try:
+        listen_port = int(configured.get("listen_port") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("controller_component_listen_port") from exc
+    if not 1 <= listen_port <= 65535:
+        raise ValueError("controller_component_listen_port")
+
+    tunnels = []
+    local_suffix = ":127.0.0.1:" + str(listen_port)
+    for unit in running_units:
+        row = unit_state(unit)
+        surface = row.get("exec_start", "") + " " + row.get("environment", "")
+        if (
+            row["active_state"] == "active"
+            and row["sub_state"] == "running"
+            and "autossh" in surface
+            and local_suffix in surface
+        ):
+            tunnels.append((unit, row))
+    if len(tunnels) != 1:
+        raise ValueError("controller_component_tunnel_" + str(len(tunnels)))
+
+    progress_path = configured.get("progress_path", "")
+    progress = {}
+    progress_mtime = 0.0
+    for _attempt in range(2):
+        try:
+            progress, _progress_sha, progress_mtime = regular_json(progress_path)
+            break
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            progress = {}
+    if progress:
+        if progress.get("schema_version") != 1:
+            raise ValueError("controller_component_progress_schema")
+        if int(progress.get("worker_pid") or 0) != selected["row"]["pid"]:
+            raise ValueError("controller_component_progress_pid")
+        worker_state = str(progress.get("state") or "")
+        if worker_state not in {"loading", "ready", "active", "recovering", "failed"}:
+            raise ValueError("controller_component_progress_state")
+        updated_at = float(progress.get("updated_at_unix") or progress_mtime)
+        heartbeat = max(1.0, float(configured.get("job_heartbeat_interval_seconds") or 5.0))
+        progress_age = max(0.0, time.time() - updated_at)
+        timestamp_sane = updated_at <= time.time() + 30.0
+        # A READY worker is an idle, process-bound state rather than a
+        # heartbeat promise.  Its PID, service, config and exact runtime
+        # identity are independently re-attested above on every poll.  Active,
+        # loading and recovery states still require a fresh progress record.
+        progress_fresh = bool(
+            timestamp_sane
+            and (
+                worker_state == "ready"
+                or progress_age <= max(15.0, heartbeat * 3.0)
+            )
+        )
+    else:
+        worker_state = ""
+        progress_age = -1.0
+        progress_fresh = False
+
+    active_job_id = str(progress.get("active_job_id") or "")
+    active_window_n = int(progress.get("active_window_n") or 0)
+    active_started_at = float(progress.get("active_started_at_unix") or 0.0)
+    active_deadline_at = float(progress.get("active_deadline_at_unix") or 0.0)
+    if worker_state == "active" and not (
+        progress_fresh
+        and re.fullmatch(r"[0-9a-f]{64}", active_job_id)
+        and active_window_n > 0
+        and 0 < active_started_at <= time.time() + 30.0
+        and active_deadline_at > active_started_at
+        and time.time() <= active_deadline_at + 5.0
+    ):
+        progress_fresh = False
+
+    return {
+        "generator_unit": selected["unit"],
+        "generator": selected["row"],
+        "tunnel_unit": tunnels[0][0],
+        "tunnel": tunnels[0][1],
+        "runtime_manifest_path": selected["manifest_path"],
+        "runtime_profile_path": selected["profile_path"],
+        "component_config_path": selected["config_path"],
+        "evidence_dir": os.path.dirname(selected["manifest_path"]),
+        "worker_state": worker_state,
+        "worker_progress_fresh": progress_fresh,
+        "worker_progress_age_s": progress_age,
+        "worker_boot_id": str(progress.get("boot_id") or ""),
+        "worker_engine_epoch": str(progress.get("engine_epoch") or ""),
+        "worker_recovery_count": int(progress.get("recovery_count") or 0),
+        "active_job_id": active_job_id,
+        "active_window_n": active_window_n,
+        "active_started_at": active_started_at,
+        "active_deadline_at": active_deadline_at,
+        "last_completed_job_id": str(progress.get("last_completed_job_id") or ""),
+        "last_completed_window_n": int(progress.get("last_completed_window_n") or 0),
+        "last_completed_at": float(progress.get("last_completed_at_unix") or 0.0),
+    }
+
+
+generator = unit_state(config["generator_unit"])
+tunnel = unit_state(config["tunnel_unit"])
+for prefix, row in (("generator", generator), ("tunnel", tunnel)):
+    for key in ("active_state", "sub_state", "enablement", "pid", "restarts"):
+        result[prefix + "_" + key] = row[key]
+
+gpu_uuid = ""
+try:
+    gpu = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=uuid,name,compute_cap,memory.used,memory.total,"
+            "utilization.gpu,power.draw,power.limit",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=6,
+        check=False,
+    )
+    parts = [
+        value.strip()
+        for value in (gpu.stdout.splitlines()[0] if gpu.stdout else "").split(",")
+    ]
+    if len(parts) == 8:
+        gpu_uuid = parts[0]
+        result.update({
+            "gpu_uuid": gpu_uuid,
+            "gpu_name": parts[1],
+            "compute_capability": parts[2],
+            "gpu_mem_mb": int(float(parts[3])),
+            "gpu_total_mb": max(1, int(float(parts[4]))),
+            "gpu_util": int(float(parts[5])),
+            "gpu_power_w": float(parts[6]),
+            "gpu_power_limit_w": float(parts[7]),
+        })
+except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+    pass
+
+try:
+    expected = config.get("controller_component")
+    if expected:
+        resolved = dynamic_component(expected, gpu_uuid=gpu_uuid)
+        config.update({
+            "generator_unit": resolved["generator_unit"],
+            "tunnel_unit": resolved["tunnel_unit"],
+            "runtime_manifest_path": resolved["runtime_manifest_path"],
+            "runtime_profile_path": resolved["runtime_profile_path"],
+            "component_config_path": resolved["component_config_path"],
+            "evidence_dir": resolved["evidence_dir"],
+        })
+        generator = resolved["generator"]
+        tunnel = resolved["tunnel"]
+        for prefix, row in (("generator", generator), ("tunnel", tunnel)):
+            for key in ("active_state", "sub_state", "enablement", "pid", "restarts"):
+                result[prefix + "_" + key] = row[key]
+        result.update({
+            "resolution_source": "controller_manifest",
+            "resolved_generator_unit": resolved["generator_unit"],
+            "resolved_tunnel_unit": resolved["tunnel_unit"],
+            "resolved_runtime_manifest_path": resolved["runtime_manifest_path"],
+            "resolved_runtime_profile_path": resolved["runtime_profile_path"],
+            "resolved_component_config_path": resolved["component_config_path"],
+            "worker_state": resolved["worker_state"],
+            "worker_progress_fresh": resolved["worker_progress_fresh"],
+            "worker_progress_age_s": resolved["worker_progress_age_s"],
+            "worker_boot_id": resolved["worker_boot_id"],
+            "worker_engine_epoch": resolved["worker_engine_epoch"],
+            "worker_recovery_count": resolved["worker_recovery_count"],
+            "active_job_id": resolved["active_job_id"],
+            "active_window_n": resolved["active_window_n"],
+            "active_started_at": resolved["active_started_at"],
+            "active_deadline_at": resolved["active_deadline_at"],
+            "last_completed_job_id": resolved["last_completed_job_id"],
+            "last_completed_window_n": resolved["last_completed_window_n"],
+            "last_completed_at": resolved["last_completed_at"],
+        })
+    else:
+        result["resolution_source"] = "static_config"
+except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    result["error"] = type(exc).__name__ + ":" + str(exc)[:160]
+
+try:
+    if result.get("error"):
+        raise ValueError(result["error"])
+    manifest, manifest_sha, _manifest_mtime = regular_json(
+        config["runtime_manifest_path"]
+    )
+    profile, profile_sha, _profile_mtime = regular_json(
+        config["runtime_profile_path"]
+    )
+    configured = assignments(config["component_config_path"])
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("manifest_identity")
+    result.update({
+        "component_role": str(manifest.get("component_role") or ""),
+        "manifest_schema_version": int(manifest.get("schema_version") or 0),
+        "manifest_sha256": manifest_sha,
+        "manifest_profile_sha256": str(profile.get("manifest_sha256") or ""),
+        "miner_source_revision": str(manifest.get("miner_source_revision") or ""),
+        "validator_source_revision": str(
+            identity.get("validator_source_revision") or ""
+        ),
+        "checkpoint_n": int(identity.get("checkpoint_n") or 0),
+        "checkpoint_revision": str(identity.get("checkpoint_revision") or ""),
+        "model_repo": str(identity.get("model_repo") or ""),
+        "environment": str(identity.get("environment") or ""),
+        "runtime_profile_sha256": str(
+            configured.get("runtime_profile_sha256") or ""
+        ),
+        "runtime_regime": str(configured.get("runtime_regime") or ""),
+        "profile_file_sha256": profile_sha,
+        "profile_source_revision": str(profile.get("source_revision") or ""),
+        "profile_checkpoint_revision": str(
+            profile.get("checkpoint_revision") or ""
+        ),
+        "profile_gpu_uuid": str(profile.get("gpu_uuid") or ""),
+    })
+    normalize_uuid = lambda value: str(value).removeprefix("GPU-").lower()
+    result["identity_ok"] = bool(
+        manifest.get("schema_version") == 5
+        and manifest.get("component_role") == config["role"]
+        and re.fullmatch(
+            r"[0-9a-f]{40}", str(manifest.get("miner_source_revision") or "")
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{40}",
+            str(identity.get("validator_source_revision") or ""),
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{40}", str(identity.get("checkpoint_revision") or "")
+        )
+        and profile.get("schema_version") == 1
+        and profile.get("role") == config["role"]
+        and profile.get("source_revision")
+        == identity.get("validator_source_revision")
+        and profile.get("checkpoint_revision")
+        == identity.get("checkpoint_revision")
+        and normalize_uuid(profile.get("gpu_uuid"))
+        == normalize_uuid(gpu_uuid)
+        and configured.get("runtime_manifest")
+        == config["runtime_manifest_path"]
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(configured.get("runtime_profile_sha256") or ""),
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(configured.get("runtime_regime") or ""),
+        )
+    )
+
+    forbidden = re.compile(
+        r"(?:^|_)(?:hotkey|coldkey|wallet|seed|validator_url|"
+        r"submit_url|subtensor|chain_endpoint)(?:_|$)",
+        re.IGNORECASE,
+    )
+    forbidden_config = any(forbidden.search(key) for key in configured)
+    process_surface = " ".join(
+        [
+            generator.get("exec_start", ""),
+            generator.get("environment", ""),
+        ]
+    )
+    forbidden_process = bool(forbidden.search(process_surface))
+    service_user = generator.get("user", "")
+    wallet_home_exists = True
+    try:
+        home = pwd.getpwnam(service_user).pw_dir
+        wallet_home_exists = any(
+            os.path.exists(path)
+            for path in (
+                os.path.join(home, ".bittensor", "wallets"),
+                os.path.join(home, ".bittensor", "wallet"),
+            )
+        )
+    except (KeyError, OSError):
+        wallet_home_exists = True
+    result["wallet_absent_attested"] = bool(
+        service_user
+        and service_user != "root"
+        and str(generator.get("protect_home", "")).lower() in {"yes", "true"}
+        and not forbidden_config
+        and not forbidden_process
+        and not wallet_home_exists
+    )
+    result["submit_authority"] = False
+
+    valid_windows = 0
+    complete_groups = 0
+    evidence_windows = []
+    latest_at = 0.0
+    for path in sorted(
+        glob.glob(os.path.join(config["evidence_dir"], "generation-*.audit.json"))
+    ):
+        try:
+            audit, _digest, mtime = regular_json(path)
+            inputs = audit.get("inputs")
+            details = audit.get("details")
+            if (
+                audit.get("schema_version") != 1
+                or audit.get("submit_disabled") is not True
+                or audit.get("wallet_free") is not True
+                or not isinstance(inputs, dict)
+                or not isinstance(details, dict)
+                or inputs.get(config["runtime_profile_path"]) != profile_sha
+            ):
+                continue
+            window_n = int(details.get("window_n") or 0)
+            groups = int(details.get("completed_groups") or 0)
+            if window_n <= 0 or groups < 0:
+                continue
+            valid_windows += 1
+            complete_groups += groups
+            evidence_windows.append(window_n)
+            latest_at = max(latest_at, float(mtime))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    result.update({
+        "evidence_valid_windows": valid_windows,
+        "evidence_complete_groups": complete_groups,
+        "evidence_first_window": min(evidence_windows) if evidence_windows else 0,
+        "evidence_last_window": max(evidence_windows) if evidence_windows else 0,
+        "evidence_latest_at": latest_at,
+    })
+except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    result["error"] = type(exc).__name__ + ":" + str(exc)[:160]
+
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+'''
+
+
+_COMPONENT_EVIDENCE_PROBE_SOURCE = r'''import glob
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+config = json.loads(sys.argv[1])
+result = {"schema_version": 1, "source_ok": False, "error": ""}
+
+
+def regular_bytes(path, *, max_bytes):
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("not_regular")
+    if before.st_size <= 0 or before.st_size > max_bytes:
+        raise ValueError("size")
+    if stat.S_IMODE(before.st_mode) & 0o022:
+        raise ValueError("mutable")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    after = os.lstat(path)
+    if (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+    ) != (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) or (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) != (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ):
+        raise ValueError("changed")
+    if not raw or len(raw) > max_bytes:
+        raise ValueError("size")
+    return raw, before.st_mtime
+
+
+def regular_json(path):
+    raw, mtime = regular_bytes(path, max_bytes=1024 * 1024)
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("not_object")
+    return value, hashlib.sha256(raw).hexdigest(), mtime
+
+
+def contained(path, root):
+    return os.path.commonpath(
+        [os.path.realpath(path), os.path.realpath(root)]
+    ) == os.path.realpath(root)
+
+
+def certificate_bound_evidence_dir(config, evidence_root):
+    """Resolve the one capture bound by the active controller certificate.
+
+    Recovery retries may leave several ``live-capture*`` directories beside a
+    runtime manifest.  Directory names and mtimes are not authority.  The
+    process-bound controller manifest names an immutable certificate; that
+    certificate names the exact parity artifact digest, and the certification
+    audit binds that digest to one capture directory.
+    """
+    controller_path = str(config.get("controller_manifest_path") or "")
+    if not controller_path:
+        return config["evidence_dir"], False
+    if not contained(controller_path, evidence_root):
+        raise ValueError("controller_manifest_outside_evidence_root")
+    controller, _controller_sha, _controller_mtime = regular_json(
+        controller_path
+    )
+    controller_identity = controller.get("identity")
+    components = controller.get("components")
+    if not isinstance(controller_identity, dict) or not isinstance(
+        components, list
+    ):
+        raise ValueError("controller_manifest_contract")
+    normalize_uuid = lambda value: str(value).removeprefix("GPU-").lower()
+    component_matches = [
+        item
+        for item in components
+        if isinstance(item, dict)
+        and item.get("role") == config["role"]
+        and normalize_uuid(item.get("component_id"))
+        == normalize_uuid(config["expected_gpu_uuid"])
+        and item.get("manifest_path") == config["runtime_manifest_path"]
+        and item.get("manifest_file_sha256")
+        == config["expected_manifest_sha256"]
+        and item.get("runtime_profile_sha256")
+        == config["expected_runtime_profile_sha256"]
+    ]
+    if (
+        len(component_matches) != 1
+        or controller.get("miner_source_revision")
+        != config["expected_miner_source_revision"]
+        or controller_identity.get("validator_source_revision")
+        != config["expected_validator_source_revision"]
+        or controller_identity.get("checkpoint_revision")
+        != config["expected_checkpoint_revision"]
+    ):
+        raise ValueError("controller_manifest_identity")
+
+    certificate_path = str(controller.get("certificate_path") or "")
+    certificate_sha = str(controller.get("certificate_sha256") or "")
+    if (
+        not certificate_path
+        or not contained(certificate_path, evidence_root)
+        or not re.fullmatch(r"[0-9a-f]{64}", certificate_sha)
+    ):
+        raise ValueError("controller_certificate_binding")
+    certificate, observed_certificate_sha, _certificate_mtime = regular_json(
+        certificate_path
+    )
+    if observed_certificate_sha != certificate_sha:
+        raise ValueError("controller_certificate_digest")
+    certificate_binding = certificate.get("runtime_binding")
+    refresh = certificate.get("checkpoint_refresh")
+    if not isinstance(certificate_binding, dict) or not isinstance(refresh, dict):
+        raise ValueError("controller_certificate_contract")
+    artifact_sha = str(refresh.get("evidence_sha256") or "")
+    if (
+        certificate_binding.get("validator_source_revision")
+        != config["expected_validator_source_revision"]
+        or certificate_binding.get("checkpoint_revision")
+        != config["expected_checkpoint_revision"]
+        or not re.fullmatch(r"[0-9a-f]{64}", artifact_sha)
+    ):
+        raise ValueError("controller_certificate_identity")
+
+    matches = []
+    for candidate in sorted(glob.glob(os.path.join(evidence_root, "live-capture*"))):
+        try:
+            candidate_info = os.lstat(candidate)
+            if stat.S_ISLNK(candidate_info.st_mode) or not stat.S_ISDIR(
+                candidate_info.st_mode
+            ):
+                continue
+            audit_path = os.path.join(candidate, "certification-evidence.audit.json")
+            audit, _audit_sha, _audit_mtime = regular_json(audit_path)
+            details = audit.get("details")
+            output_path = str(audit.get("output") or "")
+            output_sha = str(audit.get("output_sha256") or "")
+            if (
+                audit.get("schema_version") != 1
+                or audit.get("submit_disabled") is not True
+                or audit.get("wallet_free") is not True
+                or not isinstance(details, dict)
+                or details.get("artifact_sha256") != artifact_sha
+                or not output_path
+                or not contained(output_path, candidate)
+                or not re.fullmatch(r"[0-9a-f]{64}", output_sha)
+            ):
+                continue
+            output, observed_output_sha, _output_mtime = regular_json(output_path)
+            output_binding = output.get("runtime_binding")
+            output_refresh = output.get("checkpoint_refresh")
+            if (
+                observed_output_sha != output_sha
+                or not isinstance(output_binding, dict)
+                or not isinstance(output_refresh, dict)
+                or output_binding.get("validator_source_revision")
+                != config["expected_validator_source_revision"]
+                or output_binding.get("checkpoint_revision")
+                != config["expected_checkpoint_revision"]
+                or output_refresh.get("evidence_sha256") != artifact_sha
+                or int(output_refresh.get("groups") or 0) < 1
+            ):
+                continue
+            matches.append(candidate)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    if len(matches) != 1:
+        raise ValueError("certificate_evidence_directory_" + str(len(matches)))
+    return matches[0], True
+
+
+try:
+    configured_evidence = config["evidence_dir"]
+    evidence_root = (
+        configured_evidence
+        if os.path.basename(configured_evidence.rstrip("/"))
+        != "live-capture"
+        else os.path.dirname(configured_evidence.rstrip("/"))
+    )
+    evidence_dir, certificate_bound = certificate_bound_evidence_dir(
+        config, evidence_root
+    )
+    root_info = os.lstat(evidence_dir)
+    if (
+        stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+        # The controller's checkpoint-scoped live-capture directory is
+        # intentionally group-writable while its one canary is assembled.
+        # Every consumed file below is independently O_NOFOLLOW/read-stable,
+        # digest-bound, and non-writable; only world-writable roots are unsafe.
+        or stat.S_IMODE(root_info.st_mode) & 0o002
+    ):
+        raise ValueError("evidence_dir")
+    evidence_root = os.path.dirname(evidence_dir.rstrip("/"))
+    manifest_path = config["runtime_manifest_path"]
+    profile_path = config["runtime_profile_path"]
+    if not contained(manifest_path, evidence_root) or not contained(
+        profile_path, evidence_root
+    ):
+        raise ValueError("identity_outside_evidence_root")
+    manifest, manifest_sha, _manifest_mtime = regular_json(manifest_path)
+    profile, profile_sha, _profile_mtime = regular_json(profile_path)
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("manifest_identity")
+
+    normalize_uuid = lambda value: str(value).removeprefix("GPU-").lower()
+    if (
+        manifest_sha != config["expected_manifest_sha256"]
+        or manifest.get("schema_version") != 5
+        or manifest.get("component_role") != config["role"]
+        or manifest.get("miner_source_revision")
+        != config["expected_miner_source_revision"]
+        or identity.get("validator_source_revision")
+        != config["expected_validator_source_revision"]
+        or identity.get("checkpoint_revision")
+        != config["expected_checkpoint_revision"]
+        or profile.get("schema_version") != 1
+        or profile.get("role") != config["role"]
+        or profile.get("source_revision")
+        != config["expected_validator_source_revision"]
+        or profile.get("checkpoint_revision")
+        != config["expected_checkpoint_revision"]
+        or normalize_uuid(profile.get("gpu_uuid"))
+        != normalize_uuid(config["expected_gpu_uuid"])
+    ):
+        raise ValueError("evidence_identity")
+
+    windows = {}
+    complete_groups = 0
+    latest_completion_at = 0.0
+    audit_paths = sorted(
+        glob.glob(os.path.join(evidence_dir, "generation-*.audit.json"))
+    )
+    for audit_path in audit_paths:
+        audit, _audit_sha, audit_mtime = regular_json(audit_path)
+        inputs = audit.get("inputs")
+        details = audit.get("details")
+        output_path = str(audit.get("output") or "")
+        if (
+            audit.get("schema_version") != 1
+            or audit.get("submit_disabled") is not True
+            or audit.get("wallet_free") is not True
+            or not isinstance(inputs, dict)
+            or not isinstance(details, dict)
+            or inputs.get(profile_path) != profile_sha
+            or not output_path
+            or not contained(output_path, evidence_dir)
+        ):
+            raise ValueError("audit_contract")
+        # Historical component campaigns directly named the component
+        # manifest as an input.  Current split-GPU canary captures instead
+        # name the controller manifest; that controller manifest binds the
+        # exact RTX component manifest, GPU and runtime profile.  Accept both
+        # shapes, but never infer the binding from filenames alone.
+        direct_manifest_binding = inputs.get(manifest_path) == manifest_sha
+        controller_manifest_binding = False
+        if not direct_manifest_binding:
+            controller_matches = 0
+            for input_path, expected_sha in inputs.items():
+                if (
+                    not isinstance(input_path, str)
+                    or not isinstance(expected_sha, str)
+                    or not contained(input_path, evidence_root)
+                ):
+                    raise ValueError("audit_input")
+                try:
+                    candidate, candidate_sha, _candidate_mtime = regular_json(
+                        input_path
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                if candidate_sha != expected_sha:
+                    raise ValueError("audit_input_digest")
+                candidate_identity = candidate.get("identity")
+                components = candidate.get("components")
+                if not isinstance(candidate_identity, dict) or not isinstance(
+                    components, list
+                ):
+                    continue
+                matches = [
+                    item
+                    for item in components
+                    if isinstance(item, dict)
+                    and item.get("role") == config["role"]
+                    and normalize_uuid(item.get("component_id"))
+                    == normalize_uuid(config["expected_gpu_uuid"])
+                    and item.get("manifest_path") == manifest_path
+                    and item.get("manifest_file_sha256") == manifest_sha
+                    and item.get("runtime_profile_sha256")
+                    == config["expected_runtime_profile_sha256"]
+                ]
+                if (
+                    len(matches) == 1
+                    and candidate.get("miner_source_revision")
+                    == config["expected_miner_source_revision"]
+                    and candidate_identity.get("validator_source_revision")
+                    == config["expected_validator_source_revision"]
+                    and candidate_identity.get("checkpoint_revision")
+                    == config["expected_checkpoint_revision"]
+                ):
+                    controller_matches += 1
+            controller_manifest_binding = controller_matches == 1
+        if not direct_manifest_binding and not controller_manifest_binding:
+            raise ValueError("audit_component_binding")
+        for input_path, expected_sha in inputs.items():
+            if (
+                not isinstance(input_path, str)
+                or not isinstance(expected_sha, str)
+                or not contained(input_path, evidence_root)
+            ):
+                raise ValueError("audit_input")
+            raw, _mtime = regular_bytes(input_path, max_bytes=32 * 1024 * 1024)
+            if hashlib.sha256(raw).hexdigest() != expected_sha:
+                raise ValueError("audit_input_digest")
+        output, output_mtime = regular_bytes(
+            output_path, max_bytes=32 * 1024 * 1024
+        )
+        if (
+            hashlib.sha256(output).hexdigest()
+            != str(audit.get("output_sha256") or "")
+        ):
+            raise ValueError("audit_output_digest")
+        if direct_manifest_binding:
+            window_n = int(details.get("window_n") or 0)
+            groups = int(details.get("completed_groups") or 0)
+        else:
+            capture = json.loads(output)
+            if not isinstance(capture, dict):
+                raise ValueError("capture_output")
+            trials = capture.get("generation_trials")
+            if not isinstance(trials, list):
+                raise ValueError("capture_output")
+            complete_trials = [
+                trial
+                for trial in trials
+                if isinstance(trial, dict)
+                and isinstance(trial.get("group"), dict)
+                and isinstance(trial["group"].get("rollouts"), list)
+                and len(trial["group"]["rollouts"]) == 8
+                and int(trial["group"].get("prompt_idx") or 0) > 0
+            ]
+            if len(complete_trials) != len(trials):
+                raise ValueError("capture_incomplete_group")
+            window_n = int(capture.get("observed_window_n") or 0)
+            groups = len(complete_trials)
+        if window_n <= 0 or groups < 0 or window_n in windows:
+            raise ValueError("audit_window")
+        windows[window_n] = True
+        complete_groups += groups
+        # Completion truth comes from the immutable output and its audit,
+        # never from pre-created plan files.
+        latest_completion_at = max(
+            latest_completion_at,
+            float(output_mtime),
+            float(audit_mtime),
+        )
+    ordered = sorted(windows)
+    result.update({
+        "source_ok": True,
+        "certificate_bound": certificate_bound,
+        "evidence_dir": evidence_dir,
+        "manifest_sha256": manifest_sha,
+        "profile_sha256": profile_sha,
+        "valid_windows": len(ordered),
+        "complete_groups": complete_groups,
+        "first_window": ordered[0] if ordered else 0,
+        "last_window": ordered[-1] if ordered else 0,
+        "latest_completion_at": latest_completion_at,
+    })
+except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    result["error"] = type(exc).__name__ + ":" + str(exc)[:120]
+
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+'''
+
+
+def _collect_component_in_place(
+    state: ComponentState,
+    controller_component: dict[str, Any] | None = None,
+) -> None:
+    """Collect one component without reading wallet or submission material."""
+    payload = {
+        "role": state.role,
+        "generator_unit": state.generator_unit,
+        "tunnel_unit": state.tunnel_unit,
+        "runtime_manifest_path": state.runtime_manifest_path,
+        "runtime_profile_path": state.runtime_profile_path,
+        "component_config_path": state.component_config_path,
+        "evidence_dir": state.evidence_dir,
+    }
+    if controller_component is not None:
+        payload["controller_component"] = controller_component
+    command = (
+        "sudo -n python3 - "
+        + shlex.quote(json.dumps(payload, separators=(",", ":")))
+        + " <<'PYCOMPONENT'\n"
+        + _COMPONENT_PROBE_SOURCE
+        + "\nPYCOMPONENT\n"
+    )
+    rc, out, err = ssh_run(state.alias, command, timeout_s=20)
+    state.last_poll_s = time.time()
+    if rc != 0 or not out.strip():
+        detail = (err or f"rc={rc}").strip().replace("\n", " ")
+        state.error = f"probe:{detail[:160]}"
+        return
+    try:
+        payload = json.loads(out.strip().splitlines()[-1])
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("probe_schema")
+        string_fields = (
+            "generator_active_state",
+            "generator_sub_state",
+            "generator_enablement",
+            "tunnel_active_state",
+            "tunnel_sub_state",
+            "tunnel_enablement",
+            "gpu_uuid",
+            "gpu_name",
+            "compute_capability",
+            "component_role",
+            "manifest_sha256",
+            "manifest_profile_sha256",
+            "miner_source_revision",
+            "validator_source_revision",
+            "checkpoint_revision",
+            "model_repo",
+            "environment",
+            "runtime_profile_sha256",
+            "runtime_regime",
+            "profile_file_sha256",
+            "profile_source_revision",
+            "profile_checkpoint_revision",
+            "profile_gpu_uuid",
+            "resolution_source",
+            "worker_state",
+            "worker_boot_id",
+            "worker_engine_epoch",
+            "active_job_id",
+            "last_completed_job_id",
+            "evidence_error",
+            "error",
+        )
+        for name in string_fields:
+            setattr(state, name, str(payload.get(name) or ""))
+        integer_fields = (
+            "generator_pid",
+            "generator_restarts",
+            "tunnel_pid",
+            "tunnel_restarts",
+            "gpu_mem_mb",
+            "gpu_total_mb",
+            "gpu_util",
+            "manifest_schema_version",
+            "checkpoint_n",
+            "evidence_valid_windows",
+            "evidence_complete_groups",
+            "evidence_first_window",
+            "evidence_last_window",
+            "worker_recovery_count",
+            "active_window_n",
+            "last_completed_window_n",
+        )
+        for name in integer_fields:
+            value = payload.get(name, 0)
+            if isinstance(value, bool):
+                raise ValueError(f"{name}_boolean")
+            parsed = int(value or 0)
+            if parsed < 0:
+                raise ValueError(f"{name}_negative")
+            setattr(state, name, parsed)
+        state.gpu_total_mb = max(1, state.gpu_total_mb)
+        for name in (
+            "gpu_power_w",
+            "gpu_power_limit_w",
+            "evidence_latest_at",
+            "worker_progress_age_s",
+            "active_started_at",
+            "active_deadline_at",
+            "last_completed_at",
+        ):
+            value = payload.get(name, 0.0)
+            if isinstance(value, bool):
+                raise ValueError(f"{name}_boolean")
+            parsed = float(value or 0.0)
+            if not math.isfinite(parsed) or (
+                parsed < 0 and name != "worker_progress_age_s"
+            ):
+                raise ValueError(f"{name}_invalid")
+            setattr(state, name, parsed)
+        state.identity_ok = payload.get("identity_ok") is True
+        state.wallet_absent_attested = (
+            payload.get("wallet_absent_attested") is True
+        )
+        state.submit_authority = payload.get("submit_authority") is True
+        state.worker_progress_fresh = (
+            payload.get("worker_progress_fresh") is True
+        )
+        if state.resolution_source == "controller_manifest":
+            state.generator_unit = str(
+                payload.get("resolved_generator_unit") or ""
+            )
+            state.tunnel_unit = str(
+                payload.get("resolved_tunnel_unit") or ""
+            )
+            state.runtime_manifest_path = str(
+                payload.get("resolved_runtime_manifest_path") or ""
+            )
+            state.runtime_profile_path = str(
+                payload.get("resolved_runtime_profile_path") or ""
+            )
+            state.component_config_path = str(
+                payload.get("resolved_component_config_path") or ""
+            )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        state.error = f"parse:{type(exc).__name__}:{str(exc)[:120]}"
+
+
+def _collect_component_evidence_in_place(
+    state: ComponentState,
+    *,
+    controller_manifest_path: str = "",
+) -> None:
+    """Read certification evidence from its authoritative assembly host."""
+    payload = {
+        "role": state.role,
+        "evidence_dir": state.evidence_dir,
+        "runtime_manifest_path": state.evidence_runtime_manifest_path,
+        "runtime_profile_path": state.evidence_runtime_profile_path,
+        "expected_manifest_sha256": state.manifest_sha256,
+        "expected_miner_source_revision": state.miner_source_revision,
+        "expected_validator_source_revision": state.validator_source_revision,
+        "expected_checkpoint_revision": state.checkpoint_revision,
+        "expected_gpu_uuid": state.gpu_uuid,
+        "expected_runtime_profile_sha256": state.runtime_profile_sha256,
+        "controller_manifest_path": controller_manifest_path,
+    }
+    command = (
+        "sudo -n python3 - "
+        + shlex.quote(json.dumps(payload, separators=(",", ":")))
+        + " <<'PYCOMPONENTEVIDENCE'\n"
+        + _COMPONENT_EVIDENCE_PROBE_SOURCE
+        + "\nPYCOMPONENTEVIDENCE\n"
+    )
+    rc, out, err = ssh_run(state.evidence_alias, command, timeout_s=20)
+    if rc != 0 or not out.strip():
+        detail = (err or f"rc={rc}").strip().replace("\n", " ")
+        state.evidence_error = f"probe:{detail[:160]}"
+        state.evidence_source_ok = False
+        state.evidence_fresh = False
+        return
+    try:
+        payload = json.loads(out.strip().splitlines()[-1])
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("probe_schema")
+        state.evidence_error = str(payload.get("error") or "")
+        state.evidence_source_ok = payload.get("source_ok") is True
+        state.evidence_certificate_bound = (
+            payload.get("certificate_bound") is True
+        )
+        selected_evidence_dir = str(payload.get("evidence_dir") or "")
+        if selected_evidence_dir:
+            state.evidence_dir = selected_evidence_dir
+        state.evidence_manifest_sha256 = str(
+            payload.get("manifest_sha256") or ""
+        )
+        state.evidence_profile_sha256 = str(
+            payload.get("profile_sha256") or ""
+        )
+        for target, source in (
+            ("evidence_valid_windows", "valid_windows"),
+            ("evidence_complete_groups", "complete_groups"),
+            ("evidence_first_window", "first_window"),
+            ("evidence_last_window", "last_window"),
+        ):
+            value = payload.get(source, 0)
+            if isinstance(value, bool):
+                raise ValueError(f"{source}_boolean")
+            parsed = int(value or 0)
+            if parsed < 0:
+                raise ValueError(f"{source}_negative")
+            setattr(state, target, parsed)
+        latest = payload.get("latest_completion_at", 0.0)
+        if isinstance(latest, bool):
+            raise ValueError("latest_completion_at_boolean")
+        state.evidence_latest_at = float(latest or 0.0)
+        if (
+            not math.isfinite(state.evidence_latest_at)
+            or state.evidence_latest_at < 0
+        ):
+            raise ValueError("latest_completion_at_invalid")
+        complete = (
+            state.evidence_valid_windows
+            >= state.evidence_target_windows
+        )
+        age = (
+            max(0.0, time.time() - state.evidence_latest_at)
+            if state.evidence_latest_at
+            else math.inf
+        )
+        state.evidence_fresh = bool(
+            state.evidence_source_ok
+            and (
+                state.evidence_certificate_bound
+                or complete
+                or age <= state.evidence_stale_seconds
+            )
+        )
+        if (
+            state.evidence_source_ok
+            and not state.evidence_fresh
+            and not state.evidence_error
+        ):
+            state.evidence_error = "stale_incomplete_certification"
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        state.evidence_error = (
+            f"parse:{type(exc).__name__}:{str(exc)[:120]}"
+        )
+        state.evidence_source_ok = False
+        state.evidence_fresh = False
+
+
+def collect_component_snapshot(
+    state: ComponentState,
+    controller_component: dict[str, Any] | None = None,
+) -> ComponentState:
+    snapshot = ComponentState(
+        alias=state.alias,
+        label=state.label,
+        color=state.color,
+        role=state.role,
+        controller_label=state.controller_label,
+        generator_unit=state.generator_unit,
+        tunnel_unit=state.tunnel_unit,
+        runtime_manifest_path=state.runtime_manifest_path,
+        runtime_profile_path=state.runtime_profile_path,
+        component_config_path=state.component_config_path,
+        evidence_alias=state.evidence_alias,
+        evidence_dir=state.evidence_dir,
+        evidence_runtime_manifest_path=(
+            state.evidence_runtime_manifest_path
+        ),
+        evidence_runtime_profile_path=(
+            state.evidence_runtime_profile_path
+        ),
+        evidence_target_windows=state.evidence_target_windows,
+        evidence_stale_seconds=state.evidence_stale_seconds,
+        telemetry_stale_seconds=state.telemetry_stale_seconds,
+    )
+    _collect_component_in_place(snapshot, controller_component)
+    if controller_component is not None:
+        manifest_path = str(controller_component.get("manifest_path") or "")
+        if manifest_path.startswith("/"):
+            snapshot.evidence_runtime_manifest_path = manifest_path
+            evidence_root = os.path.dirname(manifest_path)
+            snapshot.evidence_runtime_profile_path = os.path.join(
+                evidence_root, "generation-profile-rtx.json"
+            )
+            snapshot.evidence_dir = evidence_root
+    controller_manifest_path = (
+        str(controller_component.get("controller_manifest_path") or "")
+        if controller_component is not None
+        else ""
+    )
+    _collect_component_evidence_in_place(
+        snapshot,
+        controller_manifest_path=controller_manifest_path,
+    )
+    return snapshot
+
+
+_STANDALONE_CERTIFICATION_PROBE_SOURCE = r"""
+import csv
+import glob
+import hashlib
+import io
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+MAX_BYTES = 8 * 1024 * 1024
+SHA256 = re.compile(r"[0-9a-f]{64}")
+GPU_UUID = re.compile(
+    r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}"
+    r"-[0-9a-fA-F]{12}"
+)
+
+def absolute(value, name):
+    value = str(value or "")
+    if not value.startswith("/"):
+        raise ValueError(name)
+    return value
+
+def read_regular(path, max_bytes=MAX_BYTES):
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("not_regular")
+    if before.st_size <= 0 or before.st_size > max_bytes:
+        raise ValueError("size")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev, opened.st_ino, opened.st_size,
+            opened.st_mtime_ns,
+        ) != (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise ValueError("changed_before_read")
+        raw = os.read(descriptor, max_bytes + 1)
+        if not raw or len(raw) > max_bytes:
+            raise ValueError("size")
+        after = os.lstat(path)
+        if (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise ValueError("changed_during_read")
+        return raw
+    finally:
+        os.close(descriptor)
+
+def read_json(path):
+    value = json.loads(read_regular(path).decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("json_object")
+    return value
+
+def cmdline(pid):
+    try:
+        raw = open(
+            "/proc/" + str(pid) + "/cmdline", "rb", buffering=0
+        ).read(65537)
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return []
+    if not raw or len(raw) > 65536:
+        return []
+    try:
+        return [
+            item.decode("utf-8")
+            for item in raw.split(b"\0")
+            if item
+        ]
+    except UnicodeDecodeError:
+        return []
+
+def ppid(pid):
+    try:
+        with open(
+            "/proc/" + str(pid) + "/status",
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            for line in handle:
+                if line.startswith("PPid:"):
+                    return int(line.split(":", 1)[1].strip())
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+        pass
+    return 0
+
+def started_at(pid):
+    with open(
+        "/proc/" + str(pid) + "/stat",
+        "r",
+        encoding="utf-8",
+    ) as handle:
+        raw = handle.read(65536)
+    if not raw or len(raw) >= 65536:
+        raise ValueError("process_stat")
+    tail = raw.rsplit(")", 1)[1].strip().split()
+    ticks = int(tail[19])
+    clock = os.sysconf("SC_CLK_TCK")
+    uptime = float(open("/proc/uptime", encoding="utf-8").read().split()[0])
+    return time.time() - uptime + ticks / clock
+
+def option(argv, name):
+    positions = [
+        index for index, value in enumerate(argv) if value == name
+    ]
+    if len(positions) != 1 or positions[0] + 1 >= len(argv):
+        raise ValueError("option:" + name)
+    return argv[positions[0] + 1]
+
+def run(command):
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+def systemd_properties(unit):
+    result = run([
+        "systemctl", "show", unit, "--no-pager",
+        "--property=LoadState,ActiveState,SubState,MainPID,User,"
+        "NoNewPrivileges",
+    ])
+    if result.returncode != 0:
+        raise ValueError("systemd_show")
+    return dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if "=" in line
+    )
+
+def gpu_telemetry(expected_uuid):
+    result = run([
+        "nvidia-smi",
+        "--query-gpu=uuid,name,utilization.gpu,memory.used,memory.total,"
+        "power.draw,power.limit",
+        "--format=csv,noheader,nounits",
+    ])
+    if result.returncode != 0:
+        raise ValueError("nvidia_smi")
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) != 7 or row[0].strip() != expected_uuid:
+            continue
+        return {
+            "uuid": row[0].strip(),
+            "name": row[1].strip(),
+            "utilization_pct": int(float(row[2].strip())),
+            "memory_used_mb": int(float(row[3].strip())),
+            "memory_total_mb": int(float(row[4].strip())),
+            "power_w": float(row[5].strip()),
+            "power_limit_w": float(row[6].strip()),
+        }
+    raise ValueError("gpu_missing")
+
+def gpu_pids(expected_uuid):
+    result = run([
+        "nvidia-smi",
+        "--query-compute-apps=pid,gpu_uuid,used_memory",
+        "--format=csv,noheader,nounits",
+    ])
+    observed = {}
+    if result.returncode != 0:
+        return observed
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) != 3 or row[1].strip() != expected_uuid:
+            continue
+        try:
+            observed[int(row[0].strip())] = int(float(row[2].strip()))
+        except ValueError:
+            continue
+    return observed
+
+def artifact_state(directory):
+    names = (
+        "reference-proof.json",
+        "candidate-proof.json",
+        "parity.json",
+        "validator-replay.json",
+        "runtime-certificate-v3.canary.json",
+        "runtime-certificate-v3.canary.report.json",
+        "runtime.bound.json",
+    )
+    return {name: os.path.isfile(directory + "/" + name) for name in names}
+
+out = {
+    "schema_version": 1,
+    "generated_at": time.time(),
+    "active": False,
+    "exact": False,
+    "error": "",
+}
+try:
+    config = json.loads(sys.argv[1])
+    if not isinstance(config, dict):
+        raise ValueError("config")
+    runner = absolute(config.get("runner_path"), "runner_path")
+    artifact_dir = absolute(config.get("artifact_dir"), "artifact_dir")
+    manifest_path = absolute(
+        config.get("runtime_manifest_path"), "runtime_manifest_path"
+    )
+    profile_path = absolute(
+        config.get("proof_profile_path"), "proof_profile_path"
+    )
+    checkpoint_path = absolute(
+        config.get("checkpoint_path"), "checkpoint_path"
+    )
+    expected_gpu = str(config.get("gpu_uuid") or "")
+    expected_sha = str(config.get("runner_sha256") or "").lower()
+    service_unit = str(config.get("service_unit") or "")
+    service_user = str(config.get("service_user") or "")
+    service_config_path = str(config.get("service_config_path") or "")
+    service_config_sha256 = str(
+        config.get("service_config_sha256") or ""
+    ).lower()
+    progress_path = str(config.get("progress_path") or "")
+    service_kind = str(
+        config.get("service_kind")
+        or ("wallet_free_generator" if service_unit else "")
+    )
+    if not SHA256.fullmatch(expected_sha) or not GPU_UUID.fullmatch(
+        expected_gpu
+    ):
+        raise ValueError("config_identity")
+    if not profile_path.startswith(artifact_dir.rstrip("/") + "/") or (
+        not service_unit
+        and not runner.startswith(artifact_dir.rstrip("/") + "/")
+    ):
+        raise ValueError("artifact_scope")
+    runner_raw = read_regular(runner, 64 * 1024 * 1024)
+    if hashlib.sha256(runner_raw).hexdigest() != expected_sha:
+        raise ValueError("runner_sha256")
+    if service_unit:
+        service_config_path = absolute(
+            service_config_path, "service_config_path"
+        )
+        if (
+            not SHA256.fullmatch(service_config_sha256)
+            or hashlib.sha256(read_regular(service_config_path)).hexdigest()
+            != service_config_sha256
+        ):
+            raise ValueError("service_config_sha256")
+    manifest = read_json(manifest_path)
+    profile = read_json(profile_path)
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("manifest_identity")
+    miner_source = str(manifest.get("miner_source_revision") or "").lower()
+    validator_source = str(
+        identity.get("validator_source_revision") or ""
+    ).lower()
+    checkpoint_revision = str(
+        identity.get("checkpoint_revision") or ""
+    ).lower()
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", miner_source)
+        or not re.fullmatch(r"[0-9a-f]{40}", validator_source)
+        or not re.fullmatch(r"[0-9a-f]{40}", checkpoint_revision)
+        or (
+            "GPU-" + str(profile.get("gpu_uuid") or "").removeprefix("GPU-")
+        ) != expected_gpu
+        or str(profile.get("source_revision") or "").lower()
+        != validator_source
+        or str(profile.get("checkpoint_revision") or "").lower()
+        != checkpoint_revision
+    ):
+        raise ValueError("runtime_profile_identity")
+
+    process_rows = {}
+    for proc_path in glob.glob("/proc/[0-9]*"):
+        pid = int(proc_path.rsplit("/", 1)[1])
+        argv = cmdline(pid)
+        if argv:
+            process_rows[pid] = {"argv": argv, "ppid": ppid(pid)}
+
+    def descendants_of(root_pid):
+        result = set()
+        changed = True
+        while changed:
+            changed = False
+            for pid, row in process_rows.items():
+                if pid in result or pid == root_pid:
+                    continue
+                if row["ppid"] == root_pid or row["ppid"] in result:
+                    result.add(pid)
+                    changed = True
+        return result
+
+    certification_worker_pid = 0
+    if service_unit:
+        properties = systemd_properties(service_unit)
+        runner_pid = int(properties.get("MainPID") or 0)
+        argv = process_rows.get(runner_pid, {}).get("argv", [])
+        if (
+            properties.get("LoadState") != "loaded"
+            or properties.get("ActiveState") != "active"
+            or properties.get("SubState") != "running"
+            or properties.get("User") != service_user
+            or properties.get("NoNewPrivileges") != "yes"
+        ):
+            raise ValueError("wallet_free_service_identity")
+        if service_kind == "wallet_free_generator":
+            generation_only = (
+                "worker" in argv
+                or (
+                    "-m" in argv
+                    and "reliquary_miner_pro_code.generator.server" in argv
+                )
+            )
+            if (
+                (
+                    runner not in argv
+                    and (not argv or os.path.realpath(argv[0]) != runner)
+                )
+                or option(argv, "--config") != service_config_path
+                or not generation_only
+                or "submit" in argv
+                or "mine" in argv
+            ):
+                raise ValueError("wallet_free_service_identity")
+        elif service_kind == "submit_disabled_certification":
+            candidates = []
+            for pid in sorted(descendants_of(runner_pid)):
+                child_argv = process_rows[pid]["argv"]
+                if not child_argv or os.path.realpath(child_argv[0]) != runner:
+                    continue
+                if (
+                    "reliquary_miner_pro_math.evidence_producer"
+                    not in child_argv
+                    or "capture-public-oracle-proof" not in child_argv
+                    or child_argv.count("--submit-disabled") != 1
+                    or option(child_argv, "--manifest") != manifest_path
+                    or option(child_argv, "--proof-profile") != profile_path
+                    or option(child_argv, "--checkpoint") != checkpoint_path
+                    or "submit" in child_argv
+                    or "mine" in child_argv
+                ):
+                    continue
+                output_path = str(option(child_argv, "--output") or "")
+                audit_path = str(option(child_argv, "--audit") or "")
+                prefix = artifact_dir.rstrip("/") + "/"
+                if not output_path.startswith(prefix) or not audit_path.startswith(
+                    prefix
+                ):
+                    continue
+                candidates.append(pid)
+            if len(candidates) != 1:
+                raise ValueError("submit_disabled_service_identity")
+            certification_worker_pid = candidates[0]
+        else:
+            raise ValueError("service_kind")
+        runners = [runner_pid]
+    else:
+        runners = [
+            pid for pid, row in process_rows.items()
+            if row["argv"] in (
+                ["/bin/bash", runner],
+                ["/usr/bin/bash", runner],
+            )
+        ]
+    if not runners:
+        out.update({
+            "error": "not_running",
+            "runner_path": runner,
+            "artifact_dir": artifact_dir,
+        })
+    else:
+        if len(runners) != 1:
+            raise ValueError("runner_count")
+        runner_pid = runners[0]
+        descendants = descendants_of(runner_pid)
+
+        phases = []
+        worker_pid = 0
+        for pid in sorted(descendants) if not service_unit else []:
+            argv = process_rows[pid]["argv"]
+            if "capture-proof" in argv:
+                if argv.count("--submit-disabled") != 1:
+                    raise ValueError("capture_not_submit_disabled")
+                label = option(argv, "--label")
+                if label not in {"reference", "candidate"}:
+                    raise ValueError("capture_label")
+                if (
+                    option(argv, "--manifest") != manifest_path
+                    or option(argv, "--proof-profile") != profile_path
+                    or option(argv, "--checkpoint") != checkpoint_path
+                    or option(argv, "--corpus")
+                    != artifact_dir + "/corpus-128.json"
+                    or option(argv, "--output")
+                    != artifact_dir + "/" + label + "-proof.json"
+                    or option(argv, "--audit")
+                    != artifact_dir + "/" + label + "-proof.audit.json"
+                ):
+                    raise ValueError("capture_paths")
+                phases.append((label + "_proof", pid))
+            elif "assemble-parity" in argv:
+                phases.append(("parity_assembly", pid))
+            elif "assemble-validator-replay" in argv:
+                phases.append(("validator_replay_assembly", pid))
+            elif "build" in argv and any(
+                "reliquary-miner-pro-math-certify" in value
+                for value in argv
+            ):
+                phases.append(("certificate_build", pid))
+            elif "certify" in argv and any(
+                value.endswith("/reliquary-miner-pro-math")
+                for value in argv
+            ):
+                phases.append(("canary_gate", pid))
+            elif "attach-certificate" in argv:
+                phases.append(("attach_certificate", pid))
+        if service_unit and service_kind == "submit_disabled_certification":
+            phase = "public_oracle_proof"
+            worker_pid = certification_worker_pid
+        elif service_unit:
+            phase = "generation_ready"
+            if progress_path and os.path.isfile(progress_path):
+                progress = read_json(absolute(progress_path, "progress_path"))
+                if any(
+                    progress.get(key) not in (None, identity.get(identity_key))
+                    for key, identity_key in (
+                        ("checkpoint_revision", "checkpoint_revision"),
+                        ("generation_profile_id", "generation_profile_id"),
+                        (
+                            "generation_contract_sha256",
+                            "generation_contract_sha256",
+                        ),
+                    )
+                ):
+                    raise ValueError("progress_identity")
+                if progress.get("pid") not in (None, runner_pid):
+                    raise ValueError("progress_pid")
+                phase = {
+                    "loading": "generation_loading",
+                    "ready": "generation_ready",
+                    "active": "generation_capture",
+                    "recovering": "generation_recovering",
+                    "failed": "generation_failed",
+                }.get(str(progress.get("state") or ""), phase)
+            compute_pids = gpu_pids(expected_gpu)
+            bound = sorted((descendants | {runner_pid}) & set(compute_pids))
+            worker_pid = bound[0] if bound else runner_pid
+        elif phases:
+            unique = {phase for phase, _pid in phases}
+            if unique == {"parity_assembly", "validator_replay_assembly"}:
+                phase = "parity_and_replay"
+            else:
+                phase = phases[0][0]
+            worker_pid = phases[0][1]
+        else:
+            phase = "transition"
+
+        gpu = gpu_telemetry(expected_gpu)
+        compute_pids = gpu_pids(expected_gpu)
+        runner_started_at = started_at(runner_pid)
+        out.update({
+            "active": True,
+            "exact": True,
+            "submit_disabled_attested": True,
+            "wallet_free_attested": bool(
+                service_unit and service_kind == "wallet_free_generator"
+            ),
+            "runner_pid": runner_pid,
+            "worker_pid": worker_pid,
+            "phase": phase,
+            "runner_path": runner,
+            "runner_sha256": expected_sha,
+            "artifact_dir": artifact_dir,
+            "runtime_manifest_path": manifest_path,
+            "proof_profile_path": profile_path,
+            "checkpoint_path": checkpoint_path,
+            "service_unit": service_unit,
+            "service_user": service_user,
+            "service_config_path": service_config_path,
+            "service_config_sha256": service_config_sha256,
+            "progress_path": progress_path,
+            "service_kind": service_kind,
+            "started_at": runner_started_at,
+            "elapsed_s": max(0.0, time.time() - runner_started_at),
+            "gpu": gpu,
+            "gpu_process_bound": bool(
+                worker_pid and worker_pid in compute_pids
+            ),
+            "gpu_worker_memory_mb": compute_pids.get(worker_pid, 0),
+            "identity": {
+                "miner_source_revision": miner_source,
+                "validator_source_revision": validator_source,
+                "checkpoint_n": identity.get("checkpoint_n"),
+                "checkpoint_revision": checkpoint_revision,
+                "model_repo": identity.get("model_repo")
+                or identity.get("checkpoint_repo_id"),
+                "environment": identity.get("environment"),
+            },
+            "artifacts": artifact_state(artifact_dir),
+        })
+except Exception as exc:
+    out["error"] = type(exc).__name__ + ":" + str(exc)[:120]
+print(json.dumps(out, separators=(",", ":"), sort_keys=True))
+"""
+
+
+_STANDALONE_TELEMETRY_PROBE_SOURCE = r"""
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import stat
+import sys
+import urllib.parse
+
+MAX_BYTES = 1024 * 1024
+GPU_UUID = re.compile(
+    r"(?:GPU-)?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+def read_bytes(path, max_bytes=MAX_BYTES, allow_zero_size=False):
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("not_regular")
+    if (
+        (before.st_size <= 0 and not allow_zero_size)
+        or before.st_size > max_bytes
+    ):
+        raise ValueError("size")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise ValueError("changed_before_read")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            value = handle.read(max_bytes + 1)
+        if not value or len(value) > max_bytes:
+            raise ValueError("size")
+        after = os.lstat(path)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise ValueError("changed_during_read")
+        return value, before.st_mtime
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+def read_object(path):
+    raw, mtime = read_bytes(path)
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("not_object")
+    return value, mtime, hashlib.sha256(raw).hexdigest()
+
+def toml_string_values(path):
+    raw, _mtime = read_bytes(path)
+    section = ""
+    values = {}
+    for raw_line in raw.decode("utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if "=" not in line:
+            continue
+        key, encoded = (part.strip() for part in line.split("=", 1))
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        if not encoded.startswith('"'):
+            continue
+        try:
+            value = json.loads(encoded)
+        except json.JSONDecodeError as exc:
+            raise ValueError("config_string") from exc
+        if not isinstance(value, str):
+            raise ValueError("config_string")
+        compound = (section + "." + key).lstrip(".")
+        if compound in values:
+            raise ValueError("config_duplicate")
+        values[compound] = value
+    return values
+
+def absolute_path(value, name):
+    if not isinstance(value, str) or not value.startswith("/"):
+        raise ValueError(name)
+    return value
+
+def canonical_gpu_id(value):
+    match = GPU_UUID.fullmatch(str(value or "").strip())
+    if not match:
+        raise ValueError("physical_gpu_id")
+    return "GPU-" + match.group(1).lower()
+
+def controller_paths(config_path, active_pid):
+    config_path = absolute_path(config_path, "controller_config_path")
+    try:
+        pid = int(active_pid)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("active_pid") from exc
+    if pid <= 0:
+        raise ValueError("active_pid")
+    raw_cmdline, _mtime = read_bytes(
+        "/proc/" + str(pid) + "/cmdline",
+        max_bytes=64 * 1024,
+        allow_zero_size=True,
+    )
+    argv = [
+        item.decode("utf-8")
+        for item in raw_cmdline.split(b"\0")
+        if item
+    ]
+    positions = [
+        index for index, value in enumerate(argv) if value == "--config"
+    ]
+    if (
+        len(positions) != 1
+        or positions[0] + 1 >= len(argv)
+        or argv[positions[0] + 1] != config_path
+    ):
+        raise ValueError("process_config_mismatch")
+    modes = [value for value in argv if value in {"canary", "mine"}]
+    if len(modes) != 1:
+        raise ValueError("controller_mode")
+    values = toml_string_values(config_path)
+    if values.get("mode") != modes[0]:
+        raise ValueError("config_mode_mismatch")
+    return {
+        "mode": modes[0],
+        "config_path": config_path,
+        "runtime_manifest": absolute_path(
+            values.get("paths.runtime_manifest"),
+            "runtime_manifest",
+        ),
+        "dashboard_json": absolute_path(
+            values.get("paths.dashboard_json"),
+            "dashboard_json",
+        ),
+        "ledger_db": absolute_path(
+            values.get("paths.ledger_db"),
+            "ledger_db",
+        ),
+    }
+
+def ledger_summary(path, since, until):
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("ledger_not_regular")
+    if info.st_size <= 0 or info.st_size > 2 * 1024 * 1024 * 1024:
+        raise ValueError("ledger_size")
+    uri = "file:" + urllib.parse.quote(path, safe="/") + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(attempts)")
+        }
+        code_attempt_columns = {
+            "physical_gpu_id", "window_n", "natural_complete", "created_at"
+        }
+        interval_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(gpu_intervals)")
+        }
+        code_interval_columns = {
+            "physical_gpu_id", "started_at", "ended_at"
+        }
+        generated_columns = (
+            {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(generated_groups)"
+                )
+            }
+            if "generated_groups" in tables
+            else set()
+        )
+        math_attempt_columns = {"window_n", "prompt_idx", "created_at"}
+        math_generated_columns = {
+            "window_n",
+            "prompt_idx",
+            "physical_gpu_id",
+            "natural_complete_m8",
+        }
+        math_interval_columns = {
+            "gpu_uuid", "started_at", "completed_at"
+        }
+        code_schema = (
+            code_attempt_columns.issubset(columns)
+            and code_interval_columns.issubset(interval_columns)
+        )
+        math_schema = (
+            math_attempt_columns.issubset(columns)
+            and math_generated_columns.issubset(generated_columns)
+            and math_interval_columns.issubset(interval_columns)
+        )
+        if not code_schema and not math_schema:
+            raise ValueError("ledger_schema")
+        attempts = {}
+        if code_schema:
+            rows = connection.execute(
+                "SELECT physical_gpu_id, window_n, natural_complete "
+                "FROM attempts WHERE created_at >= ? AND created_at <= ?",
+                (since, until),
+            )
+        else:
+            # Math records raw GPU generation before CPU grading and creates an
+            # attempt only for a candidate that survives construction. Join on
+            # the immutable window/prompt identity so an H100/RTX-style
+            # attribution is never guessed or collapsed onto the controller.
+            rows = connection.execute(
+                "SELECT g.physical_gpu_id,a.window_n,g.natural_complete_m8 "
+                "FROM attempts a JOIN generated_groups g "
+                "ON g.window_n=a.window_n AND g.prompt_idx=a.prompt_idx "
+                "WHERE a.created_at >= ? AND a.created_at <= ?",
+                (since, until),
+            )
+        for raw_gpu, raw_window, raw_natural in rows:
+            gpu = canonical_gpu_id(raw_gpu)
+            row = attempts.setdefault(gpu, {
+                "aliases": set(),
+                "attempts": 0,
+                "natural_complete_m8": 0,
+                "windows": set(),
+                "natural_windows": set(),
+            })
+            row["aliases"].add(str(raw_gpu))
+            row["attempts"] += 1
+            row["windows"].add(int(raw_window))
+            if int(raw_natural) == 1:
+                row["natural_complete_m8"] += 1
+                row["natural_windows"].add(int(raw_window))
+        intervals = {}
+        if code_schema:
+            rows = connection.execute(
+                "SELECT physical_gpu_id, started_at, ended_at "
+                "FROM gpu_intervals WHERE ended_at > ? AND started_at < ?",
+                (since, until),
+            )
+        else:
+            rows = connection.execute(
+                "SELECT gpu_uuid, started_at, completed_at "
+                "FROM gpu_intervals "
+                "WHERE completed_at > ? AND started_at < ?",
+                (since, until),
+            )
+        for raw_gpu, raw_start, raw_end in rows:
+            gpu = canonical_gpu_id(raw_gpu)
+            start = max(float(raw_start), since)
+            end = min(float(raw_end), until)
+            if not end > start:
+                continue
+            intervals.setdefault(gpu, []).append((start, end))
+            attempts.setdefault(gpu, {
+                "aliases": set(),
+                "attempts": 0,
+                "natural_complete_m8": 0,
+                "windows": set(),
+                "natural_windows": set(),
+            })["aliases"].add(str(raw_gpu))
+        result = {}
+        for gpu in sorted(attempts):
+            source = attempts[gpu]
+            merged = []
+            for start, end in sorted(intervals.get(gpu, [])):
+                if merged and start <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], end)
+                else:
+                    merged.append([start, end])
+            windows = source["windows"]
+            natural_windows = source["natural_windows"]
+            result[gpu] = {
+                "aliases": sorted(source["aliases"]),
+                "attempts": source["attempts"],
+                "natural_complete_m8": source["natural_complete_m8"],
+                "generated_windows": len(windows),
+                "natural_complete_windows": len(natural_windows),
+                "first_window": min(windows) if windows else 0,
+                "last_window": max(windows) if windows else 0,
+                "last_natural_window": (
+                    max(natural_windows) if natural_windows else 0
+                ),
+                "physical_gpu_hours": sum(
+                    end - start for start, end in merged
+                ) / 3600.0,
+            }
+        return {
+            "schema_version": 1,
+            "per_gpu": result,
+            "physical_gpu_hours": sum(
+                row["physical_gpu_hours"] for row in result.values()
+            ),
+        }
+    finally:
+        connection.close()
+
+out = {"schema_version": 1}
+try:
+    telemetry_path = absolute_path(sys.argv[1], "telemetry_path")
+    fallback_manifest = absolute_path(sys.argv[2], "fallback_manifest")
+    config_path = sys.argv[3] if len(sys.argv) > 3 else ""
+    active_unit = sys.argv[4] if len(sys.argv) > 4 else ""
+    active_pid = sys.argv[5] if len(sys.argv) > 5 else "0"
+    supervisor_path = sys.argv[6] if len(sys.argv) > 6 else ""
+    active = None
+    manifest_path = fallback_manifest
+    ledger = None
+    if config_path:
+        active = controller_paths(config_path, active_pid)
+        if active["dashboard_json"] != telemetry_path:
+            raise ValueError("active_dashboard_path_mismatch")
+        manifest_path = active["runtime_manifest"]
+    telemetry, telemetry_mtime, telemetry_sha256 = read_object(telemetry_path)
+    manifest, manifest_mtime, manifest_sha256 = read_object(manifest_path)
+    supervisor = None
+    supervisor_mtime = None
+    supervisor_error = ""
+    if supervisor_path:
+        supervisor_path = absolute_path(supervisor_path, "supervisor_path")
+        if os.path.exists(supervisor_path):
+            supervisor, supervisor_mtime, _supervisor_sha256 = read_object(
+                supervisor_path
+            )
+        else:
+            supervisor_error = "missing"
+    if active is not None:
+        raw_since = telemetry.get("since")
+        raw_until = telemetry.get("until")
+        if raw_since is None and raw_until is None:
+            # Math publishes a lifetime ledger plus release/latest-six scopes,
+            # not Code's timestamp-bounded top-level interval.
+            since = 0.0
+            until = float(telemetry.get("generated_at"))
+            if not until > 0:
+                raise ValueError("telemetry_interval")
+        else:
+            since = float(raw_since)
+            until = float(raw_until)
+            if (
+                not since > 0
+                or not until > since
+                or until - since > 172800.0
+            ):
+                raise ValueError("telemetry_interval")
+        ledger = ledger_summary(active["ledger_db"], since, until)
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("manifest_identity")
+    raw_components = manifest.get("components", [])
+    if raw_components is None:
+        raw_components = []
+    if not isinstance(raw_components, list):
+        raise ValueError("manifest_components")
+    components = []
+    for raw_component in raw_components:
+        if not isinstance(raw_component, dict):
+            raise ValueError("manifest_component")
+        components.append({
+            key: raw_component.get(key)
+            for key in (
+                "role",
+                "component_id",
+                "manifest_path",
+                "manifest_file_sha256",
+                "runtime_payload_sha256",
+                "runtime_profile_sha256",
+                "health_gpu_uuid_required",
+            )
+        })
+    out.update({
+        "telemetry": telemetry,
+        "telemetry_mtime": telemetry_mtime,
+        "telemetry_sha256": telemetry_sha256,
+        "manifest_mtime": manifest_mtime,
+        "manifest_sha256": manifest_sha256,
+        "manifest": {
+            "schema_version": manifest.get("schema_version"),
+            "miner_source_revision": manifest.get("miner_source_revision"),
+            "validator_source_revision": identity.get(
+                "validator_source_revision"
+            ),
+            "observed_validator_image_revision": identity.get(
+                "observed_validator_image_revision"
+            ),
+            "checkpoint_n": identity.get("checkpoint_n"),
+            "checkpoint_revision": identity.get("checkpoint_revision"),
+            "protocol_version": identity.get("protocol_version"),
+            "generation_profile_id": identity.get("generation_profile_id"),
+            "generation_contract_sha256": identity.get(
+                "generation_contract_sha256"
+            ),
+            "checkpoint_profile_sha256": identity.get(
+                "checkpoint_profile_sha256"
+            ),
+            "runtime_fingerprint_sha256": identity.get(
+                "runtime_fingerprint_sha256"
+            ),
+            "model_repo": identity.get("model_repo"),
+            "environment": identity.get("environment"),
+            "components": components,
+        },
+        "controller": {
+            "active_unit": active_unit,
+            "mode": active["mode"] if active is not None else "",
+            "config_path": (
+                active["config_path"] if active is not None else ""
+            ),
+            "runtime_manifest_path": manifest_path,
+            "ledger_path": active["ledger_db"] if active is not None else "",
+        },
+        "ledger": ledger,
+        "supervisor": supervisor,
+        "supervisor_mtime": supervisor_mtime,
+        "supervisor_error": supervisor_error,
+    })
+except Exception as exc:
+    out["error"] = type(exc).__name__ + ":" + str(exc)[:120]
+print(json.dumps(out, separators=(",", ":"), sort_keys=True))
+"""
+
+
+def _standalone_counter(
+    mapping: dict[str, Any],
+    *names: str,
+    required: bool = False,
+) -> int | None:
+    for name in names:
+        if name not in mapping:
+            continue
+        value = mapping[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid_counter:{name}")
+        return value
+    if required:
+        raise ValueError(f"missing_counter:{names[0]}")
+    return None
+
+
+def _standalone_nonnegative_float(
+    mapping: dict[str, Any],
+    *names: str,
+    required: bool = False,
+) -> float | None:
+    for name in names:
+        if name not in mapping:
+            continue
+        value = mapping[name]
+        if value is None and not required:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"invalid_float:{name}")
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed < 0:
+            raise ValueError(f"invalid_float:{name}")
+        return parsed
+    if required:
+        raise ValueError(f"missing_float:{names[0]}")
+    return None
+
+
+_PHYSICAL_GPU_UUID_RE = re.compile(
+    r"(?:GPU-)?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+def _canonical_physical_gpu_id(value: object) -> str:
+    """Collapse NVIDIA UUID aliases without conflating non-UUID identities."""
+    match = _PHYSICAL_GPU_UUID_RE.fullmatch(str(value or "").strip())
+    if not match:
+        raise ValueError("physical_gpu_id")
+    return "GPU-" + match.group(1).lower()
+
+
+def _standalone_ledger_gpu_summary(
+    raw: object,
+) -> tuple[dict[str, dict[str, object]], float | None]:
+    """Validate process-bound, alias-normalized generation-only ledger data."""
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError("ledger_schema")
+    per_gpu_raw = raw.get("per_gpu")
+    if not isinstance(per_gpu_raw, dict):
+        raise ValueError("ledger_per_gpu")
+    per_gpu: dict[str, dict[str, object]] = {}
+    for raw_gpu, raw_row in per_gpu_raw.items():
+        gpu = _canonical_physical_gpu_id(raw_gpu)
+        if gpu != raw_gpu or gpu in per_gpu or not isinstance(raw_row, dict):
+            raise ValueError("ledger_gpu_identity")
+        attempts = _standalone_counter(raw_row, "attempts", required=True)
+        natural = _standalone_counter(
+            raw_row, "natural_complete_m8", required=True
+        )
+        windows = _standalone_counter(
+            raw_row, "generated_windows", required=True
+        )
+        natural_windows = _standalone_counter(
+            raw_row, "natural_complete_windows", required=True
+        )
+        first_window = _standalone_counter(
+            raw_row, "first_window", required=True
+        )
+        last_window = _standalone_counter(
+            raw_row, "last_window", required=True
+        )
+        last_natural_window = _standalone_counter(
+            raw_row, "last_natural_window"
+        )
+        # Older dashboard probes did not publish the natural-only frontier.
+        # The aggregate last window is an exact fallback only when every
+        # recorded attempt completed naturally; otherwise retain unknown.
+        if last_natural_window is None and natural == attempts:
+            last_natural_window = last_window
+        gpu_hours = _standalone_nonnegative_float(
+            raw_row, "physical_gpu_hours", required=True
+        )
+        aliases = raw_row.get("aliases")
+        if (
+            natural > attempts
+            or windows > attempts
+            or natural_windows > windows
+            or natural_windows > natural
+            or not isinstance(aliases, list)
+            or not aliases
+            or not all(isinstance(alias, str) for alias in aliases)
+            or any(
+                _canonical_physical_gpu_id(alias) != gpu
+                for alias in aliases
+            )
+        ):
+            raise ValueError("ledger_gpu_counters")
+        if attempts:
+            if first_window <= 0 or last_window < first_window:
+                raise ValueError("ledger_gpu_windows")
+        elif first_window or last_window or windows or natural_windows:
+            raise ValueError("ledger_gpu_windows")
+        if natural_windows:
+            if (
+                last_natural_window is not None
+                and not (
+                    first_window
+                    <= last_natural_window
+                    <= last_window
+                )
+            ):
+                raise ValueError("ledger_gpu_natural_window")
+        elif last_natural_window not in {None, 0}:
+            raise ValueError("ledger_gpu_natural_window")
+        per_gpu[gpu] = {
+            "aliases": list(aliases),
+            "attempts": attempts,
+            "natural_complete_m8": natural,
+            "generated_windows": windows,
+            "natural_complete_windows": natural_windows,
+            "first_window": first_window,
+            "last_window": last_window,
+            "last_natural_window": last_natural_window,
+            "physical_gpu_hours": gpu_hours,
+        }
+    physical_gpu_hours = _standalone_nonnegative_float(
+        raw, "physical_gpu_hours", required=True
+    )
+    observed = sum(
+        float(row["physical_gpu_hours"]) for row in per_gpu.values()
+    )
+    if not math.isclose(
+        physical_gpu_hours,
+        observed,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise ValueError("ledger_gpu_hours")
+    return per_gpu, physical_gpu_hours
+
+
+def _standalone_comparison_scopes(raw: object) -> dict[str, dict[str, Any]]:
+    """Validate optional release/latest-window GPU comparison telemetry."""
+
+    def nullable_float(
+        mapping: dict[str, Any],
+        name: str,
+    ) -> float | None:
+        if mapping.get(name) is None:
+            return None
+        return _standalone_nonnegative_float(
+            mapping, name, required=True
+        )
+
+    def timing_map(
+        raw_timings: object,
+    ) -> dict[str, dict[str, int | float | None]]:
+        if not isinstance(raw_timings, dict):
+            raise ValueError("comparison_timings")
+        timings: dict[str, dict[str, int | float | None]] = {}
+        for stage, raw_timing in raw_timings.items():
+            if (
+                not isinstance(stage, str)
+                or not stage
+                or not isinstance(raw_timing, dict)
+            ):
+                raise ValueError("comparison_timing")
+            timings[stage] = {
+                "count": _standalone_counter(
+                    raw_timing, "count", required=True
+                ),
+                "p50": nullable_float(raw_timing, "p50"),
+                "p95": nullable_float(raw_timing, "p95"),
+                "max": nullable_float(raw_timing, "max"),
+            }
+        return timings
+
+    def quota_map(
+        raw_quota: object,
+        *,
+        error_name: str,
+    ) -> dict[str, int | float | None]:
+        if not isinstance(raw_quota, dict):
+            raise ValueError(error_name)
+        quota: dict[str, int | float | None] = {
+            "capacity_per_hotkey": _standalone_counter(
+                raw_quota, "capacity_per_hotkey", required=True
+            ),
+            "peak_effective": _standalone_counter(
+                raw_quota, "peak_effective", required=True
+            ),
+            "peak_occupancy": nullable_float(
+                raw_quota, "peak_occupancy"
+            ),
+            "dropped_solely_for_quota": _standalone_counter(
+                raw_quota, "dropped_solely_for_quota", required=True
+            ),
+        }
+        capacity = int(quota["capacity_per_hotkey"] or 0)
+        peak = int(quota["peak_effective"] or 0)
+        occupancy = quota["peak_occupancy"]
+        if (
+            peak > capacity
+            or (
+                isinstance(occupancy, float)
+                and occupancy > 1.0
+            )
+        ):
+            raise ValueError(error_name)
+        return quota
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("comparison_scopes")
+    allowed_scopes = {"lifetime", "release", "latest_six", "active_profile"}
+    if not set(raw).issubset(allowed_scopes):
+        raise ValueError("comparison_scope_name")
+    result: dict[str, dict[str, Any]] = {}
+    funnel_names = (
+        "attempts",
+        "generation_complete",
+        "natural_complete_m8",
+        "local_eligible",
+        "precommit_accepted",
+        "pool_accepted",
+        "selected",
+        "rewarded",
+        "raw_k2",
+        "malformed_k2",
+        "distribution_dropped_k2",
+        "exact_preflight_passing_k2",
+    )
+    gpu_counter_names = (
+        "generated_natural_m8",
+        "raw_k2",
+        "malformed_k2",
+        "distribution_dropped_k2",
+        "exact_preflight_passing_k2",
+        "precommit_accepted",
+        "pool_accepted",
+        "selected",
+        "rewarded",
+    )
+    for scope_name, raw_scope in raw.items():
+        if not isinstance(raw_scope, dict):
+            raise ValueError("comparison_scope")
+        window_start = (
+            None
+            if raw_scope.get("window_start") is None
+            else _standalone_counter(
+                raw_scope, "window_start", required=True
+            )
+        )
+        window_end = (
+            None
+            if raw_scope.get("window_end") is None
+            else _standalone_counter(
+                raw_scope, "window_end", required=True
+            )
+        )
+        window_count = _standalone_counter(
+            raw_scope, "window_count", required=True
+        )
+        if (
+            (window_start is None) != (window_end is None)
+            or (
+                window_start is not None
+                and (
+                    window_end < window_start
+                    or window_count != window_end - window_start + 1
+                )
+            )
+        ):
+            raise ValueError("comparison_windows")
+        raw_funnel = raw_scope.get("funnel")
+        if not isinstance(raw_funnel, dict):
+            raise ValueError("comparison_funnel")
+        funnel = {
+            name: _standalone_counter(raw_funnel, name, required=True)
+            for name in funnel_names
+        }
+        attempts = int(funnel["attempts"])
+        if (
+            int(funnel["natural_complete_m8"])
+            > int(funnel["generation_complete"])
+            or int(funnel["local_eligible"]) > attempts
+            or int(funnel["raw_k2"]) > attempts
+            or int(funnel["malformed_k2"]) > int(funnel["raw_k2"])
+            or int(funnel["distribution_dropped_k2"])
+            > int(funnel["raw_k2"])
+            or int(funnel["exact_preflight_passing_k2"])
+            > int(funnel["raw_k2"])
+            or int(funnel["precommit_accepted"])
+            > int(funnel["local_eligible"])
+            or int(funnel["pool_accepted"])
+            > int(funnel["precommit_accepted"])
+            or int(funnel["rewarded"]) > int(funnel["selected"])
+            or int(funnel["selected"]) > int(funnel["pool_accepted"])
+        ):
+            raise ValueError("comparison_funnel_order")
+
+        quota = quota_map(
+            raw_scope.get("quota"),
+            error_name="comparison_quota",
+        )
+
+        raw_per_gpu = raw_scope.get("per_gpu")
+        if not isinstance(raw_per_gpu, dict):
+            raise ValueError("comparison_per_gpu")
+        per_gpu: dict[str, dict[str, Any]] = {}
+        for raw_gpu, raw_row in raw_per_gpu.items():
+            gpu = _canonical_physical_gpu_id(raw_gpu)
+            if (
+                gpu != raw_gpu
+                or gpu in per_gpu
+                or not isinstance(raw_row, dict)
+            ):
+                raise ValueError("comparison_gpu_identity")
+            row = {
+                name: _standalone_counter(
+                    raw_row, name, required=True
+                )
+                for name in gpu_counter_names
+            }
+            row["physical_gpu_hours"] = _standalone_nonnegative_float(
+                raw_row, "physical_gpu_hours", required=True
+            )
+            row["selected_slots_per_physical_gpu_hour"] = nullable_float(
+                raw_row,
+                "selected_slots_per_physical_gpu_hour",
+            )
+            row["rewarded_slots_per_physical_gpu_hour"] = nullable_float(
+                raw_row,
+                "rewarded_slots_per_physical_gpu_hour",
+            )
+            raw_gpu_timings = raw_row.get("timings_ms")
+            row["timings_ms"] = (
+                {}
+                if raw_gpu_timings is None
+                else timing_map(raw_gpu_timings)
+            )
+            if "quota" in raw_row:
+                row["quota"] = quota_map(
+                    raw_row["quota"],
+                    error_name="comparison_gpu_quota",
+                )
+            if (
+                int(row["rewarded"]) > int(row["selected"])
+                or int(row["selected"]) > int(row["pool_accepted"])
+            ):
+                raise ValueError("comparison_gpu_order")
+            per_gpu[gpu] = row
+
+        timings = timing_map(raw_scope.get("timings_ms"))
+
+        total_gpu_hours = _standalone_nonnegative_float(
+            raw_scope, "physical_gpu_hours", required=True
+        )
+        observed_gpu_hours = sum(
+            float(row["physical_gpu_hours"]) for row in per_gpu.values()
+        )
+        if not math.isclose(
+            float(total_gpu_hours),
+            observed_gpu_hours,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("comparison_gpu_hours")
+        result[scope_name] = {
+            "scope_kind": str(raw_scope.get("scope_kind") or ""),
+            "identity_scope": str(raw_scope.get("identity_scope") or ""),
+            "gpu_identity_filter": (
+                dict(raw_scope["gpu_identity_filter"])
+                if isinstance(raw_scope.get("gpu_identity_filter"), dict)
+                else {}
+            ),
+            "release_id": (
+                str(raw_scope["release_id"])
+                if raw_scope.get("release_id") is not None
+                else None
+            ),
+            "window_start": window_start,
+            "window_end": window_end,
+            "window_count": window_count,
+            "funnel": funnel,
+            "timings_ms": timings,
+            "quota": quota,
+            "physical_gpu_hours": total_gpu_hours,
+            "selected_slots_per_physical_gpu_hour": nullable_float(
+                raw_scope,
+                "selected_slots_per_physical_gpu_hour",
+            ),
+            "rewarded_slots_per_physical_gpu_hour": nullable_float(
+                raw_scope,
+                "rewarded_slots_per_physical_gpu_hour",
+            ),
+            "per_gpu": per_gpu,
+        }
+    return result
+
+
+def _standalone_window_lifecycle(raw: object) -> dict[str, Any]:
+    """Normalize optional Math controller liveness without inventing activity."""
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("window_lifecycle")
+    status = str(raw.get("status") or "").upper()
+    if status not in {"READY", "ACTIVE", "RECOVERING", "STALLED"}:
+        raise ValueError("window_lifecycle_status")
+
+    def optional_counter(name: str) -> int | None:
+        value = raw.get(name)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"window_lifecycle_{name}")
+        return value
+
+    def optional_float(name: str) -> float | None:
+        value = raw.get(name)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"window_lifecycle_{name}")
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed < 0:
+            raise ValueError(f"window_lifecycle_{name}")
+        return parsed
+
+    latest_run_raw = raw.get("latest_run")
+    latest_run: dict[str, Any] | None = None
+    if latest_run_raw is not None:
+        if not isinstance(latest_run_raw, dict):
+            raise ValueError("window_lifecycle_latest_run")
+        run_status = str(latest_run_raw.get("status") or "").lower()
+        if run_status not in {"started", "completed", "failed"}:
+            raise ValueError("window_lifecycle_run_status")
+        window_n = latest_run_raw.get("window_n")
+        if (
+            isinstance(window_n, bool)
+            or not isinstance(window_n, int)
+            or window_n < 0
+        ):
+            raise ValueError("window_lifecycle_run_window")
+        latest_run = {
+            "window_n": window_n,
+            "status": run_status,
+            "started_at": latest_run_raw.get("started_at"),
+            "updated_at": latest_run_raw.get("updated_at"),
+            "completed_at": latest_run_raw.get("completed_at"),
+            "failure_stage": str(latest_run_raw.get("failure_stage") or ""),
+            "failure_type": str(latest_run_raw.get("failure_type") or ""),
+            "failure_message": str(
+                latest_run_raw.get("failure_message") or ""
+            )[:1_000],
+        }
+        for name in (
+            "started_at",
+            "updated_at",
+            "completed_at",
+        ):
+            value = latest_run[name]
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError(f"window_lifecycle_run_{name}")
+            latest_run[name] = float(value)
+        for name in (
+            "generated_groups",
+            "locally_eligible",
+            "precommitted",
+            "http_provisional",
+        ):
+            value = latest_run_raw.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"window_lifecycle_run_{name}")
+            latest_run[name] = value
+
+    validator_state = raw.get("validator_state")
+    if validator_state is not None and not isinstance(validator_state, str):
+        raise ValueError("window_lifecycle_validator_state")
+    return {
+        "status": status,
+        "heartbeat_at": optional_float("heartbeat_at"),
+        "heartbeat_age_seconds": optional_float("heartbeat_age_seconds"),
+        "validator_window_n": optional_counter("validator_window_n"),
+        "validator_state": validator_state,
+        "latest_run": latest_run,
+        "latest_generated_window": optional_counter(
+            "latest_generated_window"
+        ),
+        "latest_attempt_window": optional_counter("latest_attempt_window"),
+    }
+
+
+def _standalone_active_generation(
+    lifecycle: dict[str, Any],
+) -> int | None:
+    """Return the current window while an attested atomic generation is active.
+
+    Standalone generators publish completed groups atomically, so the economic
+    funnel legitimately remains at zero while a worker is generating.  The
+    controller lifecycle is the independent liveness signal for that interval.
+    Require one current ``ACTIVE``/``started`` run with no completed group or
+    submission progress; older or terminal runs must not make an idle lane look
+    busy.
+    """
+
+    if str(lifecycle.get("status") or "").upper() != "ACTIVE":
+        return None
+    latest_run = lifecycle.get("latest_run")
+    if not isinstance(latest_run, dict):
+        return None
+    if str(latest_run.get("status") or "").lower() != "started":
+        return None
+    run_window = latest_run.get("window_n")
+    validator_window = lifecycle.get("validator_window_n")
+    if (
+        isinstance(run_window, bool)
+        or not isinstance(run_window, int)
+        or run_window <= 0
+        or run_window != validator_window
+    ):
+        return None
+    if any(
+        int(latest_run.get(name, 0) or 0) > 0
+        for name in (
+            "generated_groups",
+            "locally_eligible",
+            "precommitted",
+            "http_provisional",
+        )
+    ):
+        return None
+    return run_window
+
+
+def _standalone_profile_identity(raw: object) -> dict[str, Any] | None:
+    """Normalize only the non-secret identity fields shared by both supervisors."""
+
+    if not isinstance(raw, dict):
+        return None
+    protocol = raw.get("protocol_version")
+    if protocol is not None and (
+        isinstance(protocol, bool) or not isinstance(protocol, int) or protocol < 2
+    ):
+        raise ValueError("supervisor_protocol_version")
+    profile = raw.get("generation_profile_id")
+    if profile is not None and (not isinstance(profile, str) or not profile):
+        raise ValueError("supervisor_profile_id")
+
+    def digest(name: str, size: int) -> str | None:
+        value = raw.get(name)
+        if value is None:
+            return None
+        value = str(value).lower()
+        if not re.fullmatch(rf"[0-9a-f]{{{size}}}", value):
+            raise ValueError(f"supervisor_{name}")
+        return value
+
+    checkpoint_repo = raw.get("checkpoint_repo_id")
+    if checkpoint_repo is not None and (
+        not isinstance(checkpoint_repo, str) or not checkpoint_repo
+    ):
+        raise ValueError("supervisor_checkpoint_repo_id")
+    validator_image = (
+        raw.get("validator_image_revision")
+        or raw.get("observed_validator_image_revision")
+    )
+    if validator_image is not None:
+        validator_image = str(validator_image).lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", validator_image):
+            raise ValueError("supervisor_validator_image_revision")
+    result = {
+        "protocol_version": protocol,
+        "generation_profile_id": profile,
+        "generation_contract_sha256": digest(
+            "generation_contract_sha256", 64
+        ),
+        "checkpoint_repo_id": checkpoint_repo,
+        "checkpoint_revision": digest("checkpoint_revision", 40),
+        "checkpoint_profile_sha256": digest(
+            "checkpoint_profile_sha256", 64
+        ),
+        "validator_image_revision": validator_image,
+        "window_n": raw.get("window_n")
+        if isinstance(raw.get("window_n"), int)
+        and not isinstance(raw.get("window_n"), bool)
+        else None,
+    }
+    if all(
+        result.get(name) is None
+        for name in (
+            "protocol_version",
+            "generation_profile_id",
+            "generation_contract_sha256",
+            "checkpoint_repo_id",
+            "checkpoint_revision",
+            "checkpoint_profile_sha256",
+            "validator_image_revision",
+        )
+    ):
+        return None
+    return result
+
+
+def _standalone_supervisor_status(
+    raw: object,
+    *,
+    configured: bool,
+    read_error: object,
+    current: float,
+    stale_seconds: float,
+) -> dict[str, Any]:
+    """Normalize Code schema 2 and Math schema 1 without granting authority."""
+
+    if raw is None:
+        return {
+            "configured": configured,
+            "available": False,
+            "fresh": False,
+            "submission_enabled": False,
+            "error": str(read_error or "missing")[:120] if configured else "",
+        }
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
+        raise ValueError("supervisor_schema")
+    updated_raw = raw.get("updated_at", raw.get("updated_unix"))
+    if (
+        isinstance(updated_raw, bool)
+        or not isinstance(updated_raw, (int, float))
+        or not math.isfinite(float(updated_raw))
+        or float(updated_raw) <= 0
+    ):
+        raise ValueError("supervisor_updated_at")
+    updated_at = float(updated_raw)
+    if updated_at > current + 30.0:
+        raise ValueError("supervisor_updated_at_future")
+    age_s = max(0.0, current - updated_at)
+    phase = str(raw.get("phase") or raw.get("state") or "UNKNOWN")
+    submission_enabled = raw.get("submission_enabled") is True
+    advertised_raw = (
+        raw.get("advertised")
+        or raw.get("advertised_target")
+        or raw.get("target")
+    )
+    advertised = _standalone_profile_identity(advertised_raw)
+    active_raw = raw.get("active")
+    if not isinstance(active_raw, dict):
+        active_raw = {
+            "protocol_version": raw.get(
+                "protocol_version", raw.get("active_protocol")
+            ),
+            "generation_profile_id": raw.get(
+                "generation_profile_id", raw.get("active_profile")
+            ),
+            "generation_contract_sha256": raw.get(
+                "generation_contract_sha256"
+            ),
+            "checkpoint_repo_id": raw.get("active_checkpoint_repo_id")
+            or raw.get("checkpoint_repo_id"),
+            "checkpoint_revision": raw.get("active_checkpoint")
+            or raw.get("checkpoint_revision"),
+            "checkpoint_profile_sha256": raw.get(
+                "checkpoint_profile_sha256"
+            ),
+            "observed_validator_image_revision": raw.get(
+                "observed_validator_image_revision"
+            ),
+        }
+    active = _standalone_profile_identity(active_raw)
+    active_bundle = raw.get("active_bundle")
+    if active_bundle is None:
+        active_bundle = (
+            active_raw.get("bundle_id")
+            if isinstance(active_raw, dict)
+            else None
+        )
+    compared_fields = (
+        "protocol_version",
+        "generation_profile_id",
+        "generation_contract_sha256",
+        "checkpoint_repo_id",
+        "checkpoint_revision",
+        "checkpoint_profile_sha256",
+    )
+    mismatches: dict[str, dict[str, Any]] = {}
+    identity_match: bool | None = None
+    if active is not None and advertised is not None:
+        mismatches = {
+            name: {
+                "active": active.get(name),
+                "advertised": advertised.get(name),
+            }
+            for name in compared_fields
+            if active.get(name) != advertised.get(name)
+        }
+        identity_match = not mismatches
+    blockers = [
+        str(value)
+        for value in (
+            raw.get("canary_blocker"),
+            raw.get("promotion_blocker"),
+            raw.get("mine_blocker"),
+            raw.get("blocker"),
+            raw.get("reason") if raw.get("state") == "PROFILE_BLOCKED" else None,
+        )
+        if isinstance(value, str) and value
+    ]
+    return {
+        "configured": configured,
+        "available": True,
+        "state": str(raw.get("state") or phase),
+        "phase": phase,
+        "updated_at": updated_at,
+        "age_s": age_s,
+        "fresh": age_s <= stale_seconds,
+        "submission_enabled": submission_enabled,
+        "active_bundle": str(active_bundle) if active_bundle is not None else None,
+        "active": active,
+        "advertised": advertised,
+        "identity_match": identity_match,
+        "identity_mismatches": mismatches,
+        "unsafe_submission_state": bool(
+            submission_enabled and identity_match is not True
+        ),
+        "blockers": list(dict.fromkeys(blockers)),
+        "error": "",
+    }
+
+
+def _standalone_registry_controller_authority(
+    state: BoxState,
+    wrapper: dict[str, Any],
+    *,
+    controller: dict[str, Any],
+    miner_source_revision: str,
+    validator_source_revision: str,
+    observed_validator_image_revision: str,
+    checkpoint_n: int,
+    checkpoint_repo_id: str,
+    checkpoint_revision: str,
+    protocol_version: int | None,
+    generation_profile_id: str,
+    generation_contract_sha256: str,
+    checkpoint_profile_sha256: str,
+) -> dict[str, object]:
+    """Bind a live controller to the digest-verified active registry entry.
+
+    The optional supervisor file describes transition intent and can lag a
+    completed cutover.  A configured active-unit registry instead names the
+    process that currently owns submission authority and pins its unit,
+    controller configuration, telemetry, and runtime manifest.  Only return
+    authority after all of those independently probed values agree.  Any
+    mismatch is an error so callers fail closed instead of falling back to a
+    previous static deployment tuple.
+    """
+
+    if not state.active_unit_registry_path:
+        return {}
+    registry = state.active_unit_registry
+    if (
+        not isinstance(registry, dict)
+        or registry.get("error")
+        or registry.get("schema_version") != 1
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(registry.get("registry_sha256") or "")
+        )
+    ):
+        raise ValueError("active_unit_registry_invalid")
+    entry = registry.get("active")
+    if not isinstance(entry, dict):
+        raise ValueError("active_unit_registry_entry")
+    required = {
+        "unit",
+        "mode",
+        "controller_config_path",
+        "telemetry_path",
+        "runtime_manifest_path",
+        "checkpoint_revision",
+        "source_revision",
+        "unit_fragment_sha256",
+        "controller_config_sha256",
+        "runtime_manifest_sha256",
+    }
+    if set(entry) != required:
+        raise ValueError("active_unit_registry_entry")
+    mode = str(entry.get("mode") or "").lower()
+    if mode not in {"canary", "mine"}:
+        raise ValueError("active_unit_registry_not_controller")
+    manifest_sha256 = str(wrapper.get("manifest_sha256") or "").lower()
+    expected_manifest_sha256 = str(
+        entry.get("runtime_manifest_sha256") or ""
+    ).lower()
+    checks = (
+        _canonical_systemd_unit(str(entry.get("unit") or ""))
+        == _canonical_systemd_unit(state.active_unit),
+        str(entry.get("controller_config_path") or "")
+        == str(controller.get("config_path") or ""),
+        str(controller.get("mode") or "") == mode,
+        str(entry.get("telemetry_path") or "")
+        == state.standalone_telemetry_path,
+        str(entry.get("runtime_manifest_path") or "")
+        == str(controller.get("runtime_manifest_path") or ""),
+        str(entry.get("runtime_manifest_path") or "")
+        == state.standalone_runtime_manifest_path,
+        str(entry.get("checkpoint_revision") or "").lower()
+        == checkpoint_revision,
+        str(entry.get("source_revision") or "").lower()
+        == miner_source_revision,
+        bool(re.fullmatch(r"[0-9a-f]{40}", validator_source_revision)),
+        bool(
+            re.fullmatch(
+                r"[0-9a-f]{40}", observed_validator_image_revision
+            )
+        ),
+        isinstance(protocol_version, int),
+        bool(generation_profile_id),
+        bool(re.fullmatch(r"[0-9a-f]{64}", generation_contract_sha256)),
+        bool(re.fullmatch(r"[0-9a-f]{64}", checkpoint_profile_sha256)),
+        bool(manifest_sha256),
+        manifest_sha256 == expected_manifest_sha256,
+    )
+    if not all(checks):
+        raise ValueError("active_unit_registry_binding")
+    return {
+        "source": "active_unit_registry",
+        "mode": mode,
+        "unit": str(entry["unit"]),
+        "protocol_version": protocol_version,
+        "generation_profile_id": generation_profile_id,
+        "generation_contract_sha256": generation_contract_sha256,
+        "checkpoint_n": checkpoint_n,
+        "checkpoint_repo_id": checkpoint_repo_id,
+        "checkpoint_revision": checkpoint_revision,
+        "source_revision": miner_source_revision,
+        "validator_source_revision": validator_source_revision,
+        "observed_validator_image_revision": (
+            observed_validator_image_revision
+        ),
+        "checkpoint_profile_sha256": checkpoint_profile_sha256,
+        "registry_sha256": str(registry["registry_sha256"]),
+        "runtime_manifest_sha256": manifest_sha256,
+    }
+
+
+def _standalone_sanitize_observability(
+    raw: object,
+    controller_authority: dict[str, object],
+) -> dict[str, object]:
+    """Fence transition telemetry superseded by live controller authority.
+
+    A producer can atomically publish a new, digest-bound controller registry
+    before its optional transition-observability snapshot is refreshed.  Do
+    not expose the older advertised tuple or supervisor assertions as current
+    fleet truth when they contradict that stronger authority.
+    """
+
+    observability: dict[str, object] = dict(raw) if isinstance(raw, dict) else {}
+    if not controller_authority:
+        return observability
+
+    supervisor = observability.get("supervisor")
+    advertised_candidates: list[dict[str, object]] = []
+    advertised = observability.get("validator_advertised")
+    if isinstance(advertised, dict):
+        advertised_candidates.append(advertised)
+    if isinstance(supervisor, dict):
+        for key in ("validator_advertised", "advertised"):
+            nested = supervisor.get(key)
+            if isinstance(nested, dict):
+                advertised_candidates.append(nested)
+
+    authority_fields = {
+        "protocol_version": "protocol_version",
+        "generation_profile_id": "generation_profile_id",
+        "generation_contract_sha256": "generation_contract_sha256",
+        "checkpoint_repo_id": "checkpoint_repo_id",
+        "checkpoint_revision": "checkpoint_revision",
+        "validator_image_revision": "observed_validator_image_revision",
+    }
+    mismatch_fields: set[str] = set()
+    for candidate in advertised_candidates:
+        for advertised_field, authority_field in authority_fields.items():
+            candidate_value = candidate.get(advertised_field)
+            if candidate_value in (None, ""):
+                continue
+            authority_value = controller_authority.get(authority_field)
+            if advertised_field == "protocol_version":
+                mismatch = candidate_value != authority_value
+            else:
+                mismatch = str(candidate_value).lower() != str(
+                    authority_value or ""
+                ).lower()
+            if mismatch:
+                mismatch_fields.add(advertised_field)
+
+    if not mismatch_fields:
+        return observability
+
+    # These values are all produced from the same optional transition
+    # snapshot.  Remove them together so no stale checkpoint, window, or
+    # submission assertion survives beside the newer signed registry tuple.
+    for key in (
+        "validator_advertised",
+        "active_bundle",
+        "identity_match",
+        "identity_mismatches",
+        "unsafe_submission_state",
+    ):
+        observability.pop(key, None)
+    observability["supervisor"] = {
+        "status": "FENCED_STALE",
+        "reason": "superseded_by_active_unit_registry",
+        "authority_source": "active_unit_registry",
+        "mismatch_fields": sorted(mismatch_fields),
+    }
+    return observability
+
+
+def _apply_standalone_telemetry_probe(
+    state: BoxState,
+    lines: list[str],
+    *,
+    now: float | None = None,
+) -> None:
+    """Apply one complete standalone telemetry+identity read fail-closed."""
+    state.standalone_telemetry = {}
+    state.standalone_generated_at = 0.0
+    state.standalone_age_s = -1.0
+    state.standalone_fresh = False
+    state.standalone_error = ""
+    state.runtime_components = []
+    state.standalone_controller_mode = ""
+    state.standalone_controller_config_path = ""
+    state.standalone_active_runtime_manifest_path = ""
+    state.standalone_active_ledger_path = ""
+    if not state.standalone_telemetry_path:
+        return
+    try:
+        if len(lines) != 1:
+            raise ValueError("probe_output")
+        wrapper = json.loads(lines[0])
+        if not isinstance(wrapper, dict) or wrapper.get("schema_version") != 1:
+            raise ValueError("probe_schema")
+        if wrapper.get("error"):
+            raise ValueError(str(wrapper["error"]))
+        telemetry = wrapper.get("telemetry")
+        manifest = wrapper.get("manifest")
+        if not isinstance(telemetry, dict) or not isinstance(manifest, dict):
+            raise ValueError("payload_shape")
+        generated_at_raw = telemetry.get("generated_at")
+        if (
+            isinstance(generated_at_raw, bool)
+            or not isinstance(generated_at_raw, (int, float))
+        ):
+            raise ValueError("generated_at")
+        generated_at = float(generated_at_raw)
+        current = time.time() if now is None else float(now)
+        if not math.isfinite(generated_at) or generated_at <= 0:
+            raise ValueError("generated_at")
+        if generated_at > current + 30.0:
+            raise ValueError("generated_at_future")
+        age_s = max(0.0, current - generated_at)
+        supervisor = _standalone_supervisor_status(
+            wrapper.get("supervisor"),
+            configured=bool(state.standalone_supervisor_status_path),
+            read_error=wrapper.get("supervisor_error"),
+            current=current,
+            stale_seconds=state.standalone_telemetry_stale_seconds,
+        )
+
+        funnel = telemetry.get("funnel")
+        if not isinstance(funnel, dict):
+            raise ValueError("funnel")
+        attempts = _standalone_counter(funnel, "attempts", required=True)
+        generation_complete = _standalone_counter(
+            funnel, "generation_complete", required=True
+        )
+        natural_complete = _standalone_counter(
+            funnel, "natural_complete_m8"
+        )
+        local_eligible = _standalone_counter(
+            funnel, "local_eligible", "locally_eligible", required=True
+        )
+        precommit = _standalone_counter(
+            funnel, "precommit_accepted", "receipt_accepted"
+        )
+        reveal = _standalone_counter(funnel, "reveal_accepted")
+        pool = _standalone_counter(
+            funnel, "pool_accepted", required=True
+        )
+        selected = _standalone_counter(
+            funnel, "selected", required=True
+        )
+        rewarded = _standalone_counter(
+            funnel, "rewarded", required=True
+        )
+        terminal = _standalone_counter(funnel, "terminal_final")
+        unresolved = _standalone_counter(
+            funnel, "terminal_unresolved"
+        )
+        network_proof = _standalone_counter(
+            funnel, "network_proof_passed"
+        )
+        for name, value in (
+            ("generation_complete", generation_complete),
+            ("natural_complete_m8", natural_complete),
+            ("local_eligible", local_eligible),
+            ("precommit_accepted", precommit),
+            ("reveal_accepted", reveal),
+            ("pool_accepted", pool),
+            ("selected", selected),
+            ("rewarded", rewarded),
+            ("terminal_final", terminal),
+            ("terminal_unresolved", unresolved),
+            ("network_proof_passed", network_proof),
+        ):
+            if value is not None and value > attempts:
+                raise ValueError(f"counter_exceeds_attempts:{name}")
+        if selected > pool or rewarded > selected:
+            raise ValueError("funnel_order")
+
+        published_physical_gpu_hours = _standalone_nonnegative_float(
+            telemetry, "physical_gpu_hours", required=True
+        )
+        selected_rate_required = not (
+            published_physical_gpu_hours == 0.0 and selected == 0
+        )
+        published_selected_per_gpu_hour = _standalone_nonnegative_float(
+            telemetry,
+            "selected_slots_per_physical_gpu_hour",
+            "slots_per_physical_gpu_hour",
+            required=selected_rate_required,
+        )
+        if published_selected_per_gpu_hour is None:
+            published_selected_per_gpu_hour = 0.0
+        published_rewarded_per_gpu_hour = _standalone_nonnegative_float(
+            telemetry,
+            "rewarded_slots_per_physical_gpu_hour",
+        )
+        if published_rewarded_per_gpu_hour is None:
+            published_rewarded_per_gpu_hour = (
+                published_selected_per_gpu_hour
+                if rewarded == selected
+                else 0.0
+            )
+        per_gpu, normalized_gpu_hours = _standalone_ledger_gpu_summary(
+            wrapper.get("ledger")
+        )
+        comparison_scopes = _standalone_comparison_scopes(
+            telemetry.get("comparison_scopes")
+        )
+        if sum(int(row["attempts"]) for row in per_gpu.values()) > attempts:
+            raise ValueError("ledger_attempts")
+        if (
+            natural_complete is not None
+            and sum(
+                int(row["natural_complete_m8"])
+                for row in per_gpu.values()
+            )
+            > natural_complete
+        ):
+            raise ValueError("ledger_natural_complete")
+        physical_gpu_hours = (
+            normalized_gpu_hours
+            if normalized_gpu_hours is not None
+            and normalized_gpu_hours > 0
+            else published_physical_gpu_hours
+        )
+        selected_per_gpu_hour = (
+            selected / physical_gpu_hours if physical_gpu_hours > 0 else 0.0
+        )
+        rewarded_per_gpu_hour = (
+            rewarded / physical_gpu_hours if physical_gpu_hours > 0 else 0.0
+        )
+
+        window_lifecycle = _standalone_window_lifecycle(
+            telemetry.get("window_lifecycle")
+        )
+        latest_window_raw = telemetry.get(
+            "latest_window",
+            telemetry.get("latest_attempt_window"),
+        )
+        if latest_window_raw is None:
+            zero_history = (
+                attempts == 0
+                and physical_gpu_hours == 0.0
+                and all(
+                    value in {None, 0}
+                    for value in (
+                        generation_complete,
+                        natural_complete,
+                        local_eligible,
+                        precommit,
+                        reveal,
+                        pool,
+                        network_proof,
+                        selected,
+                        rewarded,
+                        terminal,
+                        unresolved,
+                    )
+                )
+            )
+            if not window_lifecycle and not zero_history:
+                raise ValueError("missing_counter:latest_window")
+            latest_window = None
+        else:
+            latest_window = _standalone_counter(
+                {"latest_window": latest_window_raw},
+                "latest_window",
+                required=True,
+            )
+        hotkeys = telemetry.get("hotkeys", [])
+        if hotkeys is not None and not isinstance(hotkeys, list):
+            raise ValueError("hotkeys")
+        if hotkeys and (
+            not all(isinstance(value, str) for value in hotkeys)
+            or state.hotkey not in hotkeys
+        ):
+            raise ValueError("hotkey_mismatch")
+
+        miner_source = str(manifest.get("miner_source_revision") or "").lower()
+        public_source = str(
+            manifest.get("validator_source_revision") or ""
+        ).lower()
+        observed_validator_image = str(
+            manifest.get("observed_validator_image_revision") or ""
+        ).lower()
+        checkpoint_revision = str(
+            manifest.get("checkpoint_revision") or ""
+        ).lower()
+        protocol_version_raw = manifest.get("protocol_version")
+        if protocol_version_raw is not None and (
+            isinstance(protocol_version_raw, bool)
+            or not isinstance(protocol_version_raw, int)
+            or protocol_version_raw < 2
+        ):
+            raise ValueError("runtime_protocol_version")
+        generation_profile_id = str(
+            manifest.get("generation_profile_id") or ""
+        )
+        generation_contract_sha256 = str(
+            manifest.get("generation_contract_sha256") or ""
+        ).lower()
+        checkpoint_profile_sha256 = str(
+            manifest.get("checkpoint_profile_sha256") or ""
+        ).lower()
+        runtime_fingerprint_sha256 = str(
+            manifest.get("runtime_fingerprint_sha256") or ""
+        ).lower()
+        for name, value in (
+            ("generation_contract_sha256", generation_contract_sha256),
+            ("checkpoint_profile_sha256", checkpoint_profile_sha256),
+            ("runtime_fingerprint_sha256", runtime_fingerprint_sha256),
+        ):
+            if value and not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"runtime_{name}")
+        model_repo = str(manifest.get("model_repo") or "").strip()
+        environment = str(manifest.get("environment") or "").strip()
+        checkpoint_n_raw = manifest.get("checkpoint_n")
+        raw_components = manifest.get("components", [])
+        if not isinstance(raw_components, list):
+            raise ValueError("runtime_components")
+        runtime_components: list[dict[str, Any]] = []
+        for component in raw_components:
+            if not isinstance(component, dict):
+                raise ValueError("runtime_component")
+            role = str(component.get("role") or "")
+            component_id = str(component.get("component_id") or "")
+            manifest_path = str(component.get("manifest_path") or "")
+            manifest_file_sha256 = str(
+                component.get("manifest_file_sha256") or ""
+            ).lower()
+            runtime_payload_sha256 = str(
+                component.get("runtime_payload_sha256") or ""
+            ).lower()
+            runtime_profile_sha256 = str(
+                component.get("runtime_profile_sha256") or ""
+            ).lower()
+            if (
+                role not in {"generation", "proof", "grader"}
+                or not component_id
+                or (
+                    manifest_path
+                    and (
+                        not manifest_path.startswith("/")
+                        or "\x00" in manifest_path
+                    )
+                )
+                or not re.fullmatch(r"[0-9a-f]{64}", manifest_file_sha256)
+                or not re.fullmatch(r"[0-9a-f]{64}", runtime_payload_sha256)
+                or not re.fullmatch(r"[0-9a-f]{64}", runtime_profile_sha256)
+                or not isinstance(
+                    component.get("health_gpu_uuid_required"), bool
+                )
+            ):
+                raise ValueError("runtime_component")
+            normalized_component = {
+                "role": role,
+                "component_id": component_id,
+                "manifest_file_sha256": manifest_file_sha256,
+                "runtime_payload_sha256": runtime_payload_sha256,
+                "runtime_profile_sha256": runtime_profile_sha256,
+                "health_gpu_uuid_required": component[
+                    "health_gpu_uuid_required"
+                ],
+            }
+            if manifest_path:
+                normalized_component["manifest_path"] = manifest_path
+            runtime_components.append(normalized_component)
+        controller = wrapper.get("controller", {})
+        if not isinstance(controller, dict):
+            raise ValueError("controller")
+        controller_mode = str(controller.get("mode") or "")
+        controller_config_path = str(controller.get("config_path") or "")
+        active_manifest_path = str(
+            controller.get("runtime_manifest_path") or ""
+        )
+        active_ledger_path = str(controller.get("ledger_path") or "")
+        controller_unit = str(controller.get("active_unit") or "")
+        expected_config_path = ""
+        if state.active_unit:
+            expected_config_path = _configured_controller_config_path(
+                state, state.active_unit
+            )
+        if expected_config_path:
+            if (
+                controller_mode not in {"canary", "mine"}
+                or controller_config_path != expected_config_path
+                or controller_unit != state.active_unit
+                or not active_manifest_path.startswith("/")
+                or not active_ledger_path.startswith("/")
+            ):
+                raise ValueError("active_controller_binding")
+        elif any((
+            controller_mode,
+            controller_config_path,
+            active_ledger_path,
+        )):
+            raise ValueError("unexpected_controller_binding")
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", miner_source)
+            or not re.fullmatch(r"[0-9a-f]{40}", public_source)
+            or (
+                observed_validator_image
+                and not re.fullmatch(
+                    r"[0-9a-f]{40}", observed_validator_image
+                )
+            )
+            or not re.fullmatch(r"[0-9a-f]{40}", checkpoint_revision)
+            or isinstance(checkpoint_n_raw, bool)
+            or not isinstance(checkpoint_n_raw, int)
+            or checkpoint_n_raw <= 0
+            or not model_repo
+            or not environment
+        ):
+            raise ValueError("runtime_identity")
+
+        controller_authority = _standalone_registry_controller_authority(
+            state,
+            wrapper,
+            controller=controller,
+            miner_source_revision=miner_source,
+            validator_source_revision=public_source,
+            observed_validator_image_revision=observed_validator_image,
+            checkpoint_n=checkpoint_n_raw,
+            checkpoint_repo_id=model_repo,
+            checkpoint_revision=checkpoint_revision,
+            protocol_version=protocol_version_raw,
+            generation_profile_id=generation_profile_id,
+            generation_contract_sha256=generation_contract_sha256,
+            checkpoint_profile_sha256=checkpoint_profile_sha256,
+        )
+
+        historical_funnel = {
+            "attempts": attempts,
+            "generation_complete": generation_complete,
+            "natural_complete_m8": natural_complete,
+            "local_eligible": local_eligible,
+            "precommit_accepted": precommit,
+            "reveal_accepted": reveal,
+            "pool_accepted": pool,
+            "network_proof_passed": network_proof,
+            "selected": selected,
+            "rewarded": rewarded,
+            "terminal_final": terminal,
+            "terminal_unresolved": unresolved,
+        }
+        current_scope = comparison_scopes.get("active_profile")
+        if state.proc_alive and isinstance(current_scope, dict):
+            current_funnel = dict(current_scope["funnel"])
+            current_physical_gpu_hours = float(
+                current_scope["physical_gpu_hours"]
+            )
+            current_selected_per_gpu_hour = float(
+                current_scope.get("selected_slots_per_physical_gpu_hour") or 0.0
+            )
+            current_rewarded_per_gpu_hour = float(
+                current_scope.get("rewarded_slots_per_physical_gpu_hour") or 0.0
+            )
+            current_latest_window = current_scope.get("window_end")
+            metrics_posture = "active_profile"
+        elif not state.proc_alive:
+            current_funnel = {
+                name: 0
+                for name in (
+                    "attempts",
+                    "generation_complete",
+                    "natural_complete_m8",
+                    "local_eligible",
+                    "precommit_accepted",
+                    "reveal_accepted",
+                    "pool_accepted",
+                    "network_proof_passed",
+                    "selected",
+                    "rewarded",
+                    "terminal_final",
+                    "terminal_unresolved",
+                )
+            }
+            current_physical_gpu_hours = 0.0
+            current_selected_per_gpu_hour = 0.0
+            current_rewarded_per_gpu_hour = 0.0
+            current_latest_window = None
+            metrics_posture = "historical_fenced"
+        else:
+            # Backward compatibility for a live v2 producer that predates the
+            # additive active_profile scope.
+            current_funnel = historical_funnel
+            current_physical_gpu_hours = physical_gpu_hours
+            current_selected_per_gpu_hour = selected_per_gpu_hour
+            current_rewarded_per_gpu_hour = rewarded_per_gpu_hour
+            current_latest_window = latest_window
+            metrics_posture = "legacy_live"
+
+        raw_staleness = telemetry.get("staleness_seconds")
+        staleness_seconds = (
+            {
+                str(name): float(value)
+                for name, value in raw_staleness.items()
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) >= 0
+            }
+            if isinstance(raw_staleness, dict)
+            else {}
+        )
+        heartbeat_age = window_lifecycle.get("heartbeat_age_seconds")
+        ledger_age = staleness_seconds.get("ledger_update")
+        # The atomic snapshot timestamp is the telemetry liveness authority.
+        # Producer-specific ages describe independent data products: an idle
+        # selector memory or an R2 reconciliation cursor may legitimately be
+        # old while the controller is actively generating.  Taking the maximum
+        # of all of them therefore mislabeled a healthy live miner as stale.
+        # Prefer an explicit controller heartbeat for the displayed progress
+        # age, then ledger activity, while preserving every raw age below for
+        # diagnosis.  Neither auxiliary age can invalidate a fresh snapshot.
+        if isinstance(heartbeat_age, (int, float)) and not isinstance(
+            heartbeat_age, bool
+        ):
+            progress_age_s = max(0.0, float(heartbeat_age))
+        elif isinstance(ledger_age, (int, float)) and not isinstance(
+            ledger_age, bool
+        ):
+            progress_age_s = max(0.0, float(ledger_age))
+        else:
+            progress_age_s = age_s
+        observability = _standalone_sanitize_observability(
+            telemetry.get("observability"), controller_authority
+        )
+        runtime_observability = telemetry.get("runtime")
+        runtime_observability = (
+            runtime_observability
+            if isinstance(runtime_observability, dict)
+            else {}
+        )
+        state.standalone_telemetry = {
+            "schema_version": int(telemetry.get("schema_version") or 1),
+            "latest_window": current_latest_window,
+            "historical_latest_window": latest_window,
+            "funnel": current_funnel,
+            "historical_funnel": historical_funnel,
+            "metrics_posture": metrics_posture,
+            "physical_gpu_hours": current_physical_gpu_hours,
+            "published_physical_gpu_hours": published_physical_gpu_hours,
+            "selected_slots_per_physical_gpu_hour": current_selected_per_gpu_hour,
+            "rewarded_slots_per_physical_gpu_hour": current_rewarded_per_gpu_hour,
+            "published_selected_slots_per_physical_gpu_hour": (
+                published_selected_per_gpu_hour
+            ),
+            "published_rewarded_slots_per_physical_gpu_hour": (
+                published_rewarded_per_gpu_hour
+            ),
+            "per_gpu": per_gpu,
+            "comparison_scopes": comparison_scopes,
+            "window_lifecycle": window_lifecycle,
+            "staleness_seconds": staleness_seconds,
+            "observability": observability,
+            "runtime": runtime_observability,
+            "controller_authority": controller_authority,
+            "manifest_profile": {
+                "protocol_version": protocol_version_raw,
+                "generation_profile_id": generation_profile_id or None,
+                "generation_contract_sha256": (
+                    generation_contract_sha256 or None
+                ),
+                "checkpoint_profile_sha256": (
+                    checkpoint_profile_sha256 or None
+                ),
+                "runtime_fingerprint_sha256": (
+                    runtime_fingerprint_sha256 or None
+                ),
+                "checkpoint_repo_id": model_repo,
+                "checkpoint_revision": checkpoint_revision,
+                "validator_source_revision": public_source,
+                "observed_validator_image_revision": (
+                    observed_validator_image or None
+                ),
+            },
+            "raw_hotkeys": list(hotkeys or []),
+        }
+        state.standalone_supervisor = supervisor
+        state.standalone_progress_age_s = progress_age_s
+        state.standalone_generated_at = generated_at
+        state.standalone_age_s = age_s
+        state.standalone_fresh = (
+            age_s <= state.standalone_telemetry_stale_seconds
+            and state.proc_alive
+        )
+        if not state.proc_alive:
+            state.standalone_error = "no_mining_unit"
+        elif not state.standalone_fresh:
+            state.standalone_error = "stale"
+
+        state.miner_source_revision = miner_source
+        state.runtime_components = runtime_components
+        state.standalone_controller_mode = controller_mode
+        state.standalone_controller_config_path = controller_config_path
+        state.standalone_active_runtime_manifest_path = active_manifest_path
+        state.standalone_active_ledger_path = active_ledger_path
+        state.reliquary_source_revision = public_source
+        state.observed_validator_image_revision = observed_validator_image
+        state.source_manifest_provisioned_ok = True
+        state.provisioned_model_kind = "validator_checkpoint"
+        state.provisioned_checkpoint_n = checkpoint_n_raw
+        state.provisioned_model_repo = model_repo
+        state.provisioned_model_revision = checkpoint_revision
+        state.runtime_checkpoint_loaded = True
+        state.runtime_checkpoint_n = checkpoint_n_raw
+        state.runtime_checkpoint_repo = model_repo
+        state.runtime_checkpoint_revision = checkpoint_revision
+        state.runtime_checkpoint_pid = state.active_pid
+        state.runtime_checkpoint_started_at = state.active_started_at
+        state.runtime_checkpoint_evidence = "standalone_runtime_manifest"
+        state.local_checkpoint_n = checkpoint_n_raw
+        state.local_checkpoint_revision = checkpoint_revision
+        state.miner_environment = environment
+        state.active_environment = environment if state.proc_alive else ""
+        state.engine_mode = "standalone"
+        supervisor_active = supervisor.get("active")
+        supervisor_active = (
+            supervisor_active if isinstance(supervisor_active, dict) else {}
+        )
+        state.protocol_profile = str(
+            generation_profile_id
+            if controller_authority
+            else supervisor_active.get("generation_profile_id")
+            or generation_profile_id
+            or "historical-v2-unscoped"
+        )
+        state.runtime_parity_ok = bool(
+            state.proc_alive
+            and (
+                bool(controller_authority)
+                or (
+                    supervisor.get("identity_match") is not False
+                    and not supervisor.get("unsafe_submission_state")
+                )
+            )
+        )
+        state.reference_ready = bool(
+            state.proc_alive and state.standalone_fresh
+        )
+        active_generation_window = (
+            _standalone_active_generation(window_lifecycle)
+            if state.reference_ready
+            and state.runtime_parity_ok
+            and bool(controller_authority)
+            else None
+        )
+        if active_generation_window is not None:
+            state.miner_state = "active_generation"
+            state.miner_window = active_generation_window
+            state.miner_ready = 0
+            state.miner_inflight = 1
+        else:
+            state.miner_state = (
+                "live"
+                if state.reference_ready
+                else "fenced"
+                if not state.proc_alive
+                else "telemetry-stale"
+            )
+            state.miner_window = current_latest_window
+            state.miner_ready = int(state.reference_ready)
+            state.miner_inflight = 0
+        state.miner_submitted_this_win = int(
+            state.proc_alive
+            and current_funnel.get("terminal_final") is not None
+            and int(current_funnel["terminal_final"])
+            < int(current_funnel["attempts"])
+        )
+        state.acceptance_source = (
+            "standalone_active_profile"
+            if metrics_posture == "active_profile"
+            else "standalone_historical"
+            if metrics_posture == "historical_fenced"
+            else "standalone_atomic"
+        )
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+        state.standalone_error = str(exc)[:240]
+        state.reference_ready = False
+        state.runtime_parity_ok = False
+        state.miner_ready = 0
+        state.miner_state = "telemetry-error"
+
+
+def _apply_standalone_certification_probe(
+    state: BoxState,
+    line: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Replace exact non-mining certification state from one live probe."""
+    state.standalone_certification = {}
+    config = state.standalone_certification_config
+    if not config:
+        return False
+    try:
+        raw = json.loads(line)
+        if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+            raise ValueError("probe_schema")
+        generated_at = float(raw.get("generated_at") or 0.0)
+        current = time.time() if now is None else float(now)
+        if (
+            not math.isfinite(generated_at)
+            or generated_at <= 0
+            or generated_at > current + 30.0
+            or current - generated_at > 30.0
+        ):
+            raise ValueError("probe_stale")
+        if not raw.get("active"):
+            state.standalone_certification = {
+                "active": False,
+                "fresh": True,
+                "generated_at": generated_at,
+                "error": str(raw.get("error") or "not_running")[:160],
+            }
+            return False
+        phase = str(raw.get("phase") or "")
+        allowed_phases = {
+            "reference_proof",
+            "candidate_proof",
+            "parity_assembly",
+            "validator_replay_assembly",
+            "parity_and_replay",
+            "certificate_build",
+            "canary_gate",
+            "attach_certificate",
+            "transition",
+            "generation_loading",
+            "generation_ready",
+            "generation_capture",
+            "generation_recovering",
+            "generation_failed",
+            "public_oracle_proof",
+        }
+        runner_pid = int(raw.get("runner_pid") or 0)
+        worker_pid = int(raw.get("worker_pid") or 0)
+        if (
+            raw.get("exact") is not True
+            or raw.get("submit_disabled_attested") is not True
+            or phase not in allowed_phases
+            or runner_pid <= 0
+            or worker_pid < 0
+            or (
+                config.get("service_unit")
+                and config.get("service_kind")
+                != "submit_disabled_certification"
+                and raw.get("wallet_free_attested") is not True
+            )
+        ):
+            raise ValueError("process_identity")
+        for key in (
+            "runner_path",
+            "runner_sha256",
+            "artifact_dir",
+            "runtime_manifest_path",
+            "proof_profile_path",
+            "checkpoint_path",
+            "service_unit",
+            "service_user",
+            "service_config_path",
+            "service_config_sha256",
+            "progress_path",
+            "service_kind",
+        ):
+            if str(raw.get(key) or "") != str(config.get(key) or ""):
+                raise ValueError(f"config_mismatch:{key}")
+        gpu = raw.get("gpu")
+        identity = raw.get("identity")
+        artifacts = raw.get("artifacts")
+        if (
+            not isinstance(gpu, dict)
+            or not isinstance(identity, dict)
+            or not isinstance(artifacts, dict)
+            or str(gpu.get("uuid") or "") != config.get("gpu_uuid")
+        ):
+            raise ValueError("payload_shape")
+        normalized_gpu = {
+            "uuid": str(gpu["uuid"]),
+            "name": str(gpu.get("name") or ""),
+            "utilization_pct": int(gpu.get("utilization_pct") or 0),
+            "memory_used_mb": int(gpu.get("memory_used_mb") or 0),
+            "memory_total_mb": int(gpu.get("memory_total_mb") or 0),
+            "power_w": float(gpu.get("power_w") or 0.0),
+            "power_limit_w": float(gpu.get("power_limit_w") or 0.0),
+        }
+        if (
+            not 0 <= normalized_gpu["utilization_pct"] <= 100
+            or normalized_gpu["memory_used_mb"] < 0
+            or normalized_gpu["memory_total_mb"] <= 0
+            or normalized_gpu["memory_used_mb"]
+            > normalized_gpu["memory_total_mb"]
+        ):
+            raise ValueError("gpu")
+        started_at_value = float(raw.get("started_at") or 0.0)
+        elapsed_s = float(raw.get("elapsed_s") or 0.0)
+        if (
+            not math.isfinite(started_at_value)
+            or started_at_value <= 0
+            or started_at_value > current + 30.0
+            or not math.isfinite(elapsed_s)
+            or elapsed_s < 0
+        ):
+            raise ValueError("process_time")
+        state.standalone_certification = {
+            "active": True,
+            "fresh": True,
+            "generated_at": generated_at,
+            "exact": True,
+            "submit_disabled_attested": True,
+            "wallet_free_attested": bool(raw.get("wallet_free_attested")),
+            "runner_pid": runner_pid,
+            "worker_pid": worker_pid,
+            "phase": phase,
+            "started_at": started_at_value,
+            "elapsed_s": elapsed_s,
+            "runner_path": str(raw["runner_path"]),
+            "runner_sha256": str(raw["runner_sha256"]),
+            "artifact_dir": str(raw["artifact_dir"]),
+            "runtime_manifest_path": str(raw["runtime_manifest_path"]),
+            "proof_profile_path": str(raw["proof_profile_path"]),
+            "checkpoint_path": str(raw["checkpoint_path"]),
+            "service_unit": str(raw.get("service_unit") or ""),
+            "service_user": str(raw.get("service_user") or ""),
+            "service_config_path": str(
+                raw.get("service_config_path") or ""
+            ),
+            "service_config_sha256": str(
+                raw.get("service_config_sha256") or ""
+            ),
+            "progress_path": str(raw.get("progress_path") or ""),
+            "service_kind": str(raw.get("service_kind") or ""),
+            "gpu": normalized_gpu,
+            "gpu_process_bound": bool(raw.get("gpu_process_bound")),
+            "gpu_worker_memory_mb": int(
+                raw.get("gpu_worker_memory_mb") or 0
+            ),
+            "identity": {
+                "miner_source_revision": str(
+                    identity.get("miner_source_revision") or ""
+                ),
+                "validator_source_revision": str(
+                    identity.get("validator_source_revision") or ""
+                ),
+                "checkpoint_n": int(identity.get("checkpoint_n") or 0),
+                "checkpoint_revision": str(
+                    identity.get("checkpoint_revision") or ""
+                ),
+                "model_repo": str(identity.get("model_repo") or ""),
+                "environment": str(identity.get("environment") or ""),
+            },
+            "artifacts": {
+                str(key): bool(value)
+                for key, value in artifacts.items()
+                if isinstance(key, str)
+            },
+            "error": "",
+        }
+        return True
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+        json.JSONDecodeError,
+    ) as exc:
+        state.standalone_certification = {
+            "active": False,
+            "fresh": False,
+            "generated_at": 0.0,
+            "error": str(exc)[:160],
+        }
+        return False
+
+
+def _collect_standalone_certification_after_unit_failure(
+    state: BoxState,
+) -> bool:
+    """Probe a configured exact certifier without making it a miner."""
+    state.standalone_certification = {}
+    if not state.standalone_certification_config:
+        return False
+    payload = shlex.quote(json.dumps(
+        state.standalone_certification_config,
+        separators=(",", ":"),
+        sort_keys=True,
+    ))
+    command = (
+        f"sudo -n python3 - {payload} <<'PYSTANDALONECERT'\n"
+        f"{_STANDALONE_CERTIFICATION_PROBE_SOURCE}\n"
+        "PYSTANDALONECERT\n"
+    )
+    rc, out, err = ssh_run(state.alias, command, timeout_s=12)
+    if rc != 0 or not out.strip():
+        state.standalone_certification = {
+            "active": False,
+            "fresh": False,
+            "generated_at": 0.0,
+            "error": "probe:" + str(err or f"rc={rc}")[:120],
+        }
+        return False
+    return _apply_standalone_certification_probe(
+        state, out.strip().splitlines()[-1]
+    )
+
+
+def _collect_standalone_files_after_unit_failure(state: BoxState) -> None:
+    """Retain fail-stale telemetry truth even when no allowed unit is live."""
+    if not state.standalone_telemetry_path:
+        return
+    command = " ".join(
+        [
+            "sudo -n python3 -",
+            shlex.quote(state.standalone_telemetry_path),
+            shlex.quote(state.standalone_runtime_manifest_path),
+            shlex.quote(""),
+            shlex.quote(""),
+            "0",
+            shlex.quote(state.standalone_supervisor_status_path),
+        ]
+    )
+    command += (
+        " <<'PYSTANDALONE'\n"
+        + _STANDALONE_TELEMETRY_PROBE_SOURCE
+        + "\nPYSTANDALONE\n"
+    )
+    rc, out, err = ssh_run(state.alias, command, timeout_s=12)
+    if rc != 0 or not out.strip():
+        state.standalone_error = (
+            "probe:" + str(err or f"rc={rc}")[:120]
+        )
+        state.standalone_fresh = False
+        return
+    _apply_standalone_telemetry_probe(
+        state, [out.strip().splitlines()[-1]]
+    )
+
+
+def _mark_reliquary_one_stale(
+    state: BoxState,
+    *,
+    error: str,
+    now: float,
+) -> None:
+    """Retain the last safe projection while failing current readiness stale."""
+
+    previous = dict(state.reliquary_one or {})
+    previous["fresh"] = False
+    previous["collector_error"] = error
+    previous.setdefault("errors", [])
+    previous["errors"] = list(
+        dict.fromkeys([*previous.get("errors", []), error])
+    )
+    state.reliquary_one = previous
+    state.reliquary_one_error = error
+    state.error = error[:120]
+    state.last_poll_s = now
+    state.reference_ready = False
+    state.runtime_parity_ok = False
+
+
+def _collect_reliquary_one_in_place(state: BoxState) -> None:
+    """Collect one complete redacted ``reliquary-one`` snapshot over SSH."""
+
+    from reliquary_one import build_remote_probe_command, normalize_probe
+
+    now = time.time()
+    try:
+        command = build_remote_probe_command(
+            state.reliquary_one_state_root,
+            state.unit or "",
+        )
+    except ValueError as exc:
+        _mark_reliquary_one_stale(
+            state,
+            error=f"reliquary_one_config:{exc}",
+            now=now,
+        )
+        return
+    rc, out, err = ssh_run(state.alias, command, timeout_s=20)
+    if rc != 0:
+        detail = re.sub(r"\s+", " ", str(err or "ssh probe failed")).strip()
+        _mark_reliquary_one_stale(
+            state,
+            error=f"reliquary_one_ssh:{detail[:80]}",
+            now=now,
+        )
+        return
+    if len(out.encode("utf-8", errors="replace")) > 2 * 1024 * 1024:
+        _mark_reliquary_one_stale(
+            state,
+            error="reliquary_one_probe_oversized",
+            now=now,
+        )
+        return
+    try:
+        raw = json.loads(out)
+        normalized = normalize_probe(
+            raw,
+            now=now,
+            stale_seconds=state.standalone_telemetry_stale_seconds,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        _mark_reliquary_one_stale(
+            state,
+            error=f"reliquary_one_probe:{type(exc).__name__}",
+            now=now,
+        )
+        return
+
+    service = normalized.get("service", {})
+    binding = normalized.get("binding", {})
+    gpus = normalized.get("gpu", [])
+    gpu = gpus[0] if gpus else {}
+    active = bool(service.get("active"))
+    unit = str(service.get("unit") or state.unit or "")
+    environment = str(binding.get("environment") or "")
+    revision = str(binding.get("checkpoint_revision") or "")
+    checkpoint_n = int(binding.get("checkpoint_number") or 0)
+
+    state.reliquary_one = normalized
+    state.reliquary_one_error = ""
+    state.last_poll_s = now
+    state.proc_alive = active
+    state.active_unit = unit if active else ""
+    state.active_units = [unit] if active and unit else []
+    state.active_lane = str(binding.get("strategy") or "code") if active else ""
+    state.active_lanes = [state.active_lane] if state.active_lane else []
+    state.active_environment = environment
+    state.active_pid = int(service.get("pid") or 0)
+    state.restart_count = int(service.get("restarts") or 0)
+    state.proc_uptime_s = int(float(service.get("uptime_seconds") or 0.0))
+    state.gpu_util = int(float(gpu.get("utilization_pct") or 0.0))
+    state.gpu_mem_mb = int(float(gpu.get("memory_used_mib") or 0.0))
+    state.gpu_total_mb = max(
+        1,
+        int(float(gpu.get("memory_total_mib") or 1.0)),
+    )
+    state.env_file_ok = True
+    state.env_file_error = ""
+    state.unit_resolution_error = ""
+    state.unexpected_active_units = []
+    state.engine_mode = "reliquary_one"
+    state.miner_environment = environment
+    state.reference_ready = bool(normalized.get("fresh"))
+    state.runtime_parity_ok = bool(normalized.get("fresh") and revision)
+    state.runtime_checkpoint_loaded = bool(revision)
+    state.runtime_checkpoint_n = checkpoint_n
+    state.runtime_checkpoint_revision = revision
+    state.runtime_checkpoint_pid = state.active_pid
+    state.runtime_checkpoint_started_at = int(
+        float(binding.get("activated_at") or 0.0)
+    )
+    state.runtime_checkpoint_evidence = "reliquary_one_active_binding"
+    state.local_checkpoint_n = checkpoint_n
+    state.local_checkpoint_revision = revision
+    state.miner_source_revision = str(binding.get("release_sha") or "")
+    state.acceptance_source = "reliquary_one+verdicts+r2"
+    state.error = "" if normalized.get("fresh") else "reliquary_one_stale"
+
+
 def _collect_box_in_place(state: BoxState) -> None:
     """Poll a single box for GPU + journal metrics. Mutates state in place.
 
@@ -2975,14 +9748,21 @@ def _collect_box_in_place(state: BoxState) -> None:
     an explicitly coordinated set is retained for display while the primary
     unit and EnvironmentFile are fixed for the detailed metrics probe.
     """
+    if state.miner_kind == "reliquary_one":
+        _collect_reliquary_one_in_place(state)
+        return
+
     state.unit_resolution_error = ""
     state.unexpected_active_units = []
     selected_unit = state.unit or ""
     selected_env_file = state.env_file
+    selected_controller_config_path = ""
     initial_selected_unit = ""
     initial_selected_pid = 0
     lane_resolver_enabled = bool(
-        state.unit_candidates or state.host_unit_allowlist
+        state.unit_candidates
+        or state.host_unit_allowlist
+        or state.active_unit_registry_path
     )
     if not lane_resolver_enabled:
         state.active_unit = ""
@@ -2993,6 +9773,15 @@ def _collect_box_in_place(state: BoxState) -> None:
         state.active_pid = 0
     if lane_resolver_enabled:
         _clear_current_lane_telemetry(state)
+        if not _refresh_active_unit_registry(state):
+            state.last_poll_s = time.time()
+            state.proc_alive = False
+            state.reference_ready = False
+            state.runtime_parity_ok = False
+            state.env_file_ok = False
+            state.env_file_error = state.unit_resolution_error
+            state.error = state.unit_resolution_error[:120]
+            return
         resolved = _resolve_allowed_active_unit(state)
         if resolved is None:
             state.last_poll_s = time.time()
@@ -3002,8 +9791,42 @@ def _collect_box_in_place(state: BoxState) -> None:
             state.env_file_ok = False
             state.env_file_error = state.unit_resolution_error
             state.error = state.unit_resolution_error[:120]
+            # A submit-disabled certifier and the last immutable mining
+            # snapshot answer different questions.  Always retain the
+            # profile-scoped historical/supervisor truth before probing a
+            # certifier so the latter cannot hide that the current mining
+            # funnel is fenced and zero.
+            _collect_standalone_files_after_unit_failure(state)
+            if (
+                state.unit_resolution_error == "no_allowed_unit_active"
+                and _collect_standalone_certification_after_unit_failure(
+                    state
+                )
+            ):
+                # Certification is real compute but never a miner. Preserve
+                # the empty active-unit/process/funnel state and the resolver
+                # blocker while avoiding a misleading generic probe error.
+                state.error = ""
+                return
             return
         selected_unit, selected_env_file = resolved
+        if not _select_active_unit_registry_entry(state, selected_unit):
+            state.proc_alive = False
+            state.reference_ready = False
+            state.runtime_parity_ok = False
+            state.error = state.unit_resolution_error[:120]
+            return
+        try:
+            selected_controller_config_path = (
+                _configured_controller_config_path(state, selected_unit)
+            )
+        except ValueError as exc:
+            state.unit_resolution_error = f"config:{exc}"
+            state.proc_alive = False
+            state.reference_ready = False
+            state.runtime_parity_ok = False
+            state.error = state.unit_resolution_error[:120]
+            return
         initial_selected_unit = selected_unit
         initial_selected_pid = state.active_pid
 
@@ -3016,7 +9839,11 @@ def _collect_box_in_place(state: BoxState) -> None:
     # bug — `cmd || true | grep` parses as `cmd || (true | grep)`).
     if selected_unit:
         unit_q = shlex.quote(selected_unit)
-        env_guess = selected_env_file or resolve_box_env_file(state, selected_unit)
+        env_guess = selected_env_file or (
+            ""
+            if state.standalone_telemetry_path
+            else resolve_box_env_file(state, selected_unit)
+        )
         env_q = shlex.quote(env_guess)
         def jrange(window: str) -> str:
             return f"journalctl -u {unit_q} --no-pager --since '{window}'"
@@ -3113,6 +9940,34 @@ def _collect_box_in_place(state: BoxState) -> None:
             str(int(CODE_GRADER_SOCKET_MODE)),
         ]
     )
+    env_by_unit = dict(_configured_unit_specs(state))
+    crossover_unit_specs = [
+        [unit, env_by_unit.get(unit, "")]
+        for unit in (
+            state.active_units
+            if state.active_units
+            else ([readiness_unit] if readiness_unit else [])
+        )
+    ]
+    crossover_probe_cmd = (
+        "sudo -n python3 - "
+        + shlex.quote(json.dumps(crossover_unit_specs, separators=(",", ":")))
+    )
+    overlap_abba_probe_cmd = (
+        "sudo -n python3 - "
+        + shlex.quote(json.dumps(crossover_unit_specs, separators=(",", ":")))
+    )
+    standalone_probe_cmd = " ".join(
+        [
+            "sudo -n python3 -",
+            shlex.quote(state.standalone_telemetry_path),
+            shlex.quote(state.standalone_runtime_manifest_path),
+            shlex.quote(selected_controller_config_path),
+            shlex.quote(readiness_unit),
+            str(int(initial_selected_pid or state.active_pid or 0)),
+            shlex.quote(state.standalone_supervisor_status_path),
+        ]
+    )
 
     one_shot = (
         "echo '===GPU==='; "
@@ -3135,6 +9990,22 @@ def _collect_box_in_place(state: BoxState) -> None:
         f"{code_readiness_probe_cmd} <<'PYCODEAUCTION'\n"
         f"{_CODE_AUCTION_READINESS_PROBE_SOURCE}\n"
         "PYCODEAUCTION\n"
+        "echo '===CODESELECTORCROSSOVER==='; "
+        f"{crossover_probe_cmd} <<'PYCODESELECTORCROSSOVER'\n"
+        f"{_CODE_SELECTOR_CROSSOVER_PROBE_SOURCE}\n"
+        "PYCODESELECTORCROSSOVER\n"
+        "echo '===CODEOVERLAPABBA==='; "
+        f"{overlap_abba_probe_cmd} <<'PYCODEOVERLAPABBA'\n"
+        f"{_CODE_OVERLAP_ABBA_PROBE_SOURCE}\n"
+        "PYCODEOVERLAPABBA\n"
+        "echo '===STANDALONE==='; "
+        + (
+            f"{standalone_probe_cmd} <<'PYSTANDALONE'\n"
+            f"{_STANDALONE_TELEMETRY_PROBE_SOURCE}\n"
+            "PYSTANDALONE\n"
+            if state.standalone_telemetry_path
+            else "printf '{}\\n'; "
+        ) +
         "echo '===FRONTIER==='; "
         f"{state_probe_cmd} <<'PYFRONTIER'\n"
         "import glob, json, os, sys, time\n"
@@ -3319,7 +10190,9 @@ def _collect_box_in_place(state: BoxState) -> None:
     sect: dict[str, list[str]] = {
         "GPU": [], "PROC": [], "PSTAT": [], "DISK": [], "NRESTARTS": [], "PID": [],
         "UPTIME": [], "NOW": [],
-        "ENVFILE": [], "MINERENV": [], "CODEAUCTION": [], "FRONTIER": [],
+        "ENVFILE": [], "MINERENV": [], "CODEAUCTION": [],
+        "CODESELECTORCROSSOVER": [], "CODEOVERLAPABBA": [],
+        "STANDALONE": [], "FRONTIER": [],
         "STATEHEALTH": [], "WATCHDOG": [],
         "QUARANTINE": [], "REFERENCEPROFILE": [],
         "CODEREFERENCEPROFILE": [], "RUNTIMECHECKPOINT": [],
@@ -3408,9 +10281,15 @@ def _collect_box_in_place(state: BoxState) -> None:
         state.disk_used_pct = int(sect["DISK"][0])
 
     if selected_unit:
-        env_status = sect["ENVFILE"][0] if sect["ENVFILE"] else "missing:probe"
-        state.env_file_ok = env_status == "ok"
-        state.env_file_error = "" if state.env_file_ok else env_status[:240]
+        if state.standalone_telemetry_path and not selected_env_file:
+            state.env_file_ok = True
+            state.env_file_error = ""
+        else:
+            env_status = (
+                sect["ENVFILE"][0] if sect["ENVFILE"] else "missing:probe"
+            )
+            state.env_file_ok = env_status == "ok"
+            state.env_file_error = "" if state.env_file_ok else env_status[:240]
     else:
         state.env_file_ok = True
         state.env_file_error = ""
@@ -3423,6 +10302,7 @@ def _collect_box_in_place(state: BoxState) -> None:
     # receive the same reset treatment.
     state.miner_source_revision = ""
     state.reliquary_source_revision = ""
+    state.observed_validator_image_revision = ""
     state.source_manifest_provisioned_ok = False
     state.provisioned_model_kind = ""
     state.provisioned_checkpoint_n = -1
@@ -3455,6 +10335,8 @@ def _collect_box_in_place(state: BoxState) -> None:
     state.miner_unit_enablement = ""
     state.runtime_profile_hash = ""
     state.code_auction_probe = {}
+    state.code_selector_crossover_probe = {}
+    state.code_overlap_abba_probe = {}
     state.proc_uptime_s = 0
     state.active_started_at = 0
     state.quarantine_path = ""
@@ -3513,6 +10395,14 @@ def _collect_box_in_place(state: BoxState) -> None:
             pass
 
     state.code_auction_probe = _parse_code_auction_probe(sect["CODEAUCTION"])
+    state.code_selector_crossover_probe = (
+        _parse_code_selector_crossover_probe(
+            sect["CODESELECTORCROSSOVER"]
+        )
+    )
+    state.code_overlap_abba_probe = _parse_code_overlap_abba_probe(
+        sect["CODEOVERLAPABBA"]
+    )
     state.miner_unit_enablement = str(
         state.code_auction_probe.get("miner_unit_enablement") or ""
     )
@@ -3794,8 +10684,15 @@ def _collect_box_in_place(state: BoxState) -> None:
             if not state.quarantine_reason:
                 state.quarantine_reason = raw[-240:]
 
-    # systemd NRestarts — flakiness indicator
-    if sect["NRESTARTS"] and sect["NRESTARTS"][0].isdigit():
+    # For coordinated lanes the resolver's complete set is authoritative and
+    # ``restart_count`` is its sum. The detailed primary-lane probe must not
+    # overwrite that aggregate with one service's NRestarts value.
+    if state.coordinated_unit_statuses:
+        state.restart_count = sum(
+            int(row.get("restarts", 0))
+            for row in state.coordinated_unit_statuses
+        )
+    elif sect["NRESTARTS"] and sect["NRESTARTS"][0].isdigit():
         state.restart_count = int(sect["NRESTARTS"][0])
 
     # Process uptime — systemd ActiveEnterTimestamp is "Sat 2026-05-10 00:23:25 UTC".
@@ -4067,6 +10964,7 @@ def _collect_box_in_place(state: BoxState) -> None:
     # this function returns — so the trend reflects validator-confirmed
     # accepts, not the always-zero default we leave in `state.acpt_30m`
     # here.
+    _apply_standalone_telemetry_probe(state, sect["STANDALONE"])
     state.active_environment = state.miner_environment if state.proc_alive else ""
     if lane_resolver_enabled:
         observed_environment = state.active_environment
@@ -4142,6 +11040,11 @@ class ValidatorState:
     health_status: str = ""
     health_raw: dict[str, Any] = field(default_factory=dict)
     image_revision: str = ""
+    protocol_version: int = 0
+    generation_profile_id: str = ""
+    generation_contract: dict[str, Any] = field(default_factory=dict)
+    generation_contract_sha256: str = ""
+    checkpoint_profile_sha256: str = ""
     app_started_at: float = 0.0
     batch_size: int = 0
     queue_depth: int = 0
@@ -4780,6 +11683,32 @@ def _apply_validator_state(vs: ValidatorState, d: dict, *, source: str) -> None:
             setattr(vs, attr, "")
         elif isinstance(value, str):
             setattr(vs, attr, value)
+    protocol = d.get("protocol_version")
+    if isinstance(protocol, int) and not isinstance(protocol, bool) and protocol >= 2:
+        vs.protocol_version = protocol
+    profile_id = d.get("generation_profile_id")
+    if isinstance(profile_id, str):
+        vs.generation_profile_id = profile_id
+    generation_contract = d.get("generation_contract")
+    if isinstance(generation_contract, dict):
+        try:
+            encoded_contract = json.dumps(
+                generation_contract,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            pass
+        else:
+            vs.generation_contract = dict(generation_contract)
+            vs.generation_contract_sha256 = hashlib.sha256(
+                encoded_contract
+            ).hexdigest()
+    checkpoint_profile = d.get("checkpoint_profile_sha256")
+    if isinstance(checkpoint_profile, str):
+        vs.checkpoint_profile_sha256 = checkpoint_profile
     env_name = d.get("environment_name") or d.get("env_name")
     if isinstance(env_name, str):
         vs.env_name = env_name
@@ -4932,6 +11861,32 @@ def _apply_validator_health(vs: ValidatorState, d: dict) -> None:
     vs.health_raw = dict(d)
     vs.health_status = str(d.get("status") or "unknown")
     vs.image_revision = str(d.get("image_revision") or vs.image_revision)
+    protocol = d.get("protocol_version")
+    if isinstance(protocol, int) and not isinstance(protocol, bool) and protocol >= 2:
+        vs.protocol_version = protocol
+    profile_id = d.get("generation_profile_id")
+    if isinstance(profile_id, str):
+        vs.generation_profile_id = profile_id
+    generation_contract = d.get("generation_contract")
+    if isinstance(generation_contract, dict):
+        try:
+            encoded_contract = json.dumps(
+                generation_contract,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            pass
+        else:
+            vs.generation_contract = dict(generation_contract)
+            vs.generation_contract_sha256 = hashlib.sha256(
+                encoded_contract
+            ).hexdigest()
+    checkpoint_profile = d.get("checkpoint_profile_sha256")
+    if isinstance(checkpoint_profile, str):
+        vs.checkpoint_profile_sha256 = checkpoint_profile
     vs.app_started_at = _as_float(d.get("app_started_at"), vs.app_started_at)
     vs.batch_size = _as_int(d.get("batch_size"), vs.batch_size)
     vs.queue_depth = _as_int(d.get("queue_depth"), vs.queue_depth)
@@ -5289,6 +12244,15 @@ def _selected_verdict_hotkeys() -> tuple[list[str], list[str]]:
     ordered = list(dict.fromkeys([*configured, *watched]))
     limit = max(1, int(VALIDATOR_MAX_VERDICT_HOTKEYS))
     return ordered[:limit], ordered[limit:]
+
+
+def verdict_rows_for_hotkey(hotkey: str) -> list[dict[str, Any]]:
+    """Thread-safe copy of cached public verdict rows for UI reconciliation."""
+
+    if not _is_ss58_hotkey(hotkey):
+        return []
+    with _verdict_cache_lock:
+        return [dict(row) for row in _verdict_rows_by_hotkey.get(hotkey, [])]
 
 
 def _verdict_identity(row: dict[str, Any]) -> str:
@@ -5836,6 +12800,52 @@ def validator_events_in_window(seconds: float) -> list[ValidatorEvent]:
         return [e for e in _validator_events if e.ts_epoch > cutoff]
 
 
+def _reliquary_one_v5_fleet_events(
+    box: BoxState,
+) -> dict[str, int | None] | None:
+    """Return observed host-scoped V5 admission counts.
+
+    V5's ``fleet-events.jsonl`` lives beneath the configured state root for
+    one host, so ``accepted=True`` rows retain host attribution that the
+    validator's shared-hotkey `/verdicts` response cannot provide.  The
+    stream does not provide a complete rejected-outcome source, so rejection
+    counts remain unavailable even when the rolling event coverage is good.
+    """
+
+    if getattr(box, "miner_kind", "") != "reliquary_one":
+        return None
+    miner = getattr(box, "reliquary_one", {})
+    if not isinstance(miner, dict):
+        return None
+    v5 = miner.get("v5_telemetry")
+    v5 = v5 if isinstance(v5, dict) else {}
+    events = v5.get("fleet_events")
+    if not isinstance(events, dict) or events.get("available") is not True:
+        return None
+    if events.get("complete_30m") is not True:
+        return None
+
+    def count(name: str, *, required: bool = False) -> int | None:
+        value = events.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None if required else 0
+
+    accepted_30m = count("verdict_accepted_30m", required=True)
+    if accepted_30m is None:
+        return None
+    complete_60m = events.get("complete_60m") is True
+    return {
+        "accepted_30m": accepted_30m,
+        "accepted_60m": (
+            count("verdict_accepted_60m", required=True)
+            if complete_60m else None
+        ),
+        "rejected_30m": None,
+        "rejected_60m": None,
+    }
+
+
 def recompute_validator_acpts(
     boxes: list[BoxState], validator_state: ValidatorState | None = None
 ) -> None:
@@ -5902,8 +12912,51 @@ def recompute_validator_acpts(
         and now - validator_state.verdicts_last_fetch_at
         <= VALIDATOR_VERDICT_STALE_SECONDS
     )
+    resolved_hotkeys = {
+        id(box): label_to_ss58.get(box.hotkey) or box.hotkey
+        for box in boxes
+    }
+    hotkey_box_counts = Counter(
+        ss58 for ss58 in resolved_hotkeys.values() if ss58
+    )
+
+    def shared_hotkey_aggregate(ss58: str) -> dict[str, object]:
+        """Return an aggregate verdict summary without assigning it to a host."""
+
+        pref = ss58[:12]
+        aggregate: dict[str, object] = {
+            "accepted_30m": acpt_30.get(pref, 0),
+            "accepted_60m": acpt_60.get(pref, 0),
+            "rejected_30m": reject_30.get(pref, 0),
+            "rejected_60m": 0,
+            "source": "validator_events",
+        }
+        if not verdicts_globally_fresh or validator_state is None:
+            return aggregate
+        candidate = validator_state.verdicts_by_hotkey.get(ss58)
+        if not isinstance(candidate, dict):
+            return aggregate
+        fetched_at = _as_float(
+            candidate.get(
+                "_fetched_at",
+                validator_state.verdicts_last_fetch_at,
+            )
+        )
+        if (
+            fetched_at <= 0
+            or now - fetched_at > VALIDATOR_VERDICT_STALE_SECONDS
+        ):
+            return aggregate
+        return {
+            "accepted_30m": _as_int(candidate.get("accepted_30m")),
+            "accepted_60m": _as_int(candidate.get("accepted_60m")),
+            "rejected_30m": _as_int(candidate.get("rejected_30m")),
+            "rejected_60m": _as_int(candidate.get("rejected_60m")),
+            "source": "verdicts",
+        }
+
     for box in boxes:
-        ss58 = label_to_ss58.get(box.hotkey) or box.hotkey
+        ss58 = resolved_hotkeys[id(box)]
         if not ss58:
             # Box's label not in OUR_SS58 — leave the field at zero
             # rather than guessing. The operator will see "0" on the
@@ -5914,6 +12967,51 @@ def recompute_validator_acpts(
             box.late_drops_30m = 0
             box.late_drops_60m = 0
             box.acceptance_source = "unmapped"
+            box.acceptance_scope = "unmapped"
+            box.shared_hotkey_verdicts = {}
+            continue
+        v5_host_events = _reliquary_one_v5_fleet_events(box)
+        if v5_host_events is not None:
+            # The V5 state root is one host's own append-only event stream.
+            # Prefer it over a shared SS58 verdict counter, which cannot say
+            # which of two boxes produced the admitted candidate.
+            box.acpt_30m = v5_host_events["accepted_30m"]
+            box.acpt_60m = v5_host_events["accepted_60m"]
+            box.rej_30m = v5_host_events["rejected_30m"]
+            box.final_accept_30m = v5_host_events["accepted_30m"]
+            box.final_accept_60m = v5_host_events["accepted_60m"]
+            box.final_reject_30m = v5_host_events["rejected_30m"]
+            box.final_reject_60m = v5_host_events["rejected_60m"]
+            box.late_drops_30m = 0
+            box.late_drops_60m = 0
+            box.acceptance_source = "v5_fleet_events_admissions_observed"
+            box.acceptance_scope = "per_host_admissions_observed"
+            box.shared_hotkey_verdicts = (
+                shared_hotkey_aggregate(ss58)
+                if hotkey_box_counts[ss58] > 1 else {}
+            )
+            box.acpt_trend.append(int(box.acpt_30m or 0))
+            continue
+        if (
+            getattr(box, "miner_kind", "") == "reliquary_one"
+            and hotkey_box_counts[ss58] > 1
+        ):
+            # Do not turn the second V5 host into a zero or allocate the
+            # whole shared-hotkey total to the first.  Preserve the aggregate
+            # beside an explicit unavailable per-host value for the UI/API.
+            box.acpt_30m = None
+            box.acpt_60m = None
+            box.rej_30m = None
+            box.final_accept_30m = None
+            box.final_accept_60m = None
+            box.final_reject_30m = None
+            box.final_reject_60m = None
+            box.late_drops_30m = 0
+            box.late_drops_60m = 0
+            box.acceptance_source = "shared_hotkey_aggregate_unattributable"
+            box.acceptance_scope = "shared_hotkey_aggregate"
+            box.shared_hotkey_verdicts = shared_hotkey_aggregate(ss58)
+            box.acpt_trend.clear()
             continue
         if ss58 in seen_hotkeys:
             # Multiple services may share one hotkey (current RTX8 mesh).
@@ -5931,6 +13029,8 @@ def recompute_validator_acpts(
             box.final_reject_30m = 0
             box.final_reject_60m = 0
             box.acceptance_source = "duplicate-hotkey"
+            box.acceptance_scope = "shared_hotkey_duplicate"
+            box.shared_hotkey_verdicts = shared_hotkey_aggregate(ss58)
             box.acpt_trend.append(0)
             continue
         seen_hotkeys.add(ss58)
@@ -5941,6 +13041,8 @@ def recompute_validator_acpts(
         box.late_drops_30m = late_30.get(pref, 0)
         box.late_drops_60m = late_60.get(pref, 0)
         box.acceptance_source = "events"
+        box.acceptance_scope = "per_hotkey"
+        box.shared_hotkey_verdicts = {}
 
         # `/verdicts/{full-hotkey}` is exact-keyed and represents the final
         # worker decision, unlike miner-side provisional submit responses or
@@ -6006,6 +13108,7 @@ def recompute_validator_acpts(
                         box.miner_inflight = 0
                         box.miner_ready = 1 if box.proc_alive else 0
             box.acceptance_source = "verdicts"
+            box.acceptance_scope = "per_hotkey"
         # Reference frontier activity logs do not carry a window number. Once
         # an older submission has received its final verdict, attribute the
         # live ready/generating/proving/waiting state to the validator's
@@ -7538,11 +14641,59 @@ def main() -> int:
             unit_candidates=tuple(
                 tuple(spec) for spec in FLEET_UNIT_CANDIDATES.get(label, [])
             ),
+            unit_controller_config_paths=tuple(
+                (str(unit), str(path))
+                for unit, path in FLEET_CONTROLLER_CONFIG_PATHS.get(
+                    label, {}
+                ).items()
+            ),
             coordinated_units=tuple(
                 FLEET_COORDINATED_UNITS.get(label, [])
             ),
             host_unit_allowlist=tuple(
                 FLEET_HOST_UNIT_ALLOWLIST.get(label, [])
+            ),
+            standalone_telemetry_path=str(
+                FLEET_STANDALONE_TELEMETRY.get(label, {}).get(
+                    "telemetry_path"
+                ) or ""
+            ),
+            standalone_runtime_manifest_path=str(
+                FLEET_STANDALONE_TELEMETRY.get(label, {}).get(
+                    "runtime_manifest_path"
+                ) or ""
+            ),
+            active_unit_registry_path=str(
+                FLEET_STANDALONE_TELEMETRY.get(label, {}).get(
+                    "active_unit_registry_path"
+                ) or ""
+            ),
+            standalone_supervisor_status_path=str(
+                FLEET_STANDALONE_TELEMETRY.get(label, {}).get(
+                    "supervisor_status_path"
+                ) or ""
+            ),
+            standalone_telemetry_stale_seconds=float(
+                FLEET_RELIQUARY_ONE.get(label, {}).get("stale_seconds")
+                or FLEET_STANDALONE_TELEMETRY.get(label, {}).get(
+                    "stale_seconds"
+                )
+                or 90.0
+            ),
+            miner_kind=(
+                "reliquary_one"
+                if label in FLEET_RELIQUARY_ONE
+                else "legacy"
+            ),
+            reliquary_one_state_root=str(
+                FLEET_RELIQUARY_ONE.get(label, {}).get("state_root") or ""
+            ),
+            standalone_certification_config=dict(
+                FLEET_STANDALONE_CERTIFICATION.get(label, {})
+            ),
+            operator=str(
+                FLEET_STANDALONE_TELEMETRY.get(label, {}).get("operator")
+                or ""
             ),
         )
         for alias, hk, label, color, unit in FLEET
