@@ -10716,7 +10716,7 @@ PAGE = """<!doctype html>
 <script src="/static/htmx.min.js" defer></script>
 <link rel="stylesheet" href="/static/dashboard.css?v={asset_version}">
 </head>
-<body data-demo="{demo_mode}" data-refresh-seconds="{browser_refresh_s}">
+<body class="snapshot-pending" data-demo="{demo_mode}" data-refresh-seconds="{browser_refresh_s}">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
 <header class="app-header">
   <div class="brand-lockup">
@@ -10998,7 +10998,7 @@ PAGE = """<!doctype html>
 
 _dashboard_snapshot_lock = threading.Lock()
 _dashboard_snapshot_cache: dict[
-    tuple[str, str], tuple[float, dict[str, object]]
+    tuple[str, str, bool], tuple[float, dict[str, object]]
 ] = {}
 _DASHBOARD_SNAPSHOT_CACHE_SECONDS = 0.75
 
@@ -11012,11 +11012,12 @@ def render_dashboard_snapshot(
     *,
     ema_mode: str = "top",
     rundown_tf: str = "30m",
+    include_advanced: bool = True,
 ) -> dict[str, object]:
     """Render one failure-isolated payload for the complete local dashboard."""
     normalized_ema = "active" if ema_mode == "active" else "top"
     normalized_tf = rundown_tf if rundown_tf in RUNDOWN_TIMEFRAMES else "30m"
-    cache_key = (normalized_ema, normalized_tf)
+    cache_key = (normalized_ema, normalized_tf, bool(include_advanced))
     now = time.time()
     with _dashboard_snapshot_lock:
         cached = _dashboard_snapshot_cache.get(cache_key)
@@ -11030,30 +11031,35 @@ def render_dashboard_snapshot(
             "miner_auction": render_last_sealed_auction_html,
             "miner_runtime": render_checkpoint_runtime_html,
             "miner_log": render_structured_miner_log_html,
-            "score": render_scoreboard_html,
-            "windows": render_windows_html,
-            "ema": lambda: render_ema_leaderboard_html(
-                top_n=12,
-                mode=normalized_ema,
-            ),
-            "fleet": render_fleet_html,
-            "summary": render_fleet_summary_html,
-            "forensics": render_window_forensics_html,
-            "pipeline": render_pipeline_html,
-            "frontier": render_frontier_html,
-            "labs": render_labs_html,
-            "rundown": lambda: render_validator_rundown_html(
-                timeframe=normalized_tf
-            ),
-            "validator_events": render_validator_events_html,
-            "chain": render_chain_html,
-            "slotrank": render_slot_rank_html,
-            "baseline": render_baseline_html,
-            "competitors": render_competitors_html,
-            "rtt": render_rtt_html,
-            "quality": render_quality_html,
-            "events": render_events_html,
         }
+        if include_advanced:
+            renderers.update(
+                {
+                    "score": render_scoreboard_html,
+                    "windows": render_windows_html,
+                    "ema": lambda: render_ema_leaderboard_html(
+                        top_n=12,
+                        mode=normalized_ema,
+                    ),
+                    "fleet": render_fleet_html,
+                    "summary": render_fleet_summary_html,
+                    "forensics": render_window_forensics_html,
+                    "pipeline": render_pipeline_html,
+                    "frontier": render_frontier_html,
+                    "labs": render_labs_html,
+                    "rundown": lambda: render_validator_rundown_html(
+                        timeframe=normalized_tf
+                    ),
+                    "validator_events": render_validator_events_html,
+                    "chain": render_chain_html,
+                    "slotrank": render_slot_rank_html,
+                    "baseline": render_baseline_html,
+                    "competitors": render_competitors_html,
+                    "rtt": render_rtt_html,
+                    "quality": render_quality_html,
+                    "events": render_events_html,
+                }
+            )
         panels: dict[str, str] = {}
         errors: dict[str, str] = {}
         for name, renderer in renderers.items():
@@ -11201,10 +11207,12 @@ def make_app(
     def api_dashboard_snapshot(
         ema_mode: str = "top",
         rundown_tf: str = "30m",
+        advanced: bool = True,
     ):
         return render_dashboard_snapshot(
             ema_mode=ema_mode,
             rundown_tf=rundown_tf,
+            include_advanced=advanced,
         )
 
 

@@ -19,6 +19,8 @@ this project uses [Semantic Versioning](https://semver.org/).
 - Reworked the fleet dashboard around the active miner and compact recent
   history while retaining the existing validator, chain, EMA, and forensic
   panels.
+- Deferred collapsed advanced diagnostics until operators open them, reducing
+  initial rendering work while preserving the complete snapshot API by default.
 
 ### Security
 

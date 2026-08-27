@@ -512,6 +512,20 @@ def test_dashboard_snapshot_is_single_failure_isolated_payload(monkeypatch) -> N
         "miner_log",
     }
 
+    compact = _request(
+        app,
+        "GET",
+        "/api/dashboard-snapshot?advanced=false",
+    ).json()
+    assert set(compact["panels"]) == {
+        "miner_now",
+        "miner_pipeline",
+        "miner_attempts",
+        "miner_auction",
+        "miner_runtime",
+        "miner_log",
+    }
+
 
 def test_logs_return_304_when_filtered_buffer_is_unchanged(monkeypatch) -> None:
     event = fleet.ValidatorEvent(
