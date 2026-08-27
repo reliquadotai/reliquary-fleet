@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import sys
 from collections import deque
 from pathlib import Path
@@ -18,8 +19,12 @@ if str(ROOT) not in sys.path:
 fleet = importlib.import_module("fleet")
 fleet_web = importlib.import_module("fleet_web")
 
-FIXED_NOW = 1_784_688_400.0
-CHECKPOINT_REVISION = "a" * 40
+FIXED_NOW = 1_800_000_000.0
+CHECKPOINT_REVISION = "1" * 40
+DEMO_WINDOW = 42_001
+FAILURE_WINDOW = 42_002
+CURRENT_WINDOW = 42_003
+CHECKPOINT_NUMBER = 42
 SOURCE_REVISION = "b" * 40
 MODEL_REPOSITORY = "reliquary/demo-checkpoint"
 HOTKEYS = (
@@ -38,7 +43,7 @@ class _FrozenClock:
 def _box(index: int, label: str, hotkey: str, color: str) -> fleet.BoxState:
     pid = 4200 + index
     started_at = int(FIXED_NOW) - (9_400 + index * 620)
-    return fleet.BoxState(
+    box = fleet.BoxState(
         alias=f"demo-node-{index + 1}",
         hotkey=hotkey,
         label=label,
@@ -151,14 +156,139 @@ def _box(index: int, label: str, hotkey: str, color: str) -> fleet.BoxState:
             maxlen=8,
         ),
     )
+    if index == 0:
+        from reliquary_one import normalize_probe
+
+        payload = json.loads(
+            (ROOT / "tests/fixtures/reliquary_one_demo.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        miner = normalize_probe(payload, now=FIXED_NOW, stale_seconds=900.0)
+        historical_template = next(
+            attempt
+            for attempt in miner["attempts"]
+            if attempt["window_n"] == DEMO_WINDOW
+            and attempt["ordinal"] == 2
+        )
+        for offset in range(1, 12):
+            historical = dict(historical_template)
+            historical.update(
+                {
+                    "window_n": DEMO_WINDOW - offset,
+                    "ordinal": 1,
+                    "timestamp": FIXED_NOW - 700 - offset * 90,
+                    "attempt_ref": f"demo-history-{offset:02d}",
+                    "merkle_root": "",
+                    "open_age_at_start_s": 8.0 + offset,
+                    "generation_s": 31.0 + offset,
+                    "proof_s": 4.0 + offset / 10,
+                    "proof_integrity_s": 0.002 + offset / 10000,
+                    "precommit_s": 0.04 + offset / 1000,
+                    "reveal_s": 0.16 + offset / 1000,
+                    "total_s": 44.0 + offset,
+                    "transport": dict(historical_template["transport"]),
+                    "admission": {
+                        "status": "pending",
+                        "reason": None,
+                        "source": None,
+                    },
+                    "auction": {
+                        "selected": None,
+                        "rewarded": None,
+                        "canonical_rank": None,
+                        "source": None,
+                    },
+                    "failure": None,
+                }
+            )
+            miner["attempts"].append(historical)
+        service = miner["service"]
+        binding = miner["binding"]
+        gpu = miner["gpu"][0]
+        box.unit = "reliquary-one.service"
+        box.unit_candidates = ()
+        box.env_file = ""
+        box.miner_kind = "reliquary_one"
+        box.reliquary_one_state_root = "/demo/reliquary-one/code/state"
+        box.reliquary_one = miner
+        box.active_unit = "reliquary-one.service"
+        box.active_units = ["reliquary-one.service"]
+        box.active_lane = "code"
+        box.active_lanes = ["code"]
+        box.active_environment = "opencodeinstruct"
+        box.engine_mode = "reliquary_one"
+        box.miner_environment = "opencodeinstruct"
+        box.proc_alive = True
+        box.proc_uptime_s = int(service["uptime_seconds"])
+        box.restart_count = int(service["restarts"])
+        box.gpu_util = int(gpu["utilization_pct"])
+        box.gpu_mem_mb = int(gpu["memory_used_mib"])
+        box.gpu_total_mb = int(gpu["memory_total_mib"])
+        box.runtime_checkpoint_n = int(binding["checkpoint_number"])
+        box.runtime_checkpoint_revision = str(binding["checkpoint_revision"])
+        box.provisioned_checkpoint_n = int(binding["checkpoint_number"])
+        box.provisioned_model_revision = str(binding["checkpoint_revision"])
+        box.local_checkpoint_n = int(binding["checkpoint_number"])
+        box.local_checkpoint_revision = str(binding["checkpoint_revision"])
+    return box
 
 
 def _windows() -> list[fleet.WindowSummary]:
     slot_counts = [3, 2, 4, 1, 3, 2, 0, 3, 2, 4, 1, 2, 3, 1, 2, 3, 2, 1]
     competitors = ("demo-competitor-one", "demo-competitor-two")
-    windows: list[fleet.WindowSummary] = []
+    code_batch = [
+        {
+            "hotkey": f"demo-code-candidate-{rank}",
+            "canonical_rank": rank,
+            "env_name": "opencodeinstruct",
+            "response_time": 1.4 + rank * 0.27,
+            "sigma": 0.43 + rank * 0.003,
+            "selected_for_batch": True,
+            "rewarded": True,
+        }
+        for rank in range(1, 9)
+    ]
+    code_rejected = [
+        {
+            "hotkey": HOTKEYS[0],
+            "canonical_rank": None,
+            "env_name": "opencodeinstruct",
+            "accepted_into_pool": False,
+            "selected_for_batch": False,
+            "rewarded": False,
+            "reject_reason": "out_of_zone",
+            "arrival_ts": FIXED_NOW - 30 + index,
+        }
+        for index in range(2)
+    ]
+    windows: list[fleet.WindowSummary] = [
+        fleet.WindowSummary(
+            n=DEMO_WINDOW,
+            ours=0,
+            total_batch=16,
+            rt_first=1.67,
+            rejects={"out_of_zone": 2},
+            reward_total=1.0,
+            reward_data_present=True,
+            terminal_data_present=True,
+            lifecycle_explicit=True,
+            environments=["openmathinstruct", "opencodeinstruct"],
+            environment_counts={
+                "opencodeinstruct": {
+                    "selected": 8,
+                    "runners_up": 0,
+                    "rejected": 2,
+                }
+            },
+            ours_by_environment={"opencodeinstruct": 0},
+            batch=code_batch,
+            rejected=code_rejected,
+            reject_summary={"out_of_zone": 2},
+        )
+    ]
     for offset, ours in enumerate(slot_counts):
-        window_n = 7420 - offset
+        window_n = DEMO_WINDOW - 1 - offset
         batch = []
         rewards: dict[str, float] = {}
         for rank in range(1, 9):
@@ -204,11 +334,7 @@ def _windows() -> list[fleet.WindowSummary]:
 
 def seed_fixture() -> None:
     fleet_web.time = _FrozenClock
-    boxes = [
-        _box(0, "alpha", HOTKEYS[0], "#7bd389"),
-        _box(1, "beta", HOTKEYS[1], "#4fb8e0"),
-        _box(2, "gamma", HOTKEYS[2], "#a78bfa"),
-    ]
+    boxes = [_box(0, "code-miner-one", HOTKEYS[0], "#7bd389")]
     fleet_rows = [
         (box.alias, box.hotkey, box.label, box.color, box.unit)
         for box in boxes
@@ -223,13 +349,13 @@ def seed_fixture() -> None:
 
     windows = _windows()
     validator = fleet.ValidatorState(
-        state="open",
-        window=7421,
+        state="training",
+        window=CURRENT_WINDOW,
         valid=6,
-        checkpoint_n=24,
+        checkpoint_n=CHECKPOINT_NUMBER,
         checkpoint_repo_id=MODEL_REPOSITORY,
         checkpoint_revision=CHECKPOINT_REVISION,
-        env_name="openmathinstruct",
+        env_name="opencodeinstruct",
         anchor_block=19_482_160,
         last_fetch_at=FIXED_NOW - 2,
         health_last_fetch_at=FIXED_NOW - 2,
@@ -239,12 +365,12 @@ def seed_fixture() -> None:
         app_started_at=FIXED_NOW - 7_200,
         batch_size=8,
         queue_depth=2,
-        queue_depth_by_environment={"openmathinstruct": 2},
-        admission_workers_by_environment={"openmathinstruct": 4},
+        queue_depth_by_environment={"opencodeinstruct": 2},
+        admission_workers_by_environment={"opencodeinstruct": 4},
         proof_admission_count=6,
         proof_admission_limit=8,
         proof_verification_inflight=1,
-        proof_verification_inflight_by_environment={"openmathinstruct": 1},
+        proof_verification_inflight_by_environment={"opencodeinstruct": 1},
         pending_proof_reservations=1,
         inflight_proof_reservations=1,
         liveness_telemetry_reported=True,
@@ -254,7 +380,7 @@ def seed_fixture() -> None:
             "/submit": {"p50": 41.0, "p95": 82.0, "p99": 103.0, "max": 121.0},
         },
         admission_latency_ms_by_environment={
-            "openmathinstruct": {
+            "opencodeinstruct": {
                 "queue_wait_ms": {"p95": 12.0, "p99": 18.0},
                 "admission_prepare_ms": {"p95": 41.0, "p99": 55.0},
                 "commit_lock_wait_ms": {"p95": 0.2, "p99": 0.3},
@@ -262,7 +388,7 @@ def seed_fixture() -> None:
             }
         },
         seal_drain_by_environment={
-            "openmathinstruct": {
+            "opencodeinstruct": {
                 "elapsed_seconds": 2.8,
                 "timed_out": False,
                 "queue_depth_at_snapshot": 0,
@@ -272,12 +398,12 @@ def seed_fixture() -> None:
             }
         },
         window_environments={
-            "openmathinstruct": {
+            "opencodeinstruct": {
                 "valid_submissions_count": 6,
                 "target_batch_size": 8,
             }
         },
-        environment_targets={"openmathinstruct": 8},
+        environment_targets={"opencodeinstruct": 8},
         recent_reject_counts={"batch_filled": 2},
         archive_queue_depth=0,
         archive_continuity_reported=True,
@@ -407,7 +533,7 @@ def seed_fixture() -> None:
     fleet_web._r2_status_snapshot = lambda: {
         "last_success_at": FIXED_NOW - 9,
         "last_error": "",
-        "latest_window": 7420,
+        "latest_window": DEMO_WINDOW,
         "coverage_complete": True,
         "coverage": {
             "complete": True,

@@ -3,6 +3,31 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 this project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- A normalized `reliquary_one` collector for all-in-one Code and Math miners,
+  using one bounded read-only SSH probe per cycle and allowlisted structured
+  telemetry.
+- Operator-first service, checkpoint, GPU, pipeline, attempt, admission, and
+  terminal-auction views with explicit pending and unknown states.
+### Changed
+
+- Updated Rich, Twine, Playwright, Axe, and the SHA-pinned PyPI publishing
+  action to their reviewed current versions.
+- Reworked the fleet dashboard around the active miner and compact recent
+  history while retaining the existing validator, chain, EMA, and forensic
+  panels.
+
+### Security
+
+- The Reliquary One adapter excludes wallet files, secret environments, raw
+  prompts, request bodies, signatures, proofs, randomness, and exception
+  contents from collection and export.
+- Public tests and visual baselines use synthetic demo-only windows,
+  checkpoints, timings, identities, and paths.
+
 ## [1.1.0] - 2026-07-23
 
 ### Added

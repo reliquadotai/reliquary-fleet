@@ -50,6 +50,12 @@ code_readiness:
 #   color       — cyan | magenta | yellow | green | red | orange | white
 #   unit        — systemd unit name (e.g. reliquary-miner-pro@h100a.service)
 #                 or null if the miner runs outside systemd
+#   miner_kind  — `legacy` (default) or `reliquary_one`. The latter uses the
+#                 dedicated redacted adapter and requires `state_root`.
+#   state_root  — absolute structured state root for a reliquary_one miner.
+#                 Fleet reads only bounded events.jsonl, submissions.json,
+#                 active-binding.json, systemctl state, checkpoint tier names,
+#                 and nvidia-smi.
 #   env_file    — exact service EnvironmentFile path. Set this for the
 #                 reference miner because its non-templated service uses
 #                 /srv/reliquary-miner-pro/state/miner-pro.env.
@@ -59,21 +65,75 @@ code_readiness:
 #                 To run concurrent shards, configure one fleet row per unit;
 #                 rows sharing an SSH host form its exact host-wide allowlist.
 #                 Any other active reliquary-miner-pro unit fails closed.
+#   telemetry_path — optional standalone miner atomic dashboard JSON. Configure
+#                    together with runtime_manifest_path; stale telemetry fails
+#                    fleet readiness instead of retaining old counters.
+#   runtime_manifest_path — standalone runtime identity manifest (public source
+#                           and exact checkpoint only; no wallet material).
+#   active_unit_registry_path — optional stable root-owned schema-v1 registry
+#                           whose digest-attested active/rollback records replace
+#                           checkpoint-specific unit and standalone paths.
+#   controller_config_path — optional exact TOML used by this standalone unit.
+#                            Fleet verifies the live process argv, then follows
+#                            [paths].runtime_manifest and [paths].ledger_db.
+#   operator    — public SS58 coldkey/operator identity shown beside hotkey/UID.
 #   ssh_key     — optional per-box key override (falls back to validator.ssh.key)
 # ---------------------------------------------------------------------------
 fleet:
+  # Preferred all-in-one Code miner. This adapter never reads wallet files,
+  # claimed.json, prepared spool bodies, raw prompts, signatures, proofs,
+  # randomness/cooldown bodies, or exception trace contents.
+  # - alias: "ops@code-miner.example"
+  #   hotkey: "YOUR_SS58_HOTKEY"
+  #   label: "code-miner-one"
+  #   color: "green"
+  #   unit: "reliquary-one.service"
+  #   miner_kind: "reliquary_one"
+  #   state_root: "/var/lib/reliquary-one/code/state"
+  #   telemetry_stale_seconds: 900
+  #   ssh_key: null
+
   - alias: "ops@miner-1.example"
     hotkey: "YOUR_SS58_HOTKEY"
     label: "m1"
     color: "cyan"
     unit: "reliquary-miner-pro@m1.service"
     env_file: "/srv/reliquary-miner-pro/state/miner-pro-m1.env"
+    # controller_config_path: "/etc/reliquary-code/mine.toml"
+    # telemetry_path: "/var/lib/reliquary-code/dashboard/code.json"
+    # runtime_manifest_path: "/var/lib/reliquary-code/runtime-manifest.json"
+    # active_unit_registry_path: "/var/lib/reliquary-code/active-unit-registry.json"
+    # supervisor_status_path: "/var/lib/reliquary-code/dashboard/profile-supervisor.json"
+    # telemetry_stale_seconds: 90
+    # Optional display-only, submit-disabled certification process. Fleet
+    # reports this as yellow "certifying (non-mining)" only when no allowed
+    # canary/mine unit is active and the exact runner hash, argv, artifact
+    # paths, manifest/profile/checkpoint paths, and GPU UUID all match. It
+    # never supplies alive/mining readiness, attempts, accepts, or rewards.
+    # standalone_certification:
+    #   runner_path: "/var/lib/reliquary-code/cert/run-certify.sh"
+    #   runner_sha256: "64_LOWERCASE_HEX_CHARACTERS"
+    #   artifact_dir: "/var/lib/reliquary-code/cert"
+    #   runtime_manifest_path: "/var/lib/reliquary-code/runtime-manifest.json"
+    #   proof_profile_path: "/var/lib/reliquary-code/cert/proof-profile.json"
+    #   checkpoint_path: "/var/lib/reliquary-code/model"
+    #   gpu_uuid: "GPU-00000000-0000-0000-0000-000000000000"
+    #   # For a generation-only systemd worker, keep it outside unit and
+    #   # allowed_units so it remains certification-only and cannot turn the
+    #   # fleet row green or contribute attempts/rewards.
+    #   service_unit: "reliquary-code-v3-cert-worker.service"
+    #   service_user: "reliquary-code-worker"
+    #   service_config_path: "/var/lib/reliquary-code/cert/generator.toml"
+    #   service_config_sha256: "64_LOWERCASE_HEX_CHARACTERS"
+    #   progress_path: "/var/lib/reliquary-code/cert/progress.json"
+    # operator: "YOUR_OPERATOR_SS58"
     # One logical H100 row can follow a legacy canary or one named lane:
     # allowed_units:
     #   - unit: "reliquary-miner-pro@math-m2.service"
     #     env_file: "/srv/reliquary-miner-pro/state/miner-pro-math-m2.env"
     #   - unit: "reliquary-miner-pro@code-m2.service"
     #     env_file: "/srv/reliquary-miner-pro/state/miner-pro-code-m2.env"
+    #     controller_config_path: "/etc/reliquary-code/canary.toml"
     # Optional exact set allowed to run concurrently. Every named service must
     # already appear in unit + allowed_units; any other multi-service set is
     # still reported as multiple_allowed_units_active.
@@ -98,6 +158,33 @@ labs:
   #   color: "magenta"
   #   selector_artifact_manifest: "/srv/reliquary-selector/report.json"
   #   source_manifest: "/srv/reliquary-miner-pro/state/source-manifest.env"
+  #   ssh_key: null
+
+# ---------------------------------------------------------------------------
+# Wallet-free live accelerator components. A component generates for exactly
+# one fleet controller and never owns a hotkey, wallet, submit authority, or
+# reward funnel. Fleet verifies both services, GPU/power, immutable runtime
+# identity and bounded certification progress. Controller attachment is true
+# only after its runtime manifest binds the exact component manifest+profile.
+# ---------------------------------------------------------------------------
+components:
+  # - alias: "ops@wallet-free-worker.example"
+  #   label: "rtx-code-generation"
+  #   color: "magenta"
+  #   role: "generation"
+  #   controller_label: "m1"
+  #   generator_unit: "reliquary-code-rtx-generator.service"
+  #   tunnel_unit: "reliquary-code-rtx-live-tunnel.service"
+  #   runtime_manifest_path: "/var/lib/reliquary-code/worker/runtime-manifest.unbound.json"
+  #   runtime_profile_path: "/var/lib/reliquary-code/generator/runtime-profile.json"
+  #   component_config_path: "/etc/reliquary-code-rtx/generator.toml"
+  #   evidence_alias: "ops@controller.example"
+  #   evidence_dir: "/var/lib/reliquary-code/evidence/rtx/tunnel-measurements"
+  #   evidence_runtime_manifest_path: "/var/lib/reliquary-code/evidence/rtx/runtime-manifest.json"
+  #   evidence_runtime_profile_path: "/var/lib/reliquary-code/evidence/rtx/generator/runtime-profile.json"
+  #   evidence_target_windows: 20
+  #   evidence_stale_seconds: 300
+  #   telemetry_stale_seconds: 180
   #   ssh_key: null
 
 # ---------------------------------------------------------------------------
