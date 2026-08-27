@@ -14,13 +14,14 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(
     () =>
-      document.querySelectorAll("main .panel").length >= 18 &&
-      document.querySelectorAll(".skeleton-panel").length === 0,
+      !document.body.classList.contains("snapshot-pending") &&
+      document.querySelectorAll(".operator-command .skeleton-panel").length === 0,
   );
 });
 
 test("matches the sanitized viewport baseline", async ({ page }) => {
   await expect(page.locator('[hx-trigger*="every"]')).toHaveCount(0);
+  await expect(page.locator("body")).not.toHaveClass(/snapshot-pending/);
   await expect(page).toHaveScreenshot("dashboard-viewport.png");
 });
 
@@ -223,8 +224,8 @@ test("loads without browser console errors", async ({ page }) => {
   await page.reload();
   await page.waitForFunction(
     () =>
-      document.querySelectorAll("main .panel").length >= 18 &&
-      document.querySelectorAll(".skeleton-panel").length === 0,
+      !document.body.classList.contains("snapshot-pending") &&
+      document.querySelectorAll(".operator-command .skeleton-panel").length === 0,
   );
   expect(errors).toEqual([]);
 });

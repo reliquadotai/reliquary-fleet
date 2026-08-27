@@ -74,6 +74,9 @@
     text-rendering: optimizeLegibility;
     overflow-x: clip;
   }
+  body.snapshot-pending .dashboard-shell {
+    visibility: hidden;
+  }
   button, input, select { font: inherit; }
   ::selection { background: rgba(232,122,62,0.30); color: var(--bone); }
 

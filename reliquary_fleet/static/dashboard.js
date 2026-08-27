@@ -4,6 +4,7 @@
   const drawer = document.getElementById("drawer");
   const backdrop = document.getElementById("drawer-backdrop");
   const soundToggle = document.getElementById("sound-toggle");
+  const advancedDashboard = document.querySelector(".advanced-dashboard");
   let drawerTrigger = null;
   let drawerRequest = null;
   let soundOn = false;
@@ -372,6 +373,7 @@
     const query = new URLSearchParams({
       ema_mode: document.getElementById("ema-area")?.dataset.mode || "top",
       rundown_tf: document.getElementById("rundown-area")?.dataset.tf || "30m",
+      advanced: advancedDashboard?.open ? "1" : "0",
     });
     return `/api/dashboard-snapshot?${query.toString()}`;
   }
@@ -439,6 +441,7 @@
     } finally {
       if (snapshotRequest === request) {
         snapshotRequest = null;
+        document.body.classList.remove("snapshot-pending");
         scheduleSnapshot();
       }
     }
@@ -452,6 +455,10 @@
       return;
     }
     refreshSnapshot(true);
+  });
+
+  advancedDashboard?.addEventListener("toggle", () => {
+    if (advancedDashboard.open) refreshSnapshot(true);
   });
 
   window.reliquaryFleetRefresh = () => refreshSnapshot(true);
